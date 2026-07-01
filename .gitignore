@@ -1,0 +1,24 @@
+test-passkey-credblob.html
+.DS_Store
+
+# Python bytecode cache
+**/__pycache__/
+*.pyc
+
+# node_modules at any depth
+**/node_modules/
+
+# contracts: compiled/cached output
+contracts/artifacts/
+contracts/cache/
+contracts/build/
+contracts/dist/
+contracts/.cache/
+contracts/typechain/
+contracts/typechain-types/
+contracts/.env
+contracts/.env.*
+.claude/worktrees/confident-zhukovsky-e4e6a9/
+
+# docs
+docs/

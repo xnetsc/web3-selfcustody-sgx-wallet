@@ -1,0 +1,70 @@
+xWallet Source Available License 1.0
+
+Copyright (c) 2026 xnetsc. All rights reserved.
+
+DEFINITIONS
+
+"Software" means the xWallet source code, documentation, and all associated
+files in this repository.
+
+"Non-Commercial Use" means personal, academic, research, educational, or
+charitable use where no direct or indirect commercial advantage or monetary
+compensation is sought or received in connection with the use of the Software.
+This includes internal evaluation and prototyping solely for the purpose of
+determining whether to obtain a commercial license.
+
+"Commercial Use" means any use of the Software, in whole or in part, that is
+intended for or results in commercial advantage or monetary compensation,
+including but not limited to:
+
+  (a) incorporating the Software into a product or service that is sold,
+      licensed, or otherwise monetized;
+  (b) using the Software to provide services to third parties (including as
+      SaaS, PaaS, or hosted services);
+  (c) using the Software in internal business operations of a for-profit entity;
+  (d) using the Software to process transactions, assets, or data on behalf of
+      paying customers;
+  (e) distributing the Software bundled with a commercial product or service.
+
+NON-COMMERCIAL USE GRANT
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this Software, to use, copy, modify, merge, publish, and distribute the
+Software solely for Non-Commercial Use, subject to the following conditions:
+
+  1. The above copyright notice and this license notice shall be included in
+     all copies or substantial portions of the Software.
+
+  2. Any modifications must be clearly marked as such and must not be
+     misrepresented as the original Software.
+
+  3. This license does not grant any rights to use the name "xWallet" or the
+     name "xnetsc" for endorsement or promotional purposes.
+
+COMMERCIAL USE
+
+Any Commercial Use of the Software requires a separate written commercial
+license agreement obtained from the copyright holder prior to such use.
+There are no exemptions, grace periods, or conversion mechanisms — Commercial
+Use without a valid commercial license is strictly prohibited.
+
+To inquire about a commercial license, open an issue or pull request in the
+official xWallet repository.
+
+CONTRIBUTIONS
+
+By submitting a contribution (pull request, patch, or otherwise) to this
+repository, you agree that your contribution is made under the same terms as
+this license, and you grant the copyright holder a perpetual, worldwide,
+royalty-free, irrevocable license to use, reproduce, modify, distribute, and
+sublicense your contribution as part of the Software under any license terms
+the copyright holder chooses, including commercial licenses.
+
+DISCLAIMER
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT, OR OTHERWISE, ARISING FROM, OUT OF, OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.

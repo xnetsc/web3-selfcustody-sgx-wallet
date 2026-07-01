@@ -1,0 +1,29 @@
+{
+  "name": "sgx-enclave",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "SGX based enclave server",
+  "dependencies": {
+    "@xnetx/raft-hlc-sync": "^0.0.1",
+    "@simplewebauthn/server": "^10.0.1",
+    "@xnetx/sgx-ra-tls-verify": "^0.0.1",
+    "better-sqlite3": "^11.0.0",
+    "bip39": "^3.1.0",
+    "cbor": "^10.0.12",
+    "cron-parser": "^4.9.0",
+    "elliptic": "^6.6.1",
+    "ethers": "^6.13.5",
+    "express": "^4.21.2",
+    "hdkey": "^2.1.0",
+    "node-cron": "^3.0.3",
+    "node-forge": "^1.4.0",
+    "uuid": "^9.0.1"
+  }
+}

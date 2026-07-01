@@ -1,0 +1,14 @@
+{
+  "name": "sgx-enclave-integration-test",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "test": "node run-general-tests.mjs"
+  },
+  "dependencies": {
+    "@xnetx/raft-hlc-sync": "^0.0.1",
+    "better-sqlite3": "^12.8.0",
+    "cbor": "^10.0.12",
+    "ethers": "^6.16.0"
+  }
+}
