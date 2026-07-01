@@ -49,6 +49,15 @@ contract WalletTrustContract is Ownable {
     /// @dev 程序运行参数（JSON 字符串格式）
     string public runtimeParams;
 
+    // ============ 合约迁移目标（Owner 设置，无需鉴权即可读取） ============
+
+    /// @dev 迁移目标 RPC URL（空字符串表示无迁移）
+    string public migrationRpcUrl;
+    /// @dev 迁移目标合约地址（空字符串表示无迁移）
+    string public migrationContractAddress;
+    /// @dev 迁移目标链 ID（0 表示无迁移）
+    uint256 public migrationChainId;
+
     // ============ Enclave 白名单（RA-TLS 验证用） ============
 
     EnclaveIdentity[] internal _enclaveWhitelist;
@@ -96,6 +105,8 @@ contract WalletTrustContract is Ownable {
     );
     event PasskeyRecoverySet(string userId, bytes32 newPubKeyHash, bytes32 oldPubKeyHash, string uuid, string memo);
     event PasskeyRecoveryRemoved(string userId, bytes32 newPubKeyHash);
+    event MigrationTargetUpdated(string rpcUrl, string contractAddress, uint256 chainId);
+    event MigrationTargetCleared();
 
     // ============ 构造函数 ============
 
@@ -113,6 +124,32 @@ contract WalletTrustContract is Ownable {
     function updateRuntimeParams(string calldata _runtimeParams) external onlyOwner {
         runtimeParams = _runtimeParams;
         emit RuntimeParamsUpdated(_runtimeParams);
+    }
+
+    // ============ 合约迁移目标管理（Owner 权限） ============
+
+    /// @dev 设置迁移目标（Owner 调用，所有节点读到后将切换到新合约）
+    function setMigrationTarget(string calldata _rpcUrl, string calldata _contractAddress, uint256 _chainId) external onlyOwner {
+        require(bytes(_rpcUrl).length > 0, "Empty rpcUrl");
+        require(bytes(_contractAddress).length > 0, "Empty contractAddress");
+        require(_chainId > 0, "Invalid chainId");
+        migrationRpcUrl = _rpcUrl;
+        migrationContractAddress = _contractAddress;
+        migrationChainId = _chainId;
+        emit MigrationTargetUpdated(_rpcUrl, _contractAddress, _chainId);
+    }
+
+    /// @dev 清除迁移目标（迁移完成后 Owner 调用）
+    function clearMigrationTarget() external onlyOwner {
+        migrationRpcUrl = "";
+        migrationContractAddress = "";
+        migrationChainId = 0;
+        emit MigrationTargetCleared();
+    }
+
+    /// @dev 查询迁移目标（任何人可调用，无需鉴权）
+    function getMigrationTarget() external view returns (string memory rpcUrl_, string memory contractAddress_, uint256 chainId_) {
+        return (migrationRpcUrl, migrationContractAddress, migrationChainId);
     }
 
     // ============ Enclave 白名单管理（Owner 权限，RA-TLS 验证用） ============

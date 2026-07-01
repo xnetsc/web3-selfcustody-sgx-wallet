@@ -23,4 +23,7 @@ export const CONTRACT_ABI = [
   // ===== Passkey 恢复 =====
   'function passkeyRecoveryExists(string, bytes32) view returns (bool)',
   'function getPasskeyRecovery(string, bytes32) view returns (bytes32 oldPubKeyHash, string uuid, string memo, uint256 createdAt)',
+
+  // ===== 合约迁移目标（无需鉴权，所有人可读） =====
+  'function getMigrationTarget() view returns (string rpcUrl, string contractAddress, uint256 chainId)',
 ];

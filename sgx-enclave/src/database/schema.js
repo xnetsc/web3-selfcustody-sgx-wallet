@@ -199,6 +199,26 @@ export const CREATE_ACCOUNT_FREEZES_INDEXES_SQL = [
     `CREATE INDEX IF NOT EXISTS idx_account_freezes_status ON account_freezes (status)`,
 ];
 
+// ========== 合约身份钉住表（安全：防止 env 注入替换合约） ==========
+
+// 单行表（id 恒为 1）。首次成功读到合约数据时写入合约身份 + 最近一次已知的
+// 安全相关合约配置快照（runtimeParams / 白名单 / codeRepository）。
+// 一旦钉住，enclave 永久使用该合约身份，忽略环境变量里的合约连接参数；
+// 钉住的合约不可达时使用该快照作为最后已知配置，绝不回退到环境变量。
+// 参与跨节点同步（HLC LWW），确保所有节点用同一份钉住数据。
+export const CREATE_PINNED_CONTRACT_SQL = `
+CREATE TABLE IF NOT EXISTS pinned_contract (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    rpc_url TEXT NOT NULL,
+    chain_id INTEGER NOT NULL,
+    contract_address TEXT NOT NULL,
+    allow_non_ra_tls INTEGER NOT NULL DEFAULT 0,
+    snapshot_json TEXT,
+    pinned_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    _hlc TEXT NOT NULL DEFAULT '0'
+)`;
+
 // ========== 同步表 ==========
 
 export const CREATE_SYNC_LOG_SQL = `
@@ -245,6 +265,7 @@ export const ALL_TABLE_SQLS = [
     { name: 'tx_sign_nonces', sql: CREATE_TX_SIGN_NONCES_SQL, indexes: CREATE_TX_SIGN_NONCES_INDEXES_SQL },
     { name: 'webauthn_challenges', sql: CREATE_WEBAUTHN_CHALLENGES_SQL, indexes: CREATE_WEBAUTHN_CHALLENGES_INDEXES_SQL },
     { name: 'account_freezes', sql: CREATE_ACCOUNT_FREEZES_SQL, indexes: CREATE_ACCOUNT_FREEZES_INDEXES_SQL },
+    { name: 'pinned_contract', sql: CREATE_PINNED_CONTRACT_SQL, indexes: [] },
     { name: '_sync_log', sql: CREATE_SYNC_LOG_SQL, indexes: CREATE_SYNC_LOG_INDEXES_SQL },
     { name: '_sync_peers', sql: CREATE_SYNC_PEERS_SQL, indexes: [] },
     { name: '_tombstones', sql: CREATE_TOMBSTONES_SQL, indexes: [] },

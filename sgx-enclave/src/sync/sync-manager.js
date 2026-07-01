@@ -81,9 +81,11 @@ export class SyncManager {
      * @param {number} [options.httpPort]
      * @param {number} [options.numShards]
      * @param {function(): number|Promise<number>} [options.getMinQuorum]
+     * @param {object} [options.contractClient] - ContractClient 实例，用于 peer pin-check 验证
      */
     constructor(options) {
         this.peerUrls = options.peerUrls || [];
+        this._contractClient = options.contractClient || null;
         this.listenPort = options.listenPort || DEFAULT_LISTEN_PORT;
         this._numShards = options.numShards || DEFAULT_NUM_SHARDS;
         this._httpPort = options.httpPort || 3000;
@@ -114,6 +116,10 @@ export class SyncManager {
 
         // peerId → ws 映射
         this._peerWsMap = new Map();
+        // 已通过 pin-check 的 peerId 集合
+        this._pinCheckedPeers = new Set();
+        // 等待对端 pin-check 的 Promise resolve 队列
+        this._pinCheckWaiters = new Map(); // peerId → { resolve, reject }
 
         const defaultMinQuorum = (this.peerUrls.length > 0) ? 2 : 1;
         this._getMinQuorum = typeof options.getMinQuorum === 'function'
@@ -228,6 +234,8 @@ export class SyncManager {
             try { ws.close(); } catch (_) {}
         }
         this._peerWsMap.clear();
+        this._pinCheckedPeers.clear();
+        this._pinCheckWaiters.clear();
 
         if (this.wss) { this.wss.close(); this.wss = null; }
         if (this._httpsServer) { this._httpsServer.close(); this._httpsServer = null; }
@@ -366,12 +374,19 @@ export class SyncManager {
                 this._registerWs(peerId, ws);
                 this.engine.peerConnected(peerId, { direction: 'inbound' });
 
+                // 先刷新合约缓存（可能合约有迁移），再发送 pin-check 握手
+                this._refreshAndSendPinCheck(peerId, ws);
+
                 ws.on('message', (data) => {
-                    this.engine.receiveMessage(peerId, data.toString());
+                    const msgStr = data.toString();
+                    if (this._handlePinCheckMessage(peerId, ws, msgStr)) return;
+                    this.engine.receiveMessage(peerId, msgStr);
                 });
                 ws.on('close', () => {
                     this.engine.peerDisconnected(peerId);
                     this._peerWsMap.delete(peerId);
+                    this._pinCheckedPeers.delete(peerId);
+                    this._pinCheckWaiters.delete(peerId);
                 });
                 ws.on('error', (err) => {
                     console.error('[SyncManager] Inbound error:', err.message);
@@ -435,13 +450,17 @@ export class SyncManager {
             });
 
             ws.on('message', (data) => {
-                this.engine.receiveMessage(url, data.toString());
+                const msgStr = data.toString();
+                if (this._handlePinCheckMessage(url, ws, msgStr)) return;
+                this.engine.receiveMessage(url, msgStr);
             });
 
             ws.on('close', () => {
                 console.log('[SyncManager] Disconnected from peer: ' + url);
                 this.engine.peerDisconnected(url);
                 this._peerWsMap.delete(url);
+                this._pinCheckedPeers.delete(url);
+                this._pinCheckWaiters.delete(url);
                 if (this._started && !ws._dedupClosed) {
                     this._addToPending(url);
                 }
@@ -465,10 +484,221 @@ export class SyncManager {
         this.pendingConnections.delete(url);
         this._registerWs(url, ws);
         this.engine.peerConnected(url, { direction: 'outbound' });
+        // 先刷新合约缓存（可能合约有迁移），再发送 pin-check 握手
+        this._refreshAndSendPinCheck(url, ws);
     }
 
     _registerWs(peerId, ws) {
         this._peerWsMap.set(peerId, ws);
+    }
+
+    // ========== Pin-Check 握手 ==========
+
+    /**
+     * 先刷新合约缓存（可能合约有迁移，需要拿到最新身份），再发送 pin-check。
+     * 刷新失败不阻塞——用当前缓存的身份发送。
+     */
+    async _refreshAndSendPinCheck(peerId, ws) {
+        try {
+            if (this._contractClient) {
+                await this._contractClient.refreshCache();
+            }
+        } catch (err) {
+            console.warn('[SyncManager] pin-check: pre-send contract refresh failed for ' + peerId + ': ' + err.message);
+        }
+        this._sendPinCheck(peerId, ws);
+    }
+
+    /**
+     * 发送本节点的 pinned 合约身份给对端。
+     * 消息格式: JSON { type: 'pin-check', rpcUrl, contractAddress, chainId }
+     * 如果没有 contractClient 或尚未 pin，发送 type='pin-check' 且 rpcUrl/contractAddress/chainId 为 null。
+     */
+    _sendPinCheck(peerId, ws) {
+        const identity = this._contractClient?.getPinnedIdentity?.() || null;
+        const msg = JSON.stringify({
+            type: 'pin-check',
+            rpcUrl: identity?.rpcUrl || null,
+            contractAddress: identity?.contractAddress || null,
+            chainId: identity?.chainId ?? null,
+            allowNonRaTls: identity?.allowNonRaTls ?? null,
+        });
+        try {
+            if (ws.readyState === WebSocket.OPEN) {
+                ws.send(msg);
+            }
+        } catch (err) {
+            console.error('[SyncManager] _sendPinCheck failed for ' + peerId + ':', err.message);
+        }
+    }
+
+    /**
+     * 处理收到的 pin-check 握手消息。如果是 pin-check 消息则拦截，返回 true。
+     * 验证对端的 pinned 身份是否与本节点一致：
+     *   - 一致 → 标记通过，允许后续通信
+     *   - 不一致或本节点尚未 pin → 尝试刷新合约后再比较
+     *   - 仍不一致 → 断开连接
+     *
+     * @returns {boolean} true 表示消息已被拦截（是 pin-check 消息），false 表示不是 pin-check 消息
+     */
+    _handlePinCheckMessage(peerId, ws, msgStr) {
+        let msg;
+        try {
+            msg = JSON.parse(msgStr);
+        } catch (_) {
+            return false; // 不是 JSON，交给 SyncEngine
+        }
+        if (!msg || (msg.type !== 'pin-check' && msg.type !== 'pin-check-ack')) return false;
+
+        // pin-check-ack: 对端告知验证结果
+        if (msg.type === 'pin-check-ack') {
+            if (msg.ok) {
+                this._pinCheckedPeers.add(peerId);
+                this._resolvePinCheckWaiter(peerId, true);
+            } else {
+                this._resolvePinCheckWaiter(peerId, false);
+                // 对端拒绝了我们的 pin-check，断开连接
+                console.warn('[SyncManager] pin-check: rejected by peer ' + peerId + ' — disconnecting');
+                try { ws.close(); } catch (_) {}
+            }
+            return true;
+        }
+
+        // pin-check: 对端发来了它的身份，需要验证
+
+        // 已通过 pin-check 的 peer 不需要重复验证
+        if (this._pinCheckedPeers.has(peerId)) {
+            // 回复 ack（对端可能还在等）
+            this._sendPinCheckAck(ws, true);
+            return true;
+        }
+
+        // 异步验证
+        this._verifyPeerPin(peerId, ws, msg).catch((err) => {
+            console.error('[SyncManager] pin-check verification error for ' + peerId + ':', err.message);
+        });
+
+        return true;
+    }
+
+    /**
+     * 验证对端 pinned 身份是否与本节点一致。
+     * 不一致时尝试刷新合约（可能合约迁移了），刷新后仍不一致则断开。
+     */
+    async _verifyPeerPin(peerId, ws, peerPin) {
+        const localPin = this._contractClient?.getPinnedIdentity?.() || null;
+
+        // 如果本节点尚未 pin，先尝试刷新合约以触发 pin
+        if (!localPin) {
+            console.warn('[SyncManager] pin-check: local node has no pinned identity — attempting contract refresh');
+            try {
+                await this._contractClient?.refreshCache();
+            } catch (err) {
+                console.error('[SyncManager] pin-check: contract refresh failed:', err.message);
+            }
+        }
+
+        const localPinAfterRefresh = this._contractClient?.getPinnedIdentity?.() || null;
+
+        // 对端也没有 pin（双方都是首次部署）
+        if (!peerPin.rpcUrl && !peerPin.contractAddress && peerPin.chainId == null) {
+            if (!localPinAfterRefresh) {
+                // 双方都未 pin，允许通信（首次部署场景）
+                console.log('[SyncManager] pin-check: both nodes unpinned — allowing (first deployment)');
+                this._pinCheckedPeers.add(peerId);
+                this._sendPinCheckAck(ws, true);
+                this._resolvePinCheckWaiter(peerId, true);
+                return;
+            }
+            // 本节点已 pin 但对端没有 → 拒绝
+            console.warn('[SyncManager] pin-check: local pinned but peer has no pin — rejecting ' + peerId);
+            this._sendPinCheckAck(ws, false);
+            this._rejectAndClose(peerId, ws, 'peer has no pinned identity');
+            return;
+        }
+
+        // 比较三元组
+        const match = this._pinIdentityMatches(localPinAfterRefresh, peerPin);
+        if (match) {
+            console.log('[SyncManager] pin-check: identity matches with ' + peerId);
+            this._pinCheckedPeers.add(peerId);
+            this._sendPinCheckAck(ws, true);
+            this._resolvePinCheckWaiter(peerId, true);
+            return;
+        }
+
+        // 不一致 → 尝试刷新合约（可能合约刚迁移，本节点还没同步）
+        console.warn('[SyncManager] pin-check: identity mismatch with ' + peerId +
+            ' — local=' + JSON.stringify(localPinAfterRefresh) +
+            ' peer=' + JSON.stringify({ rpcUrl: peerPin.rpcUrl, contractAddress: peerPin.contractAddress, chainId: peerPin.chainId }) +
+            ' — attempting contract refresh');
+
+        try {
+            await this._contractClient?.refreshCache();
+        } catch (err) {
+            console.error('[SyncManager] pin-check: contract refresh failed:', err.message);
+        }
+
+        const localPinAfterRefresh2 = this._contractClient?.getPinnedIdentity?.() || null;
+        const match2 = this._pinIdentityMatches(localPinAfterRefresh2, peerPin);
+        if (match2) {
+            console.log('[SyncManager] pin-check: identity matches after refresh with ' + peerId);
+            this._pinCheckedPeers.add(peerId);
+            this._sendPinCheckAck(ws, true);
+            this._resolvePinCheckWaiter(peerId, true);
+            return;
+        }
+
+        // 仍不一致 → 断开连接
+        console.warn('[SyncManager] pin-check: identity still mismatched after refresh — rejecting ' + peerId);
+        this._sendPinCheckAck(ws, false);
+        this._rejectAndClose(peerId, ws, 'pinned identity mismatch after refresh');
+    }
+
+    /**
+     * 比较两个 pinned 身份是否一致（rpcUrl + contractAddress + chainId）
+     */
+    _pinIdentityMatches(local, peer) {
+        if (!local || !peer) return false;
+        return (
+            local.rpcUrl === peer.rpcUrl &&
+            local.contractAddress === peer.contractAddress &&
+            Number(local.chainId) === Number(peer.chainId) &&
+            !!local.allowNonRaTls === !!peer.allowNonRaTls
+        );
+    }
+
+    /**
+     * 发送 pin-check ack（让对端知道验证结果）
+     */
+    _sendPinCheckAck(ws, ok) {
+        const msg = JSON.stringify({ type: 'pin-check-ack', ok });
+        try {
+            if (ws.readyState === WebSocket.OPEN) {
+                ws.send(msg);
+            }
+        } catch (_) {}
+    }
+
+    /**
+     * 拒绝并断开连接
+     */
+    _rejectAndClose(peerId, ws, reason) {
+        console.warn('[SyncManager] pin-check REJECT: ' + peerId + ' — ' + reason + ' — disconnecting');
+        this._resolvePinCheckWaiter(peerId, false);
+        try { ws.close(); } catch (_) {}
+    }
+
+    /**
+     * 解除等待 pin-check 结果的 Promise
+     */
+    _resolvePinCheckWaiter(peerId, ok) {
+        const waiter = this._pinCheckWaiters.get(peerId);
+        if (waiter) {
+            this._pinCheckWaiters.delete(peerId);
+            if (ok) waiter.resolve();
+            else waiter.reject(new Error('pin-check failed for ' + peerId));
+        }
     }
 
     // ========== 重连 ==========

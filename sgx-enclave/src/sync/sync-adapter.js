@@ -142,6 +142,10 @@ export const BUSINESS_TABLES = {
         keyColumns: ['authorization_id', 'guid'],
         dataColumns: ['authorization_id', 'guid', 'created_at', '_hlc'],
     },
+    pinned_contract: {
+        keyColumns: ['id'],
+        dataColumns: ['id', 'rpc_url', 'chain_id', 'contract_address', 'allow_non_ra_tls', 'snapshot_json', 'pinned_at', 'updated_at', '_hlc'],
+    },
 };
 
 /**

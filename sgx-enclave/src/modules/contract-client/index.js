@@ -86,11 +86,16 @@ export class ContractClient {
    * @param {string} options.rpcUrl - 区块链 RPC 地址
    * @param {number|string} options.chainId - 链 ID
    * @param {string} options.contractAddress - 合约部署地址
+   * @param {import('./contract-pin-store.js').ContractPinStore} [options.pinStore] - 合约身份钉住存储（可选）
    */
   constructor(options) {
     this._rpcUrl = options.rpcUrl || null;
     this._chainId = options.chainId ? Number(options.chainId) : null;
     this._contractAddress = options.contractAddress || null;
+
+    // 合约身份钉住存储（sealed）。存在时启用 TOFU 钉住 + 永久忽略 env 的安全策略。
+    this._pinStore = options.pinStore || null;
+    this._pinned = false; // 本次运行是否已加载到钉住记录
 
     this._provider = null;
     this._contract = null;
@@ -120,6 +125,10 @@ export class ContractClient {
    */
   async initialize() {
     console.log(`[ContractClient] initialize: rpcUrl=${this._rpcUrl}, contractAddress=${this._contractAddress}, chainId=${this._chainId}`);
+
+    // 0. 合约身份钉住（TOFU）：若曾成功读到过合约，永久锁定该合约身份，
+    //    忽略环境变量里的合约连接参数；并预载最近一次已知的安全配置快照。
+    this._loadPinAndOverrideIdentity();
 
     // 1. 读取合约数据（合约配置不全或连不上时为 null，只报错不抛异常）
     let contractData = null;
@@ -152,8 +161,13 @@ export class ContractClient {
       console.warn(`[ContractClient] initialize: contract config incomplete (missing: ${missing.join(', ')}), skipping contract read`);
     }
 
-    // 2. 合并环境变量 + 合约数据 → 唯一配置
-    this._mergeAndApplyCache(contractData);
+    // 2. 应用合约数据。合约不可读时保留已预载的最后已知快照（或初始空缓存），
+    //    绝不回退到环境变量提供的配置。
+    if (contractData) {
+      this._applyContractData(contractData);
+    } else {
+      console.warn(`[ContractClient] initialize: contract data unavailable, using ${this._pinned ? 'last-known-good snapshot' : 'code defaults'} (env config is NOT used)`);
+    }
 
     // 3. 启动定时器（仅当 RPC URL 已配置时）
     if (this._rpcUrl && this._chainId && this._contractAddress) {
@@ -183,7 +197,7 @@ export class ContractClient {
     if (!this._contract) return;
     const contractData = await this._readContractData();
     this._contractAvailable = true;
-    this._mergeAndApplyCache(contractData);
+    this._applyContractData(contractData);
   }
 
   /**
@@ -196,16 +210,27 @@ export class ContractClient {
       codeRepository,
       platformWhitelistRaw,
       enclaveWhitelistRaw,
+      migrationTarget,
     ] = await Promise.all([
       this._contract.getRuntimeParams(),
       this._contract.getCodeRepository(),
       this._contract.getPlatformWhitelist(),
       this._contract.getEnclaveWhitelist(),
+      this._contract.getMigrationTarget(),
     ]);
 
     let runtimeParams = null;
     if (runtimeParamsStr && runtimeParamsStr.length > 0) {
       runtimeParams = JSON.parse(runtimeParamsStr);
+    }
+
+    let migration = null;
+    if (migrationTarget && migrationTarget.rpcUrl && migrationTarget.contractAddress && Number(migrationTarget.chainId) > 0) {
+      migration = {
+        rpcUrl: migrationTarget.rpcUrl,
+        contractAddress: migrationTarget.contractAddress,
+        chainId: Number(migrationTarget.chainId),
+      };
     }
 
     return {
@@ -217,15 +242,36 @@ export class ContractClient {
         isvprodid: Number(item.isvprodid), isvsvn: Number(item.isvsvn),
         description: item.description,
       })),
+      migration,
     };
   }
 
   /**
-   * 用合约数据原子替换缓存
-   * 合约是唯一真理源；env 不再提供 fallback
-   * @param {Object|null} contractData - 从合约读取的数据（null 表示合约数据不可用）
+   * 应用一次成功读到的合约数据：
+   *   1. 用合约数据原子替换缓存（合约是唯一真理源；env 不提供 fallback）
+   *   2. 持久化钉住记录（身份 + 最近一次已知的安全配置快照）
+   * 仅在成功读到合约数据时调用（contractData 非空）。
+   * @param {Object} contractData - 从合约读取的数据
    */
-  _mergeAndApplyCache(contractData) {
+  _applyContractData(contractData) {
+    this._buildCache(contractData, true);
+    this._savePin(contractData);
+
+    // 合约迁移：当前合约声明了迁移目标（rpcUrl + contractAddress + chainId）
+    if (contractData.migration) {
+      this._handleMigration(contractData.migration).catch((err) => {
+        console.error(`[ContractClient] migration failed: ${err.message}`);
+      });
+    }
+  }
+
+  /**
+   * 根据合约数据（或快照）构建缓存
+   * @param {Object|null} contractData - 合约数据 / 快照（同结构）
+   * @param {boolean} markRefreshed - true 表示这是新鲜的合约数据（更新 lastRefreshedAt）；
+   *                                  false 表示这是预载的历史快照（保留原 lastRefreshedAt）
+   */
+  _buildCache(contractData, markRefreshed) {
     const contract = contractData || {};
 
     const runtimeParams = contract.runtimeParams || null;
@@ -250,17 +296,112 @@ export class ContractClient {
       enclaveWhitelist,
       enclaveWhitelistMap,
       codeRepository: mergedCodeRepository,
-      lastRefreshedAt: Date.now(),
+      lastRefreshedAt: markRefreshed ? Date.now() : (this._cache?.lastRefreshedAt || 0),
     };
 
-    console.log(`[ContractClient] _mergeAndApplyCache: platformWhitelist=${platformWhitelist.length}, enclaveWhitelist=${enclaveWhitelist.length}, hasRuntimeParams=${!!runtimeParams}, contractAvailable=${this._contractAvailable}`);
+    console.log(`[ContractClient] _buildCache: platformWhitelist=${platformWhitelist.length}, enclaveWhitelist=${enclaveWhitelist.length}, hasRuntimeParams=${!!runtimeParams}, fresh=${markRefreshed}, contractAvailable=${this._contractAvailable}`);
     if (runtimeParams) {
-      console.log(`[ContractClient] _mergeAndApplyCache: runtimeParams keys=${Object.keys(runtimeParams).join(', ')}`);
+      console.log(`[ContractClient] _buildCache: runtimeParams keys=${Object.keys(runtimeParams).join(', ')}`);
     }
 
     // 更新定时器间隔（仅在正常刷新模式下生效；重连模式下由 _onReconnectTick 管理）
-    if (!this._reconnecting && runtimeParams?.cache?.refreshInterval) {
+    if (markRefreshed && !this._reconnecting && runtimeParams?.cache?.refreshInterval) {
       this._restartRefreshTimer(runtimeParams.cache.refreshInterval);
+    }
+  }
+
+  /**
+   * 加载钉住记录并覆盖合约身份（在 initialize 最开始调用）
+   *
+   * 安全策略：
+   *   - 若存在钉住记录，永久使用钉住的合约身份，忽略环境变量里的连接参数；
+   *   - 预载最近一次已知的安全配置快照，使得钉住合约不可达时也有可用配置，
+   *     绝不回退到环境变量。
+   */
+  _loadPinAndOverrideIdentity() {
+    if (!this._pinStore) return;
+
+    let pinned = null;
+    try {
+      pinned = this._pinStore.load();
+    } catch (err) {
+      console.error(`[ContractClient] _loadPinAndOverrideIdentity: failed to load pin: ${err.message}`);
+      return;
+    }
+    if (!pinned) {
+      console.log('[ContractClient] no pinned contract yet (TOFU): will pin on first successful contract read');
+      return;
+    }
+
+    this._pinned = true;
+
+    const envDiffers =
+      this._rpcUrl !== pinned.rpcUrl ||
+      this._chainId !== pinned.chainId ||
+      this._contractAddress !== pinned.contractAddress;
+    if (envDiffers) {
+      console.warn(
+        `[ContractClient] SECURITY: env contract identity differs from pinned identity — ignoring env. ` +
+          `env=(rpcUrl=${this._rpcUrl}, chainId=${this._chainId}, address=${this._contractAddress}), ` +
+          `pinned=(rpcUrl=${pinned.rpcUrl}, chainId=${pinned.chainId}, address=${pinned.contractAddress})`
+      );
+    }
+
+    // 永久锁定钉住身份
+    this._rpcUrl = pinned.rpcUrl;
+    this._chainId = pinned.chainId;
+    this._contractAddress = pinned.contractAddress;
+    this._pinnedAllowNonRaTls = pinned.allowNonRaTls;
+
+    // 预载最后已知快照（不标记为新鲜）
+    if (pinned.snapshot) {
+      this._buildCache(pinned.snapshot, false);
+      console.log('[ContractClient] preloaded last-known-good contract snapshot from sealed store');
+    }
+  }
+
+  /**
+   * 持久化钉住记录：首次成功读到合约数据时钉住身份，之后每次刷新更新快照。
+   * 身份一旦钉住不可更改（由 ContractPinStore 保证）。
+   * @param {Object} contractData - 成功读到的合约数据（作为最后已知快照）
+   */
+  _savePin(contractData) {
+    if (!this._pinStore) return;
+    try {
+      // 从合约数据中提取 allowNonRaTls
+      const allowNonRaTls = !!(contractData.runtimeParams?.attestation?.allowNonRaTls);
+      this._pinStore.save({
+        rpcUrl: this._rpcUrl,
+        chainId: this._chainId,
+        contractAddress: this._contractAddress,
+        allowNonRaTls,
+        snapshot: contractData,
+      });
+      this._pinned = true;
+      this._pinnedAllowNonRaTls = allowNonRaTls;
+    } catch (err) {
+      console.error(`[ContractClient] _savePin: failed to persist pin: ${err.message}`);
+    }
+  }
+
+  /**
+   * 获取当前钉住的合约身份（供 SyncManager peer 验证用）
+   * @returns {{ rpcUrl: string, chainId: number, contractAddress: string }|null}
+   */
+  getPinnedIdentity() {
+    if (!this._pinStore) return null;
+    try {
+      const pinned = this._pinStore.load();
+      if (!pinned) return null;
+      return {
+        rpcUrl: pinned.rpcUrl,
+        chainId: pinned.chainId,
+        contractAddress: pinned.contractAddress,
+        allowNonRaTls: pinned.allowNonRaTls,
+      };
+    } catch (err) {
+      console.error(`[ContractClient] getPinnedIdentity: ${err.message}`);
+      return null;
     }
   }
 
@@ -606,16 +747,155 @@ export class ContractClient {
       this._scheduleReconnect();
     }
   }
+
+  /**
+   * 合约迁移：当前合约声明了迁移目标，验证新合约可用后切换。
+   *
+   * 流程：
+   *   1. 用迁移目标参数创建新 provider/contract
+   *   2. 从新合约读取数据（必须返回非空 runtimeParams）
+   *   3. 验证通过 → 更新 pin 身份 + 快照，切换 provider/contract，重建缓存
+   *   4. 验证失败 → 保持旧合约不变，仅日志告警
+   *
+   * @param {{ rpcUrl: string, contractAddress: string, chainId: number }} migration
+   */
+  async _handleMigration(migration) {
+    // 如果迁移目标和当前身份一致，无需迁移
+    if (
+      migration.rpcUrl === this._rpcUrl &&
+      migration.contractAddress === this._contractAddress &&
+      migration.chainId === this._chainId
+    ) {
+      return;
+    }
+
+    console.log(
+      `[ContractClient] migration target detected: rpcUrl=${migration.rpcUrl}, chainId=${migration.chainId}, address=${migration.contractAddress}`
+    );
+
+    // 1. 创建新 provider/contract
+    let newProvider, newContract;
+    try {
+      const network = ethers.Network.from(migration.chainId);
+      newProvider = new ethers.JsonRpcProvider(migration.rpcUrl, network, { staticNetwork: network });
+      newContract = new ethers.Contract(migration.contractAddress, CONTRACT_ABI, newProvider);
+    } catch (err) {
+      console.error(`[ContractClient] migration: failed to create new provider/contract: ${err.message}`);
+      return;
+    }
+
+    // 2. 从新合约读取数据
+    let newData;
+    try {
+      newData = await this._readContractDataFrom(newContract);
+    } catch (err) {
+      console.error(`[ContractClient] migration: failed to read from new contract: ${err.message}`);
+      return;
+    }
+
+    // 3. 验证：新合约必须返回非空 runtimeParams（必须的运行时参数）
+    if (!newData.runtimeParams) {
+      console.error(`[ContractClient] migration: new contract returned empty runtimeParams — aborting migration`);
+      return;
+    }
+
+    // 4. 验证通过 → 更新 pin 身份 + 快照
+    if (this._pinStore) {
+      try {
+        const allowNonRaTls = !!(newData.runtimeParams?.attestation?.allowNonRaTls);
+        this._pinStore.updateIdentity({
+          rpcUrl: migration.rpcUrl,
+          chainId: migration.chainId,
+          contractAddress: migration.contractAddress,
+          allowNonRaTls,
+          snapshot: newData,
+        });
+        this._pinnedAllowNonRaTls = allowNonRaTls;
+      } catch (err) {
+        console.error(`[ContractClient] migration: failed to update pin: ${err.message}`);
+        return;
+      }
+    }
+
+    // 5. 切换 provider/contract，更新身份
+    this._rpcUrl = migration.rpcUrl;
+    this._chainId = migration.chainId;
+    this._contractAddress = migration.contractAddress;
+    this._provider = newProvider;
+    this._contract = newContract;
+
+    // 6. 用新合约数据重建缓存
+    this._buildCache(newData, true);
+    this._pinned = true;
+
+    console.log(
+      `[ContractClient] migration complete: switched to rpcUrl=${migration.rpcUrl}, chainId=${migration.chainId}, address=${migration.contractAddress}`
+    );
+  }
+
+  /**
+   * 从指定的 contract 实例读取数据（不使用 this._contract）
+   * 供迁移时读取新合约使用
+   * @param {import('ethers').Contract} contract
+   * @returns {Promise<Object>}
+   */
+  async _readContractDataFrom(contract) {
+    const [
+      runtimeParamsStr,
+      codeRepository,
+      platformWhitelistRaw,
+      enclaveWhitelistRaw,
+      migrationTarget,
+    ] = await Promise.all([
+      contract.getRuntimeParams(),
+      contract.getCodeRepository(),
+      contract.getPlatformWhitelist(),
+      contract.getEnclaveWhitelist(),
+      contract.getMigrationTarget(),
+    ]);
+
+    let runtimeParams = null;
+    if (runtimeParamsStr && runtimeParamsStr.length > 0) {
+      runtimeParams = JSON.parse(runtimeParamsStr);
+    }
+
+    let migration = null;
+    if (migrationTarget && migrationTarget.rpcUrl && migrationTarget.contractAddress && Number(migrationTarget.chainId) > 0) {
+      migration = {
+        rpcUrl: migrationTarget.rpcUrl,
+        contractAddress: migrationTarget.contractAddress,
+        chainId: Number(migrationTarget.chainId),
+      };
+    }
+
+    return {
+      runtimeParams,
+      codeRepository,
+      platformWhitelist: Array.from(platformWhitelistRaw),
+      enclaveWhitelist: enclaveWhitelistRaw.map((item) => ({
+        mrenclave: item.mrenclave, mrsigner: item.mrsigner,
+        isvprodid: Number(item.isvprodid), isvsvn: Number(item.isvsvn),
+        description: item.description,
+      })),
+      migration,
+    };
+  }
 }
 
 /**
  * 从环境变量读取合约连接参数并创建 ContractClient
+ *
+ * 注意：环境变量里的合约连接参数只在“尚未钉住任何合约”（TOFU 首次运行）时生效。
+ * 一旦成功读过合约并钉住身份，pinStore 会在 initialize 时覆盖这些 env 参数，
+ * 使 enclave 永久使用钉住的合约身份，防止通过 env 注入替换合约。
+ *
+ * @param {import('./contract-pin-store.js').ContractPinStore} [pinStore] - 合约身份钉住存储（可选）
  * @returns {ContractClient}
  */
-export function createContractClientFromEnv() {
+export function createContractClientFromEnv(pinStore = null) {
   const rpcUrl = process.env.CONTRACT_RPC_URL;
   const chainId = process.env.CONTRACT_CHAIN_ID;
   const contractAddress = process.env.CONTRACT_ADDRESS;
-  console.log(`[ContractClient] createContractClientFromEnv: rpcUrl=${rpcUrl}, chainId=${chainId}, contractAddress=${contractAddress}`);
-  return new ContractClient({ rpcUrl, chainId, contractAddress });
+  console.log(`[ContractClient] createContractClientFromEnv: rpcUrl=${rpcUrl}, chainId=${chainId}, contractAddress=${contractAddress}, pinStore=${!!pinStore}`);
+  return new ContractClient({ rpcUrl, chainId, contractAddress, pinStore });
 }

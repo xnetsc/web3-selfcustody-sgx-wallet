@@ -26,6 +26,7 @@ import crypto from 'crypto';
 import { LazyConnectionManager, DB_PATH, cleanExpiredSessions, cleanExpiredExportSessions } from './src/database/index.js';
 import { CertificateVerifier } from '@xnetx/sgx-ra-tls-verify';
 import { createContractClientFromEnv } from './src/modules/contract-client/index.js';
+import { ContractPinStore } from './src/modules/contract-client/contract-pin-store.js';
 import { SyncManager } from './src/sync/sync-manager.js';
 import { HLC } from '@xnetx/raft-hlc-sync';
 
@@ -62,15 +63,25 @@ import { createApp, startServer } from './src/server.js';
 async function main() {
   console.log('[SGX Enclave] Starting...');
 
-  // 1. 加载配置：读取环境变量 + 读取合约 → 合并成唯一配置
-  //    合约配置缺失/不全/连不上时只报错，不抛异常，不退出
-  const contractClient = createContractClientFromEnv();
-  await contractClient.initialize();
-  console.log(`[SGX Enclave] Config client initialized (contractAvailable=${contractClient.isContractAvailable()})`);
-
-  // 2. SQLite 配置（硬编码路径，不可配置）
+  // 1. SQLite 配置（硬编码路径，不可配置）
   const sqliteConfig = { dbPath: DB_PATH };
   console.log(`[SGX Enclave] SQLite config: dbPath=${sqliteConfig.dbPath}`);
+
+  // 2. 创建数据库连接管理器并立即初始化。
+  //    必须在合约客户端之前完成：合约身份钉住存储（ContractPinStore）依赖 sealed DB。
+  const connectionManager = new LazyConnectionManager(sqliteConfig);
+  // 强制初始化以获取 db 实例（合约钉住 / sync-manager 启动前需要）
+  connectionManager.readQuery('SELECT 1');
+  console.log('[SGX Enclave] ConnectionManager initialized');
+
+  // 3. 加载配置：读取合约 → 唯一配置来源。
+  //    合约身份钉住（TOFU）：首次成功读到合约后永久锁定合约身份，
+  //    忽略环境变量里的合约连接参数；钉住合约不可达时用最后已知快照，绝不回退 env。
+  //    合约配置缺失/不全/连不上时只报错，不抛异常，不退出。
+  const pinStore = new ContractPinStore(connectionManager);
+  const contractClient = createContractClientFromEnv(pinStore);
+  await contractClient.initialize();
+  console.log(`[SGX Enclave] Config client initialized (contractAvailable=${contractClient.isContractAvailable()})`);
 
   // 同步节点配置（可选，不设置则单节点运行）
   const syncNodesStr = process.env.SYNC_NODES || '';
@@ -116,21 +127,15 @@ async function main() {
     return defaultMinQuorum;
   };
 
-  // 4. 最终校验：合并后所有配置已加载
-  //    runtimeParams 可能为 null（未设置 RUNTIME_PARAMS 且无合约），此时所有参数使用代码默认值
-  //    合约连接非必须，缺失只警告不退出
+  // 4. 最终校验：配置已加载
+  //    runtimeParams 可能为 null（无合约且无钉住快照），此时所有参数使用代码默认值
+  //    合约连接非必须，缺失只警告不退出；绝不回退到环境变量提供的运行时配置
   //    SQLite DB path 硬编码在 constants.js 中，不需要环境变量
   if (!contractClient.isContractAvailable()) {
-    console.warn('[SGX Enclave] Contract connection unavailable — running with env-only config, some functions (e.g. authorization revocation) may be limited');
+    console.warn('[SGX Enclave] Contract connection unavailable — using last-known-good pinned snapshot or code defaults (env runtime config is NOT used); some functions (e.g. authorization revocation) may be limited');
   } else {
     console.log('[SGX Enclave] All config sources loaded successfully');
   }
-
-  // 6. 创建数据库连接管理器并立即初始化（sync 需要 db 实例）
-  const connectionManager = new LazyConnectionManager(sqliteConfig);
-  // 强制初始化以获取 db 实例（sync-manager 启动前需要）
-  connectionManager.readQuery('SELECT 1');
-  console.log('[SGX Enclave] ConnectionManager initialized');
 
   // 7. 启动 WSS 同步管理器（如果有 peer 节点或需要监听）
   let syncManager = null;
@@ -143,7 +148,15 @@ async function main() {
   const hlc = new HLC(nodeId, () => ({ value: Date.now(), unit: 'ms' }));
 
   // Attestation 配置 — 从 runtimeParams.attestation 读取（合约 > env RUNTIME_PARAMS > 默认值）
+  // 但如果已 pin，allowNonRaTls 以 pin 的值为准，忽略合约/env 的值
   const attestationConfig = runtimeParams.attestation || {};
+  const pinnedIdentity = contractClient.getPinnedIdentity();
+  const allowNonRaTls = pinnedIdentity
+    ? pinnedIdentity.allowNonRaTls
+    : !!attestationConfig.allowNonRaTls;
+  if (pinnedIdentity) {
+    console.log(`[SGX Enclave] allowNonRaTls=${allowNonRaTls} (from pinned identity, ignoring env/contract)`);
+  }
 
   // 构建 RA-TLS选项(enclaveWhitelist 数组等，来自合约或环境变量）
   const raTlsOpts = {};
@@ -182,7 +195,6 @@ async function main() {
   raTlsOpts.allowHwConfigNeeded = !!attestationConfig.allowHwConfigNeeded;
   raTlsOpts.allowSwHardeningNeeded = !!attestationConfig.allowSwHardeningNeeded;
 
-  const allowNonRaTls = !!attestationConfig.allowNonRaTls;
   const verifier = new CertificateVerifier({
     allowNonRaTls,
     raTlsOptions: raTlsOpts,
@@ -213,6 +225,7 @@ async function main() {
     httpPort,
     numShards,
     getMinQuorum,
+    contractClient,
   });
 
   await syncManager.start();
