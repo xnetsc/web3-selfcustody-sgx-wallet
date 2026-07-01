@@ -29,7 +29,6 @@ sgx-wallet/
 │   │   │   └── sync/              # Multi-node 2PC synchronization
 │   │   └── database/   # SQLite schema & connection pooling
 ├── test-integration/   # End-to-end integration tests
-└── docs/               # Design documents and API reference
 ```
 
 ### Key Components
@@ -253,7 +252,7 @@ All responses include:
 | `POST /api/enclave/info` | Get enclave identity and attestation info |
 | `POST /api/admin/userId/list` | List all user IDs (platform admin) |
 
-For full request/response schemas, see [`docs/sgx-enclave-api.md`](docs/sgx-enclave-api.md).
+For full request/response schemas, see docs.
 
 ## Security Model
 
@@ -266,14 +265,14 @@ For full request/response schemas, see [`docs/sgx-enclave-api.md`](docs/sgx-encl
 
 ## Documentation
 
-Detailed design documents are in the [`docs/`](docs/) directory:
+Detailed design documents are in the docs/ directory:
 
-- [`docs/master-rules.md`](docs/master-rules.md) — Project governance, architecture, and data models
-- [`docs/eoa-wallet-solution.md`](docs/eoa-wallet-solution.md) — Full wallet design for mobile clients
-- [`docs/sgx-enclave-api.md`](docs/sgx-enclave-api.md) — HTTP API reference
-- [`docs/authorization-json-guide.md`](docs/authorization-json-guide.md) — Authorization JSON structure reference
-- [`docs/security-risks.md`](docs/security-risks.md) — Security threat analysis
-- [`docs/details/`](docs/details/) — 30+ detailed design documents for individual modules
+- docs/master-rules.md — Project governance, architecture, and data models
+- docs/eoa-wallet-solution.md — Full wallet design for mobile clients
+- docs/sgx-enclave-api.md — HTTP API reference
+- docs/authorization-json-guide.md — Authorization JSON structure reference
+- docs/security-risks.md — Security threat analysis
+- docs/details/ — 30+ detailed design documents for individual modules
 
 ## License
 
