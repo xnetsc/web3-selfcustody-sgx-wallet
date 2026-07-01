@@ -213,6 +213,7 @@ CREATE TABLE IF NOT EXISTS pinned_contract (
     chain_id INTEGER NOT NULL,
     contract_address TEXT NOT NULL,
     allow_non_ra_tls INTEGER NOT NULL DEFAULT 0,
+    rpc_tls_ca_cert TEXT NOT NULL DEFAULT '',
     snapshot_json TEXT,
     pinned_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),

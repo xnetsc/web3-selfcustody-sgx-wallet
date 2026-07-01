@@ -27,6 +27,7 @@
  *   CONTRACT_RPC_URL   - blockchain RPC endpoint (required for normal ops)
  *   CONTRACT_CHAIN_ID  - blockchain chain ID (required)
  *   CONTRACT_ADDRESS   - WalletTrustContract address (required)
+ *   CONTRACT_RPC_TLS_CA_CERT - RPC server TLS CA certificate (base64, for TLS verification)
  *   PROXY_API_KEY      - Intel PCCS API key (sensitive)
  *
  * .env loading is disabled — dotenv is not imported, and .env is NOT in

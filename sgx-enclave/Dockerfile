@@ -27,7 +27,7 @@
 # Configuration:
 #   All runtime configuration must be supplied via `docker run -e ...` and
 #   only the variables in the manifest passthrough whitelist take effect:
-#     CONTRACT_RPC_URL / CONTRACT_CHAIN_ID / CONTRACT_ADDRESS  (bootstrap)
+#     CONTRACT_RPC_URL / CONTRACT_CHAIN_ID / CONTRACT_ADDRESS / CONTRACT_RPC_TLS_CA_CERT  (bootstrap)
 #     SGX_HTTP_PORT / SYNC_NODES / SYNC_LISTEN_PORT             (deployment)
 #     RATLS_CERT_PATH / PROXY_API_KEY                           (local/sensitive)
 #   Everything else (runtimeParams, whitelists, codeRepository, freeze

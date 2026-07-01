@@ -6,6 +6,8 @@
 
 import { ethers } from 'ethers';
 import { CONTRACT_ABI } from './abi.js';
+import https from 'node:https';
+import tls from 'node:tls';
 
 /** 默认缓存刷新间隔（毫秒），合约连接成功后的正常刷新间隔 */
 const DEFAULT_REFRESH_INTERVAL = 60000;
@@ -14,6 +16,48 @@ const DEFAULT_REFRESH_INTERVAL = 60000;
 const DEFAULT_RECONNECT_INITIAL_MS = 5000;
 const DEFAULT_RECONNECT_INCREMENT_MS = 30000;
 const DEFAULT_RECONNECT_MAX_MS = 300000;
+
+/**
+ * 判断 RPC URL 是否为本地地址（127.0.0.1 / localhost），本地地址跳过 TLS 证书验证
+ */
+function isLocalRpcUrl(rpcUrl) {
+  try {
+    const u = new URL(rpcUrl);
+    return u.hostname === '127.0.0.1' || u.hostname === 'localhost' || u.hostname === '::1';
+  } catch (_) {
+    return false;
+  }
+}
+
+/**
+ * 创建带自定义 CA 证书验证的 FetchRequest（用于 ethers v6 JsonRpcProvider）
+ * 127.0.0.1 / localhost 跳过 TLS 验证（本地测试通常用 HTTP）
+ * @param {string} rpcUrl
+ * @param {string} caCertBase64 - base64 编码的 CA 证书（PEM 或 DER）
+ * @returns {ethers.FetchRequest}
+ */
+function createFetchRequest(rpcUrl, caCertBase64) {
+  const req = new ethers.FetchRequest(rpcUrl);
+  const u = new URL(rpcUrl);
+  // HTTP (non-TLS) 和本地地址跳过 TLS 验证
+  if (u.protocol === 'http:' || isLocalRpcUrl(rpcUrl)) {
+    return req;
+  }
+  // HTTPS 非本地地址必须提供 CA 证书
+  if (!caCertBase64) {
+    throw new Error(`HTTPS RPC URL ${rpcUrl} requires TLS CA certificate but none provided`);
+  }
+  // 解码 base64 CA 证书
+  const caCertPem = caCertBase64.includes('-----BEGIN')
+    ? caCertBase64
+    : Buffer.from(caCertBase64, 'base64').toString('utf8');
+  const agent = new https.Agent({
+    ca: caCertPem,
+    rejectUnauthorized: true,
+  });
+  req.getUrlFunc = ethers.FetchRequest.createGetUrlFunc({ agent });
+  return req;
+}
 
 /**
  * 判断值是否为纯对象（非数组、非 null、非 Date 等）
@@ -92,6 +136,7 @@ export class ContractClient {
     this._rpcUrl = options.rpcUrl || null;
     this._chainId = options.chainId ? Number(options.chainId) : null;
     this._contractAddress = options.contractAddress || null;
+    this._rpcTlsCaCert = options.rpcTlsCaCert || '';
 
     // 合约身份钉住存储（sealed）。存在时启用 TOFU 钉住 + 永久忽略 env 的安全策略。
     this._pinStore = options.pinStore || null;
@@ -136,7 +181,8 @@ export class ContractClient {
       try {
         // 使用 staticNetwork 避免 ethers.js 内部连接共享导致 destroy 互相影响
         const network = ethers.Network.from(this._chainId);
-        this._provider = new ethers.JsonRpcProvider(this._rpcUrl, network, { staticNetwork: network });
+        const fetchReq = createFetchRequest(this._rpcUrl, this._rpcTlsCaCert);
+        this._provider = new ethers.JsonRpcProvider(fetchReq, network, { staticNetwork: network });
         this._contract = new ethers.Contract(
           this._contractAddress,
           CONTRACT_ABI,
@@ -163,8 +209,13 @@ export class ContractClient {
 
     // 2. 应用合约数据。合约不可读时保留已预载的最后已知快照（或初始空缓存），
     //    绝不回退到环境变量提供的配置。
+    //    例外：从未配置合约且无 pin 记录时（首次裸启动），允许从 env RUNTIME_PARAMS 启动，
+    //    但必须包含必须参数，否则报错退出。
     if (contractData) {
       this._applyContractData(contractData);
+    } else if (!this._pinned && !this._rpcUrl && !this._chainId && !this._contractAddress) {
+      // 无合约配置且无 pin → 首次裸启动，从 env RUNTIME_PARAMS 加载
+      this._loadFromEnv();
     } else {
       console.warn(`[ContractClient] initialize: contract data unavailable, using ${this._pinned ? 'last-known-good snapshot' : 'code defaults'} (env config is NOT used)`);
     }
@@ -211,12 +262,14 @@ export class ContractClient {
       platformWhitelistRaw,
       enclaveWhitelistRaw,
       migrationTarget,
+      rpcTlsCaCert,
     ] = await Promise.all([
       this._contract.getRuntimeParams(),
       this._contract.getCodeRepository(),
       this._contract.getPlatformWhitelist(),
       this._contract.getEnclaveWhitelist(),
       this._contract.getMigrationTarget(),
+      this._contract.getRpcTlsCaCert(),
     ]);
 
     let runtimeParams = null;
@@ -230,6 +283,7 @@ export class ContractClient {
         rpcUrl: migrationTarget.rpcUrl,
         contractAddress: migrationTarget.contractAddress,
         chainId: Number(migrationTarget.chainId),
+        rpcTlsCaCert: migrationTarget.rpcTlsCaCert || '',
       };
     }
 
@@ -242,6 +296,7 @@ export class ContractClient {
         isvprodid: Number(item.isvprodid), isvsvn: Number(item.isvsvn),
         description: item.description,
       })),
+      rpcTlsCaCert: rpcTlsCaCert || '',
       migration,
     };
   }
@@ -263,6 +318,58 @@ export class ContractClient {
         console.error(`[ContractClient] migration failed: ${err.message}`);
       });
     }
+  }
+
+  /**
+   * 首次裸启动（无合约配置且无 pin）：从环境变量 RUNTIME_PARAMS 加载配置。
+   * 必须参数缺失时报错退出。
+   */
+  _loadFromEnv() {
+    const envParamsStr = process.env.RUNTIME_PARAMS;
+    let envParams = null;
+    if (envParamsStr) {
+      try {
+        envParams = JSON.parse(envParamsStr);
+      } catch (err) {
+        console.error(`[ContractClient] _loadFromEnv: failed to parse RUNTIME_PARAMS env: ${err.message}`);
+      }
+    }
+
+    // 校验必须参数
+    const missing = [];
+    if (!envParams || !envParams.session || envParams.session.importTtlSeconds == null) {
+      missing.push('runtimeParams.session.importTtlSeconds');
+    }
+    if (!envParams || !envParams.session || envParams.session.exportTtlSeconds == null) {
+      missing.push('runtimeParams.session.exportTtlSeconds');
+    }
+    if (!envParams || !envParams.sync || envParams.sync.numShards == null) {
+      missing.push('runtimeParams.sync.numShards');
+    }
+    if (!envParams || !envParams.attestation || envParams.attestation.allowNonRaTls == null) {
+      missing.push('runtimeParams.attestation.allowNonRaTls');
+    }
+
+    if (missing.length > 0) {
+      console.error(`[ContractClient] _loadFromEnv: no contract configured, no pin data, and missing required env params: ${missing.join(', ')}`);
+      console.error(`[ContractClient] _loadFromEnv: set RUNTIME_PARAMS env with required fields or configure CONTRACT_RPC_URL / CONTRACT_CHAIN_ID / CONTRACT_ADDRESS`);
+      process.exit(1);
+    }
+
+    // 用 env 参数构建缓存（无白名单，无 codeRepository）
+    this._rpcTlsCaCert = process.env.CONTRACT_RPC_TLS_CA_CERT || '';
+    this._cache = {
+      runtimeParams: envParams,
+      platformWhitelist: [],
+      platformWhitelistSet: new Set(),
+      enclaveWhitelist: [],
+      enclaveWhitelistMap: new Map(),
+      codeRepository: '',
+      lastRefreshedAt: 0,
+    };
+    this._envFallbackMode = true;
+    console.warn(`[ContractClient] _loadFromEnv: no contract configured and no pin — started with env RUNTIME_PARAMS (env fallback mode)`);
+    console.log(`[ContractClient] _buildCache: platformWhitelist=0, enclaveWhitelist=0, hasRuntimeParams=true, fresh=false, contractAvailable=false`);
   }
 
   /**
@@ -352,6 +459,7 @@ export class ContractClient {
     this._chainId = pinned.chainId;
     this._contractAddress = pinned.contractAddress;
     this._pinnedAllowNonRaTls = pinned.allowNonRaTls;
+    this._rpcTlsCaCert = pinned.rpcTlsCaCert || '';
 
     // 预载最后已知快照（不标记为新鲜）
     if (pinned.snapshot) {
@@ -368,17 +476,19 @@ export class ContractClient {
   _savePin(contractData) {
     if (!this._pinStore) return;
     try {
-      // 从合约数据中提取 allowNonRaTls
       const allowNonRaTls = !!(contractData.runtimeParams?.attestation?.allowNonRaTls);
+      const rpcTlsCaCert = contractData.rpcTlsCaCert || this._rpcTlsCaCert || '';
       this._pinStore.save({
         rpcUrl: this._rpcUrl,
         chainId: this._chainId,
         contractAddress: this._contractAddress,
         allowNonRaTls,
+        rpcTlsCaCert,
         snapshot: contractData,
       });
       this._pinned = true;
       this._pinnedAllowNonRaTls = allowNonRaTls;
+      this._rpcTlsCaCert = rpcTlsCaCert;
     } catch (err) {
       console.error(`[ContractClient] _savePin: failed to persist pin: ${err.message}`);
     }
@@ -398,6 +508,7 @@ export class ContractClient {
         chainId: pinned.chainId,
         contractAddress: pinned.contractAddress,
         allowNonRaTls: pinned.allowNonRaTls,
+        rpcTlsCaCert: pinned.rpcTlsCaCert || '',
       };
     } catch (err) {
       console.error(`[ContractClient] getPinnedIdentity: ${err.message}`);
@@ -757,7 +868,7 @@ export class ContractClient {
    *   3. 验证通过 → 更新 pin 身份 + 快照，切换 provider/contract，重建缓存
    *   4. 验证失败 → 保持旧合约不变，仅日志告警
    *
-   * @param {{ rpcUrl: string, contractAddress: string, chainId: number }} migration
+   * @param {{ rpcUrl: string, contractAddress: string, chainId: number, rpcTlsCaCert: string }} migration
    */
   async _handleMigration(migration) {
     // 如果迁移目标和当前身份一致，无需迁移
@@ -773,11 +884,13 @@ export class ContractClient {
       `[ContractClient] migration target detected: rpcUrl=${migration.rpcUrl}, chainId=${migration.chainId}, address=${migration.contractAddress}`
     );
 
-    // 1. 创建新 provider/contract
+    // 1. 创建新 provider/contract（用迁移目标的 CA 证书）
     let newProvider, newContract;
     try {
       const network = ethers.Network.from(migration.chainId);
-      newProvider = new ethers.JsonRpcProvider(migration.rpcUrl, network, { staticNetwork: network });
+      const migrationCaCert = migration.rpcTlsCaCert || this._rpcTlsCaCert || '';
+      const fetchReq = createFetchRequest(migration.rpcUrl, migrationCaCert);
+      newProvider = new ethers.JsonRpcProvider(fetchReq, network, { staticNetwork: network });
       newContract = new ethers.Contract(migration.contractAddress, CONTRACT_ABI, newProvider);
     } catch (err) {
       console.error(`[ContractClient] migration: failed to create new provider/contract: ${err.message}`);
@@ -803,14 +916,17 @@ export class ContractClient {
     if (this._pinStore) {
       try {
         const allowNonRaTls = !!(newData.runtimeParams?.attestation?.allowNonRaTls);
+        const rpcTlsCaCert = newData.rpcTlsCaCert || migration.rpcTlsCaCert || '';
         this._pinStore.updateIdentity({
           rpcUrl: migration.rpcUrl,
           chainId: migration.chainId,
           contractAddress: migration.contractAddress,
           allowNonRaTls,
+          rpcTlsCaCert,
           snapshot: newData,
         });
         this._pinnedAllowNonRaTls = allowNonRaTls;
+        this._rpcTlsCaCert = rpcTlsCaCert;
       } catch (err) {
         console.error(`[ContractClient] migration: failed to update pin: ${err.message}`);
         return;
@@ -821,6 +937,7 @@ export class ContractClient {
     this._rpcUrl = migration.rpcUrl;
     this._chainId = migration.chainId;
     this._contractAddress = migration.contractAddress;
+    this._rpcTlsCaCert = newData.rpcTlsCaCert || migration.rpcTlsCaCert || this._rpcTlsCaCert;
     this._provider = newProvider;
     this._contract = newContract;
 
@@ -846,12 +963,14 @@ export class ContractClient {
       platformWhitelistRaw,
       enclaveWhitelistRaw,
       migrationTarget,
+      rpcTlsCaCert,
     ] = await Promise.all([
       contract.getRuntimeParams(),
       contract.getCodeRepository(),
       contract.getPlatformWhitelist(),
       contract.getEnclaveWhitelist(),
       contract.getMigrationTarget(),
+      contract.getRpcTlsCaCert(),
     ]);
 
     let runtimeParams = null;
@@ -865,6 +984,7 @@ export class ContractClient {
         rpcUrl: migrationTarget.rpcUrl,
         contractAddress: migrationTarget.contractAddress,
         chainId: Number(migrationTarget.chainId),
+        rpcTlsCaCert: migrationTarget.rpcTlsCaCert || '',
       };
     }
 
@@ -877,6 +997,7 @@ export class ContractClient {
         isvprodid: Number(item.isvprodid), isvsvn: Number(item.isvsvn),
         description: item.description,
       })),
+      rpcTlsCaCert: rpcTlsCaCert || '',
       migration,
     };
   }
@@ -896,6 +1017,7 @@ export function createContractClientFromEnv(pinStore = null) {
   const rpcUrl = process.env.CONTRACT_RPC_URL;
   const chainId = process.env.CONTRACT_CHAIN_ID;
   const contractAddress = process.env.CONTRACT_ADDRESS;
-  console.log(`[ContractClient] createContractClientFromEnv: rpcUrl=${rpcUrl}, chainId=${chainId}, contractAddress=${contractAddress}, pinStore=${!!pinStore}`);
-  return new ContractClient({ rpcUrl, chainId, contractAddress, pinStore });
+  const rpcTlsCaCert = process.env.CONTRACT_RPC_TLS_CA_CERT || '';
+  console.log(`[ContractClient] createContractClientFromEnv: rpcUrl=${rpcUrl}, chainId=${chainId}, contractAddress=${contractAddress}, hasCaCert=${!!rpcTlsCaCert}, pinStore=${!!pinStore}`);
+  return new ContractClient({ rpcUrl, chainId, contractAddress, rpcTlsCaCert, pinStore });
 }

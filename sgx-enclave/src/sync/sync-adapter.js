@@ -144,7 +144,7 @@ export const BUSINESS_TABLES = {
     },
     pinned_contract: {
         keyColumns: ['id'],
-        dataColumns: ['id', 'rpc_url', 'chain_id', 'contract_address', 'allow_non_ra_tls', 'snapshot_json', 'pinned_at', 'updated_at', '_hlc'],
+        dataColumns: ['id', 'rpc_url', 'chain_id', 'contract_address', 'allow_non_ra_tls', 'rpc_tls_ca_cert', 'snapshot_json', 'pinned_at', 'updated_at', '_hlc'],
     },
 };
 

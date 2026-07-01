@@ -8,10 +8,11 @@
  *     / freezeDuration / numShards / minQuorum 等）一律从合约读取，不再有 env 兜底。
  *   - .env 文件不被 enclave 加载（dotenv 已移除，allowed_files 也不含 .env）。
  *
- * 本地透传环境变量（仅以下 8 项，由 manifest 显式 passthrough）：
+ * 本地透传环境变量（仅以下 9 项，由 manifest 显式 passthrough）：
  *   CONTRACT_RPC_URL    — 区块链 RPC 地址（引导）
  *   CONTRACT_CHAIN_ID   — 链 ID（引导）
  *   CONTRACT_ADDRESS    — WalletTrustContract 合约地址（引导）
+ *   CONTRACT_RPC_TLS_CA_CERT — RPC 服务器 TLS CA 证书（base64，引导）
  *   SGX_HTTP_PORT       — 本地 HTTP 监听端口（默认 3000）
  *   SYNC_NODES          — 同步节点 WSS 地址（逗号分隔，可选）
  *   SYNC_LISTEN_PORT    — 本地 WSS 监听端口（默认 3307）
@@ -128,11 +129,11 @@ async function main() {
   };
 
   // 4. 最终校验：配置已加载
-  //    runtimeParams 可能为 null（无合约且无钉住快照），此时所有参数使用代码默认值
-  //    合约连接非必须，缺失只警告不退出；绝不回退到环境变量提供的运行时配置
+  //    无合约配置且无 pin 时，ContractClient 已从 env RUNTIME_PARAMS 加载（env fallback mode）；
+  //    否则 runtimeParams 来自合约或 pin 快照，绝不回退到环境变量。
   //    SQLite DB path 硬编码在 constants.js 中，不需要环境变量
   if (!contractClient.isContractAvailable()) {
-    console.warn('[SGX Enclave] Contract connection unavailable — using last-known-good pinned snapshot or code defaults (env runtime config is NOT used); some functions (e.g. authorization revocation) may be limited');
+    console.warn('[SGX Enclave] Contract connection unavailable — using last-known-good pinned snapshot or env fallback; some functions (e.g. authorization revocation) may be limited');
   } else {
     console.log('[SGX Enclave] All config sources loaded successfully');
   }
@@ -158,7 +159,7 @@ async function main() {
     console.log(`[SGX Enclave] allowNonRaTls=${allowNonRaTls} (from pinned identity, ignoring env/contract)`);
   }
 
-  // 构建 RA-TLS选项(enclaveWhitelist 数组等，来自合约或环境变量）
+  // 构建 RA-TLS 选项（enclaveWhitelist 数组等，仅来自合约/pin 快照，无 env 兜底）
   const raTlsOpts = {};
 
   // 从 enclaveWhitelist 数组构建（支持多版本共存和滚动升级）

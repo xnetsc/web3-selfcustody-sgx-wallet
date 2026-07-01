@@ -8,6 +8,9 @@ export const CONTRACT_ABI = [
   'function getCodeRepository() view returns (string)',
   'function getPublicInfo() view returns (string, string, tuple(bytes32 mrenclave, bytes32 mrsigner, uint16 isvprodid, uint16 isvsvn, string description)[])',
 
+  // ===== RPC TLS CA 证书 =====
+  'function getRpcTlsCaCert() view returns (string)',
+
   // ===== Enclave 白名单（RA-TLS 验证用） =====
   'function getEnclaveWhitelist() view returns (tuple(bytes32 mrenclave, bytes32 mrsigner, uint16 isvprodid, uint16 isvsvn, string description)[])',
   'function isEnclaveWhitelisted(bytes32) view returns (bool)',
@@ -25,5 +28,5 @@ export const CONTRACT_ABI = [
   'function getPasskeyRecovery(string, bytes32) view returns (bytes32 oldPubKeyHash, string uuid, string memo, uint256 createdAt)',
 
   // ===== 合约迁移目标（无需鉴权，所有人可读） =====
-  'function getMigrationTarget() view returns (string rpcUrl, string contractAddress, uint256 chainId)',
+  'function getMigrationTarget() view returns (string rpcUrl, string contractAddress, uint256 chainId, string rpcTlsCaCert)',
 ];

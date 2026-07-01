@@ -130,6 +130,7 @@ If `CONTRACT_RPC_URL`, `CONTRACT_CHAIN_ID`, or `CONTRACT_ADDRESS` are omitted, t
 | `CONTRACT_RPC_URL` | Yes¹ | — | RPC endpoint of the target blockchain (e.g. `http://127.0.0.1:8545`) |
 | `CONTRACT_CHAIN_ID` | Yes¹ | — | Chain ID (e.g. `31337` for local Hardhat, `1` for Ethereum mainnet) |
 | `CONTRACT_ADDRESS` | Yes¹ | — | Deployed `WalletTrustContract` address |
+| `CONTRACT_RPC_TLS_CA_CERT` | No | — | Base64-encoded TLS CA certificate for verifying the RPC server's TLS certificate chain. Required for HTTPS RPC URLs (non-localhost). Ignored for HTTP or 127.0.0.1/localhost URLs. Pinned after first successful contract read. |
 | `SGX_HTTP_PORT` | No | `3000` | HTTP port for the API server |
 | `SYNC_NODES` | No | — | Comma-separated WSS peer URLs for multi-node sync; omit for single-node mode |
 | `SYNC_LISTEN_PORT` | No | `3307` | WebSocket listening port for P2P sync |

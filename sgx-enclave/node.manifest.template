@@ -79,6 +79,7 @@ loader.env.NODE_ID = { passthrough = true }
 loader.env.CONTRACT_RPC_URL = { passthrough = true }
 loader.env.CONTRACT_CHAIN_ID = { passthrough = true }
 loader.env.CONTRACT_ADDRESS = { passthrough = true }
+loader.env.CONTRACT_RPC_TLS_CA_CERT = { passthrough = true }
 
 # --- Runtime configuration: read EXCLUSIVELY from contract ---
 # runtimeParams (incl. session/cache/reconnect/attestation/sync/security),

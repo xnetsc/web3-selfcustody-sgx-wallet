@@ -27,11 +27,11 @@ export class ContractPinStore {
 
   /**
    * 读取已钉住的合约身份 + 快照
-   * @returns {{ rpcUrl: string, chainId: number, contractAddress: string, allowNonRaTls: boolean, snapshot: Object|null }|null}
+   * @returns {{ rpcUrl: string, chainId: number, contractAddress: string, allowNonRaTls: boolean, rpcTlsCaCert: string, snapshot: Object|null }|null}
    */
   load() {
     const rows = this._connMgr.readQuery(
-      'SELECT rpc_url, chain_id, contract_address, allow_non_ra_tls, snapshot_json FROM pinned_contract WHERE id = ?',
+      'SELECT rpc_url, chain_id, contract_address, allow_non_ra_tls, rpc_tls_ca_cert, snapshot_json FROM pinned_contract WHERE id = ?',
       [PIN_ROW_ID]
     );
     if (!rows || rows.length === 0) return null;
@@ -52,6 +52,7 @@ export class ContractPinStore {
       chainId: row.chain_id != null ? Number(row.chain_id) : null,
       contractAddress: row.contract_address,
       allowNonRaTls: !!row.allow_non_ra_tls,
+      rpcTlsCaCert: row.rpc_tls_ca_cert || '',
       snapshot,
     };
   }
@@ -68,12 +69,13 @@ export class ContractPinStore {
    * @param {Object|null} [record.snapshot] - 安全相关合约配置快照
    */
   save(record) {
-    const { rpcUrl, chainId, contractAddress, allowNonRaTls } = record;
+    const { rpcUrl, chainId, contractAddress, allowNonRaTls, rpcTlsCaCert } = record;
     if (!rpcUrl || chainId == null || !contractAddress) {
       throw new Error('ContractPinStore.save: rpcUrl/chainId/contractAddress are all required');
     }
     const snapshotJson = record.snapshot ? JSON.stringify(record.snapshot) : null;
     const allowNonRaTlsVal = allowNonRaTls ? 1 : 0;
+    const caCert = rpcTlsCaCert || '';
 
     const existing = this._connMgr.readQuery(
       'SELECT rpc_url, chain_id, contract_address FROM pinned_contract WHERE id = ?',
@@ -83,12 +85,12 @@ export class ContractPinStore {
     if (!existing || existing.length === 0) {
       // 首次钉住
       this._connMgr.writeQuery(
-        `INSERT INTO pinned_contract (id, rpc_url, chain_id, contract_address, allow_non_ra_tls, snapshot_json)
-         VALUES (?, ?, ?, ?, ?, ?)`,
-        [PIN_ROW_ID, rpcUrl, Number(chainId), contractAddress, allowNonRaTlsVal, snapshotJson]
+        `INSERT INTO pinned_contract (id, rpc_url, chain_id, contract_address, allow_non_ra_tls, rpc_tls_ca_cert, snapshot_json)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        [PIN_ROW_ID, rpcUrl, Number(chainId), contractAddress, allowNonRaTlsVal, caCert, snapshotJson]
       );
       console.log(
-        `[ContractPinStore] pinned contract identity: rpcUrl=${rpcUrl}, chainId=${Number(chainId)}, address=${contractAddress}, allowNonRaTls=${!!allowNonRaTlsVal}`
+        `[ContractPinStore] pinned contract identity: rpcUrl=${rpcUrl}, chainId=${Number(chainId)}, address=${contractAddress}, allowNonRaTls=${!!allowNonRaTlsVal}, hasCaCert=${!!caCert}`
       );
       return;
     }
@@ -112,27 +114,29 @@ export class ContractPinStore {
    * @param {Object|null} [record.snapshot]
    */
   updateIdentity(record) {
-    const { rpcUrl, chainId, contractAddress, allowNonRaTls } = record;
+    const { rpcUrl, chainId, contractAddress, allowNonRaTls, rpcTlsCaCert } = record;
     if (!rpcUrl || chainId == null || !contractAddress) {
       throw new Error('ContractPinStore.updateIdentity: rpcUrl/chainId/contractAddress are all required');
     }
     const snapshotJson = record.snapshot ? JSON.stringify(record.snapshot) : null;
     const allowNonRaTlsVal = allowNonRaTls ? 1 : 0;
+    const caCert = rpcTlsCaCert || '';
 
     this._connMgr.writeQuery(
-      `INSERT INTO pinned_contract (id, rpc_url, chain_id, contract_address, allow_non_ra_tls, snapshot_json)
-       VALUES (?, ?, ?, ?, ?, ?)
+      `INSERT INTO pinned_contract (id, rpc_url, chain_id, contract_address, allow_non_ra_tls, rpc_tls_ca_cert, snapshot_json)
+       VALUES (?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(id) DO UPDATE SET
          rpc_url = excluded.rpc_url,
          chain_id = excluded.chain_id,
          contract_address = excluded.contract_address,
          allow_non_ra_tls = excluded.allow_non_ra_tls,
+         rpc_tls_ca_cert = excluded.rpc_tls_ca_cert,
          snapshot_json = excluded.snapshot_json,
          updated_at = datetime('now')`,
-      [PIN_ROW_ID, rpcUrl, Number(chainId), contractAddress, allowNonRaTlsVal, snapshotJson]
+      [PIN_ROW_ID, rpcUrl, Number(chainId), contractAddress, allowNonRaTlsVal, caCert, snapshotJson]
     );
     console.log(
-      `[ContractPinStore] contract identity migrated to: rpcUrl=${rpcUrl}, chainId=${Number(chainId)}, address=${contractAddress}, allowNonRaTls=${!!allowNonRaTlsVal}`
+      `[ContractPinStore] contract identity migrated to: rpcUrl=${rpcUrl}, chainId=${Number(chainId)}, address=${contractAddress}, allowNonRaTls=${!!allowNonRaTlsVal}, hasCaCert=${!!caCert}`
     );
   }
 }

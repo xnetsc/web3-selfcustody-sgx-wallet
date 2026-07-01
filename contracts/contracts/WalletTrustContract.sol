@@ -49,6 +49,11 @@ contract WalletTrustContract is Ownable {
     /// @dev 程序运行参数（JSON 字符串格式）
     string public runtimeParams;
 
+    // ============ RPC TLS CA 证书 ============
+
+    /// @dev RPC 服务器的 TLS CA 证书（base64 编码），用于验证 RPC 连接的 TLS 证书链
+    string public rpcTlsCaCert;
+
     // ============ 合约迁移目标（Owner 设置，无需鉴权即可读取） ============
 
     /// @dev 迁移目标 RPC URL（空字符串表示无迁移）
@@ -57,6 +62,8 @@ contract WalletTrustContract is Ownable {
     string public migrationContractAddress;
     /// @dev 迁移目标链 ID（0 表示无迁移）
     uint256 public migrationChainId;
+    /// @dev 迁移目标 RPC TLS CA 证书（base64 编码，空字符串表示无迁移）
+    string public migrationRpcTlsCaCert;
 
     // ============ Enclave 白名单（RA-TLS 验证用） ============
 
@@ -105,7 +112,8 @@ contract WalletTrustContract is Ownable {
     );
     event PasskeyRecoverySet(string userId, bytes32 newPubKeyHash, bytes32 oldPubKeyHash, string uuid, string memo);
     event PasskeyRecoveryRemoved(string userId, bytes32 newPubKeyHash);
-    event MigrationTargetUpdated(string rpcUrl, string contractAddress, uint256 chainId);
+    event RpcTlsCaCertUpdated(string caCert);
+    event MigrationTargetUpdated(string rpcUrl, string contractAddress, uint256 chainId, string rpcTlsCaCert);
     event MigrationTargetCleared();
 
     // ============ 构造函数 ============
@@ -126,17 +134,31 @@ contract WalletTrustContract is Ownable {
         emit RuntimeParamsUpdated(_runtimeParams);
     }
 
+    // ============ RPC TLS CA 证书管理（Owner 权限） ============
+
+    /// @dev 设置 RPC TLS CA 证书（base64 编码）
+    function setRpcTlsCaCert(string calldata _caCert) external onlyOwner {
+        rpcTlsCaCert = _caCert;
+        emit RpcTlsCaCertUpdated(_caCert);
+    }
+
+    /// @dev 查询 RPC TLS CA 证书
+    function getRpcTlsCaCert() external view returns (string memory) {
+        return rpcTlsCaCert;
+    }
+
     // ============ 合约迁移目标管理（Owner 权限） ============
 
     /// @dev 设置迁移目标（Owner 调用，所有节点读到后将切换到新合约）
-    function setMigrationTarget(string calldata _rpcUrl, string calldata _contractAddress, uint256 _chainId) external onlyOwner {
+    function setMigrationTarget(string calldata _rpcUrl, string calldata _contractAddress, uint256 _chainId, string calldata _rpcTlsCaCert) external onlyOwner {
         require(bytes(_rpcUrl).length > 0, "Empty rpcUrl");
         require(bytes(_contractAddress).length > 0, "Empty contractAddress");
         require(_chainId > 0, "Invalid chainId");
         migrationRpcUrl = _rpcUrl;
         migrationContractAddress = _contractAddress;
         migrationChainId = _chainId;
-        emit MigrationTargetUpdated(_rpcUrl, _contractAddress, _chainId);
+        migrationRpcTlsCaCert = _rpcTlsCaCert;
+        emit MigrationTargetUpdated(_rpcUrl, _contractAddress, _chainId, _rpcTlsCaCert);
     }
 
     /// @dev 清除迁移目标（迁移完成后 Owner 调用）
@@ -144,12 +166,13 @@ contract WalletTrustContract is Ownable {
         migrationRpcUrl = "";
         migrationContractAddress = "";
         migrationChainId = 0;
+        migrationRpcTlsCaCert = "";
         emit MigrationTargetCleared();
     }
 
     /// @dev 查询迁移目标（任何人可调用，无需鉴权）
-    function getMigrationTarget() external view returns (string memory rpcUrl_, string memory contractAddress_, uint256 chainId_) {
-        return (migrationRpcUrl, migrationContractAddress, migrationChainId);
+    function getMigrationTarget() external view returns (string memory rpcUrl_, string memory contractAddress_, uint256 chainId_, string memory rpcTlsCaCert_) {
+        return (migrationRpcUrl, migrationContractAddress, migrationChainId, migrationRpcTlsCaCert);
     }
 
     // ============ Enclave 白名单管理（Owner 权限，RA-TLS 验证用） ============

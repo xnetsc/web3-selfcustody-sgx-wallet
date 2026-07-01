@@ -511,14 +511,15 @@ export class SyncManager {
 
     /**
      * 发送本节点的 pinned 合约身份给对端。
-     * 消息格式: JSON { type: 'pin-check', rpcUrl, contractAddress, chainId }
-     * 如果没有 contractClient 或尚未 pin，发送 type='pin-check' 且 rpcUrl/contractAddress/chainId 为 null。
+     * 消息格式: JSON { type: 'pin-check', rpcTlsCaCert, contractAddress, chainId, allowNonRaTls }
+     * 比较 rpcTlsCaCert 而非 rpcUrl（证书是身份的真正锚点）。
+     * 如果没有 contractClient 或尚未 pin，发送 type='pin-check' 且各字段为 null。
      */
     _sendPinCheck(peerId, ws) {
         const identity = this._contractClient?.getPinnedIdentity?.() || null;
         const msg = JSON.stringify({
             type: 'pin-check',
-            rpcUrl: identity?.rpcUrl || null,
+            rpcTlsCaCert: identity?.rpcTlsCaCert ?? null,
             contractAddress: identity?.contractAddress || null,
             chainId: identity?.chainId ?? null,
             allowNonRaTls: identity?.allowNonRaTls ?? null,
@@ -656,12 +657,14 @@ export class SyncManager {
     }
 
     /**
-     * 比较两个 pinned 身份是否一致（rpcUrl + contractAddress + chainId）
+     * 比较两个 pinned 身份是否一致（rpcTlsCaCert + contractAddress + chainId + allowNonRaTls）
+     * 用 rpcTlsCaCert 替代 rpcUrl 做比较——证书是身份的真正锚点。
+     * 一方有证书另一方没有即视为不匹配。
      */
     _pinIdentityMatches(local, peer) {
         if (!local || !peer) return false;
         return (
-            local.rpcUrl === peer.rpcUrl &&
+            (local.rpcTlsCaCert || '') === (peer.rpcTlsCaCert || '') &&
             local.contractAddress === peer.contractAddress &&
             Number(local.chainId) === Number(peer.chainId) &&
             !!local.allowNonRaTls === !!peer.allowNonRaTls

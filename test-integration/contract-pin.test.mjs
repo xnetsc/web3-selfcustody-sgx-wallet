@@ -1,7 +1,7 @@
 /**
  * 合约身份钉住（TOFU）回归测试
  *
- * 运行：node --test src/modules/contract-client/contract-pin.test.mjs
+ * 运行：node --test test-integration/contract-pin.test.mjs
  *
  * 覆盖：
  *   1. 首次成功读到合约 → 钉住身份 + 快照
@@ -13,19 +13,21 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import Database from 'better-sqlite3';
 
-import { ContractClient } from './index.js';
-import { ContractPinStore } from './contract-pin-store.js';
-import { CREATE_PINNED_CONTRACT_SQL } from '../../database/schema.js';
+import { ContractClient } from '../sgx-enclave/src/modules/contract-client/index.js';
+import { ContractPinStore } from '../sgx-enclave/src/modules/contract-client/contract-pin-store.js';
+import { CREATE_PINNED_CONTRACT_SQL } from '../sgx-enclave/src/database/schema.js';
 
 const IDENTITY_A = {
   rpcUrl: 'http://good-rpc.example:8545',
   chainId: 1,
   contractAddress: '0x' + 'a'.repeat(40),
+  rpcTlsCaCert: '',
 };
 const IDENTITY_B = {
   rpcUrl: 'http://attacker-rpc.evil:8545',
   chainId: 999,
   contractAddress: '0x' + 'b'.repeat(40),
+  rpcTlsCaCert: '',
 };
 
 function makeContractData(tag) {
@@ -36,6 +38,7 @@ function makeContractData(tag) {
     enclaveWhitelist: [
       { mrenclave: `mre-${tag}`, mrsigner: 'sgn', isvprodid: 0, isvsvn: 0, description: 'd' },
     ],
+    rpcTlsCaCert: '',
     migration: null,
   };
 }
@@ -90,6 +93,7 @@ test('1. 首次成功读到合约 → 钉住身份 + 快照', async () => {
   assert.equal(pinned.rpcUrl, IDENTITY_A.rpcUrl);
   assert.equal(pinned.chainId, IDENTITY_A.chainId);
   assert.equal(pinned.contractAddress, IDENTITY_A.contractAddress);
+  assert.equal(pinned.rpcTlsCaCert, '', 'rpcTlsCaCert pinned as empty string');
   assert.equal(pinned.snapshot.codeRepository, 'repo-A');
 });
 
@@ -165,6 +169,7 @@ test('5. getPinnedIdentity 返回钉住的身份', async () => {
   assert.equal(identity.chainId, IDENTITY_A.chainId);
   assert.equal(identity.contractAddress, IDENTITY_A.contractAddress);
   assert.equal(identity.allowNonRaTls, false, 'allowNonRaTls pinned as false');
+  assert.equal(identity.rpcTlsCaCert, '', 'rpcTlsCaCert in pinned identity');
 });
 
 test('5b. allowNonRaTls=true 被 pin 住', async () => {
@@ -198,6 +203,7 @@ test('6. 合约迁移：migration target 验证成功后切换身份', async () 
     rpcUrl: IDENTITY_B.rpcUrl,
     contractAddress: IDENTITY_B.contractAddress,
     chainId: IDENTITY_B.chainId,
+    rpcTlsCaCert: '',
   };
   const dataWithMigration = { ...makeContractData('A'), migration: MIGRATION_B };
   const newDataB = makeContractData('B');
@@ -238,6 +244,7 @@ test('7. 合约迁移：新合约不可用时保持旧身份', async () => {
     rpcUrl: IDENTITY_B.rpcUrl,
     contractAddress: IDENTITY_B.contractAddress,
     chainId: IDENTITY_B.chainId,
+    rpcTlsCaCert: '',
   };
   const dataWithMigration = { ...makeContractData('A'), migration: MIGRATION_B };
 
@@ -269,6 +276,7 @@ test('8. 合约迁移：新合约 runtimeParams 为空时中止迁移', async ()
     rpcUrl: IDENTITY_B.rpcUrl,
     contractAddress: IDENTITY_B.contractAddress,
     chainId: IDENTITY_B.chainId,
+    rpcTlsCaCert: '',
   };
   const dataWithMigration = { ...makeContractData('A'), migration: MIGRATION_B };
 

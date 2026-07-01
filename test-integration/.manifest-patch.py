@@ -15,7 +15,7 @@ def patch_env(env, key, value):
         return env + f"\n{key}={value}"
 
 # Patch contract config if provided via environment variables
-for key in ("CONTRACT_ADDRESS", "CONTRACT_RPC_URL", "CONTRACT_CHAIN_ID", "FREEZE_DURATION_SECONDS"):
+for key in ("CONTRACT_ADDRESS", "CONTRACT_RPC_URL", "CONTRACT_CHAIN_ID", "CONTRACT_RPC_TLS_CA_CERT", "FREEZE_DURATION_SECONDS"):
     val = os.environ.get(key, "")
     if val:
         env = patch_env(env, key, val)
