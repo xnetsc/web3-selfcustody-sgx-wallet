@@ -7,7 +7,6 @@
 import { ethers } from 'ethers';
 import { CONTRACT_ABI } from './abi.js';
 import https from 'node:https';
-import tls from 'node:tls';
 
 /** 默认缓存刷新间隔（毫秒），合约连接成功后的正常刷新间隔 */
 const DEFAULT_REFRESH_INTERVAL = 60000;
