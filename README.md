@@ -1,4 +1,4 @@
-ecentralized,sgx based self-custody web3 wallet running in gramine and sync data by authorized peer through by raft
+Decentralized,sgx based self-custody web3 wallet running in gramine and sync data by authorized peer through raft protocol
 # Web3-selfcustody-sgx-wallet
 
 A non-custodial blockchain wallet system built on Intel SGX (Software Guard Extensions) trusted execution environment with WebAuthn/Passkey authentication. Private keys are generated and stored exclusively inside the SGX enclave — the platform never has access to user keys.
