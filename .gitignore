@@ -20,5 +20,6 @@ contracts/.env
 contracts/.env.*
 .claude/worktrees/confident-zhukovsky-e4e6a9/
 
-# docs
-docs/
+# docs (internal design docs ignored; public API docs are unignored below)
+docs/**
+!docs/sgx-enclave-api.md
