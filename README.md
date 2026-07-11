@@ -9,7 +9,7 @@ All cryptographic operations (key generation, transaction signing, key import/ex
 
 Every signing request (`/api/tx/sign`) goes through a **14-point authorization checklist** — platform whitelist verification, WebAuthn P256 Passkey signature, on-chain revocation lookup, authorization expiry, cron-window matching, target address allowlist, per-transaction amount limit, and cumulative spend limit. The endpoint supports two transaction formats: structured `txParams` (platform-supplied fields) and `rawTxHex` (raw bytes, where all auth-relevant fields are parsed from the bytes rather than trusted from the caller).
 
-**Full API reference**: see [`docs/sgx-enclave-api.md`](docs/sgx-enclave-api.md) for detailed request/response schemas, examples, and error codes for all enclave endpoints.
+**Full API reference**: see [`docs/sgx-enclave-api.md`](docs/sgx-enclave-api.md) (English) / [`docs/sgx-enclave-api.zh.md`](docs/sgx-enclave-api.zh.md) (中文) for detailed request/response schemas, examples, and error codes for all enclave endpoints.
 
 ## Architecture
 
