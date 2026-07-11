@@ -143,6 +143,7 @@ If `CONTRACT_RPC_URL`, `CONTRACT_CHAIN_ID`, or `CONTRACT_ADDRESS` are omitted, t
 | `CODE_REPOSITORY` | No | — | Fallback source code repository URL. **Replaced by contract value when non-empty.** |
 | `RUNTIME_PARAMS` | No | — | Fallback runtime parameters: JSON object (see structure below). **Replaced by contract value when non-empty.** |
 | `FREEZE_DURATION_SECONDS` | No | `259200` (72 h) | Freeze window duration when a Passkey is registered for an existing account that already has wallets (anti-account-takeover); overridden by `runtimeParams.security.freezeDurationSeconds` from contract |
+| `NTP_SERVERS` | No | — | **Deprecated / replaced by contract.** Use `runtimeParams.security.ntpServers` to configure trusted NTP servers for monotonic-clock calibration. If all configured servers fail, the enclave exits. |
 | `PROXY_API_KEY` | No | — | Intel PCCS API key for remote attestation. **Env-only — never stored in the contract.** |
 | `RATLS_CERT_PATH` | No | `/app/sgx-enclave/ratls-cert.pem` | Path to the RA-TLS certificate file written by the Gramine launcher. **Env-only — never stored in the contract.** |
 
@@ -193,7 +194,8 @@ Both the `RUNTIME_PARAMS` env variable and the on-chain `runtimeParams` field sh
     "allowNonRaTls": false
   },
   "security": {
-    "freezeDurationSeconds": 259200
+    "freezeDurationSeconds": 259200,
+    "ntpServers": ["pool.ntp.org", "time.cloudflare.com", "time.apple.com"]
   }
 }
 ```
@@ -265,6 +267,27 @@ For full request/response schemas, see docs.
 5. **Remote attestation**: The enclave provides SGX attestation quotes so clients can cryptographically verify they are talking to genuine, unmodified enclave code.
 6. **Account freeze**: Registering a new Passkey for an account that already holds wallets triggers a configurable freeze window (default 72 hours), preventing an attacker from immediately using a hijacked Passkey to access funds.
 
+## Monotonic Clock & Time Security
+
+All security-sensitive time operations inside the enclave use a **monotonic clock** (`sgx-enclave/src/utils/monotonic-clock.js`) instead of the host's wall clock. This prevents time-based attacks such as adjusting the system clock to bypass account freezes, session expiration, or authorization windows.
+
+| Mechanism | Description | Behavior on failure |
+|-----------|-------------|-------------------|
+| **Monotonic clock** | Based on `process.hrtime.bigint()` with a single startup anchor; all `Date.now()` / `new Date()` / `datetime('now')` usages in business logic have been replaced. | — |
+| **NTP calibration** | If `runtimeParams.security.ntpServers` is configured, the enclave queries multiple servers at startup and takes the median time to calibrate the monotonic anchor. It re-calibrates whenever the NTP server list changes in the contract. | **Fatal**: the enclave exits with code `1` if all configured servers fail, because running with a potentially-tampered local clock is unsafe. |
+| **System clock drift monitor** | Every 60 seconds the enclave compares monotonic time with `Date.now()`. If the absolute drift exceeds 5 minutes, it treats the system clock as tampered. | **Fatal**: the enclave exits with code `1` to prevent bypass of time-based protections. |
+
+To enable NTP calibration, set `security.ntpServers` in `runtimeParams`:
+
+```json
+{
+  "security": {
+    "freezeDurationSeconds": 259200,
+    "ntpServers": ["pool.ntp.org", "time.cloudflare.com", "time.apple.com"]
+  }
+}
+```
+
 ## Documentation
 
 Detailed design documents are in the docs/ directory:
@@ -274,7 +297,6 @@ Detailed design documents are in the docs/ directory:
 - docs/sgx-enclave-api.md — HTTP API reference
 - docs/authorization-json-guide.md — Authorization JSON structure reference
 - docs/security-risks.md — Security threat analysis
-- docs/details/ — 30+ detailed design documents for individual modules
 
 ## License
 

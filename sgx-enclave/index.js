@@ -61,7 +61,7 @@ import {
 } from './src/api/index.js';
 
 import { createApp, startServer } from './src/server.js';
-import { getMonotonicNow, calibrateFromNtp, getLastNtpServers } from './src/utils/monotonic-clock.js';
+import { getMonotonicNow, calibrateFromNtp, getLastNtpServers, getMonotonicSystemDriftMs } from './src/utils/monotonic-clock.js';
 
 async function main() {
   console.log('[SGX Enclave] Starting...');
@@ -365,6 +365,21 @@ async function main() {
     }),
   };
 
+  // 9.1 启动系统时钟漂移监控：每分钟检查单调时间与系统时间的偏差，超过 5 分钟则停止运行
+  //     该检查用于检测系统墙钟被恶意篡改（如绕过冻结时间）。
+  const DRIFT_CHECK_INTERVAL_MS = 60 * 1000;
+  const MAX_DRIFT_MS = 5 * 60 * 1000;
+  const driftTimer = setInterval(() => {
+    const driftMs = getMonotonicSystemDriftMs();
+    const driftAbsMs = Math.abs(driftMs);
+    if (driftAbsMs > MAX_DRIFT_MS) {
+      console.error(`[SGX Enclave] System clock drift detected: monotonic time differs from system time by ${driftAbsMs}ms (>${MAX_DRIFT_MS}ms). Stopping enclave to prevent time-based attacks.`);
+      process.exit(1);
+    } else {
+      console.log(`[SGX Enclave] Drift check OK: drift=${driftMs.toFixed(2)}ms`);
+    }
+  }, DRIFT_CHECK_INTERVAL_MS);
+
   // 10. 启动过期会话定时清理（import + export + 挑战值）
   //     清理间隔从 runtimeParams.session.cleanupIntervalSeconds 读取，默认 3600（1小时）
   const cleanupIntervalMs = (sessionConfig.cleanupIntervalSeconds || 3600) * 1000;
@@ -406,6 +421,7 @@ async function main() {
   // 12. 优雅退出
   const shutdown = (signal) => {
     console.log(`[SGX Enclave] Received ${signal}, shutting down...`);
+    clearInterval(driftTimer);
     clearInterval(cleanupTimer);
     server.close(() => {
       console.log('[SGX Enclave] HTTP server closed');

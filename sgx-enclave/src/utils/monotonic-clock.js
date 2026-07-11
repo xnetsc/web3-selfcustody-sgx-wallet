@@ -237,6 +237,17 @@ export function getMonotonicMs() {
 }
 
 /**
+ * 返回单调时间与当前系统墙钟（Date.now()）的偏差（毫秒）。
+ * 正值表示单调时钟领先于系统时间，负值表示落后。
+ * 该值可用于检测系统时钟被篡改：若合约已配置 NTP 时间源，
+ * 单调时钟锚点已被 NTP 校正，系统时间若被人为调整，偏差会迅速扩大。
+ * @returns {number}
+ */
+export function getMonotonicSystemDriftMs() {
+    return _monotonicMs() - Date.now();
+}
+
+/**
  * 返回基于单调时钟的 Date 对象。等价于 new Date()，但不受系统时钟篡改影响。
  * @returns {Date}
  */
