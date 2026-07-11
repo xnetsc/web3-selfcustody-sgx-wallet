@@ -17,6 +17,7 @@ import crypto from 'crypto';
 import { deriveSharedSecret, decrypt } from './ecdh.js';
 import { validateMnemonic, deriveWallet, privateKeyToAddress } from '../wallet-management/hd-wallet.js';
 import { createConnProxy } from '../../sync/sync-adapter.js';
+import { getMonotonicSqliteNow } from '../../utils/monotonic-clock.js';
 const DEFAULT_IMPORT_TTL_SECONDS = 300 // 5 分钟
 
 export class KeyImporter {
@@ -142,9 +143,9 @@ export class KeyImporter {
     if (importType === 'private_key') {
       const address = privateKeyToAddress(plaintext);
       conn.query(
-        `INSERT INTO wallets (user_id, wallet_id, wallet_type, mnemonic, chain_id, coin_type, address, private_key, _hlc)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [userId, finalWalletId, 'imported_key', null, chains[0].chainId, chains[0].coinType, address, plaintext, ts]
+        `INSERT INTO wallets (user_id, wallet_id, wallet_type, mnemonic, chain_id, coin_type, address, private_key, created_at, _hlc)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [userId, finalWalletId, 'imported_key', null, chains[0].chainId, chains[0].coinType, address, plaintext, getMonotonicSqliteNow(), ts]
       );
       result = { walletId: finalWalletId, address };
     } else if (importType === 'mnemonic') {
@@ -163,9 +164,9 @@ export class KeyImporter {
         if (existingChainIds.has(chain.chainId)) continue;
         const derived = deriveWallet(plaintext, chain.coinType);
         conn.query(
-          `INSERT INTO wallets (user_id, wallet_id, wallet_type, mnemonic, chain_id, coin_type, address, private_key, derivation_path, _hlc)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-          [userId, finalWalletId, 'imported_mnemonic', plaintext, chain.chainId, chain.coinType, derived.address, derived.privateKey, derived.derivationPath, ts]
+          `INSERT INTO wallets (user_id, wallet_id, wallet_type, mnemonic, chain_id, coin_type, address, private_key, derivation_path, created_at, _hlc)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [userId, finalWalletId, 'imported_mnemonic', plaintext, chain.chainId, chain.coinType, derived.address, derived.privateKey, derived.derivationPath, getMonotonicSqliteNow(), ts]
         );
         wallets.push({
           chainId: chain.chainId,
@@ -248,9 +249,9 @@ export class KeyImporter {
       if (item.type === 'private_key') {
         const address = privateKeyToAddress(item.data);
         conn.query(
-          `INSERT INTO wallets (user_id, wallet_id, wallet_type, mnemonic, chain_id, coin_type, address, private_key, _hlc)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-          [itemUserId, itemWalletId, 'imported_key', null, item.chains[0].chainId, item.chains[0].coinType, address, item.data, ts]
+          `INSERT INTO wallets (user_id, wallet_id, wallet_type, mnemonic, chain_id, coin_type, address, private_key, created_at, _hlc)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [itemUserId, itemWalletId, 'imported_key', null, item.chains[0].chainId, item.chains[0].coinType, address, item.data, getMonotonicSqliteNow(), ts]
         );
         results.push({ walletId: itemWalletId, address });
       } else if (item.type === 'mnemonic') {
@@ -261,9 +262,9 @@ export class KeyImporter {
         for (const chain of item.chains) {
           const derived = deriveWallet(item.data, chain.coinType);
           conn.query(
-            `INSERT INTO wallets (user_id, wallet_id, wallet_type, mnemonic, chain_id, coin_type, address, private_key, derivation_path, _hlc)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-            [itemUserId, itemWalletId, 'imported_mnemonic', item.data, chain.chainId, chain.coinType, derived.address, derived.privateKey, derived.derivationPath, ts]
+            `INSERT INTO wallets (user_id, wallet_id, wallet_type, mnemonic, chain_id, coin_type, address, private_key, derivation_path, created_at, _hlc)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [itemUserId, itemWalletId, 'imported_mnemonic', item.data, chain.chainId, chain.coinType, derived.address, derived.privateKey, derived.derivationPath, getMonotonicSqliteNow(), ts]
           );
           wallets.push({
             chainId: chain.chainId,

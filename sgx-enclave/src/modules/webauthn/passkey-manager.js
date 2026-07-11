@@ -9,6 +9,7 @@
 import { v4 as uuidv4 } from 'uuid';
 import crypto from 'crypto';
 import { createConnProxy } from '../../sync/sync-adapter.js';
+import { getMonotonicSqliteNow } from '../../utils/monotonic-clock.js';
 
 export class PasskeyManager {
   /**
@@ -51,14 +52,14 @@ export class PasskeyManager {
 
       // 1. 确保账户存在（INSERT OR IGNORE 幂等）
       conn.query(
-        'INSERT OR IGNORE INTO accounts (user_id, _hlc) VALUES (?, ?)',
-        [finalUserId, ts]
+        'INSERT OR IGNORE INTO accounts (user_id, created_at, _hlc) VALUES (?, ?, ?)',
+        [finalUserId, getMonotonicSqliteNow(), ts]
       );
 
       // 2. 绑定 Passkey（唯一约束 user_id + credential_id）
       const result = conn.query(
-        'INSERT INTO passkeys (user_id, credential_id, public_key_cose, _hlc) VALUES (?, ?, ?, ?)',
-        [finalUserId, credentialId, publicKeyCoseBuf, ts]
+        'INSERT INTO passkeys (user_id, credential_id, public_key_cose, created_at, _hlc) VALUES (?, ?, ?, ?, ?)',
+        [finalUserId, credentialId, publicKeyCoseBuf, getMonotonicSqliteNow(), ts]
       );
 
       return {

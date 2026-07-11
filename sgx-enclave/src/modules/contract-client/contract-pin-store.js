@@ -87,9 +87,9 @@ export class ContractPinStore {
     if (!existing || existing.length === 0) {
       // 首次钉住
       this._connMgr.writeQuery(
-        `INSERT INTO pinned_contract (id, rpc_url, chain_id, contract_address, allow_non_ra_tls, rpc_tls_ca_cert, snapshot_json)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
-        [PIN_ROW_ID, rpcUrl, Number(chainId), contractAddress, allowNonRaTlsVal, caCert, snapshotJson]
+        `INSERT INTO pinned_contract (id, rpc_url, chain_id, contract_address, allow_non_ra_tls, rpc_tls_ca_cert, snapshot_json, pinned_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [PIN_ROW_ID, rpcUrl, Number(chainId), contractAddress, allowNonRaTlsVal, caCert, snapshotJson, getMonotonicSqliteNow(), getMonotonicSqliteNow()]
       );
       console.log(
         `[ContractPinStore] pinned contract identity: rpcUrl=${rpcUrl}, chainId=${Number(chainId)}, address=${contractAddress}, allowNonRaTls=${!!allowNonRaTlsVal}, hasCaCert=${!!caCert}`
@@ -125,8 +125,8 @@ export class ContractPinStore {
     const caCert = rpcTlsCaCert || '';
 
     this._connMgr.writeQuery(
-      `INSERT INTO pinned_contract (id, rpc_url, chain_id, contract_address, allow_non_ra_tls, rpc_tls_ca_cert, snapshot_json)
-       VALUES (?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO pinned_contract (id, rpc_url, chain_id, contract_address, allow_non_ra_tls, rpc_tls_ca_cert, snapshot_json, pinned_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(id) DO UPDATE SET
          rpc_url = excluded.rpc_url,
          chain_id = excluded.chain_id,
@@ -135,7 +135,7 @@ export class ContractPinStore {
          rpc_tls_ca_cert = excluded.rpc_tls_ca_cert,
          snapshot_json = excluded.snapshot_json,
          updated_at = ?`,
-      [PIN_ROW_ID, rpcUrl, Number(chainId), contractAddress, allowNonRaTlsVal, caCert, snapshotJson, getMonotonicSqliteNow()]
+      [PIN_ROW_ID, rpcUrl, Number(chainId), contractAddress, allowNonRaTlsVal, caCert, snapshotJson, getMonotonicSqliteNow(), getMonotonicSqliteNow(), getMonotonicSqliteNow()]
     );
     console.log(
       `[ContractPinStore] contract identity migrated to: rpcUrl=${rpcUrl}, chainId=${Number(chainId)}, address=${contractAddress}, allowNonRaTls=${!!allowNonRaTlsVal}, hasCaCert=${!!caCert}`

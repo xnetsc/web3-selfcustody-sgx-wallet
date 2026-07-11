@@ -11,6 +11,7 @@
 import { v4 as uuidv4 } from 'uuid';
 import { generateMnemonic, validateMnemonic, deriveWallet, privateKeyToAddress } from './hd-wallet.js';
 import { createConnProxy } from '../../sync/sync-adapter.js';
+import { getMonotonicSqliteNow } from '../../utils/monotonic-clock.js';
 
 export class WalletManager {
   /**
@@ -78,9 +79,9 @@ export class WalletManager {
 
       for (const w of wallets) {
         conn.query(
-          `INSERT INTO wallets (user_id, wallet_id, wallet_type, mnemonic, chain_id, coin_type, address, private_key, derivation_path, _hlc)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-          [userId, finalWalletId, 'native', mnemonic, w.chainId, w.coinType, w.address, w.privateKey, w.derivationPath, ts]
+          `INSERT INTO wallets (user_id, wallet_id, wallet_type, mnemonic, chain_id, coin_type, address, private_key, derivation_path, created_at, _hlc)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [userId, finalWalletId, 'native', mnemonic, w.chainId, w.coinType, w.address, w.privateKey, w.derivationPath, getMonotonicSqliteNow(), ts]
         );
       }
 
@@ -122,9 +123,9 @@ export class WalletManager {
     await this._engine.write(async (db) => {
       const ts = this._engine.hlc.tick();
       db.run(
-        `INSERT INTO wallets (user_id, wallet_id, wallet_type, mnemonic, chain_id, coin_type, address, private_key, _hlc)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [userId, finalWalletId, 'imported_key', null, chainId, coinType, address, privateKey, ts]
+        `INSERT INTO wallets (user_id, wallet_id, wallet_type, mnemonic, chain_id, coin_type, address, private_key, created_at, _hlc)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [userId, finalWalletId, 'imported_key', null, chainId, coinType, address, privateKey, getMonotonicSqliteNow(), ts]
       );
     }, userId);
 
@@ -173,9 +174,9 @@ export class WalletManager {
 
         const derived = deriveWallet(mnemonic, chain.coinType);
         conn.query(
-          `INSERT INTO wallets (user_id, wallet_id, wallet_type, mnemonic, chain_id, coin_type, address, private_key, derivation_path, _hlc)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-          [userId, finalWalletId, 'imported_mnemonic', mnemonic, chain.chainId, chain.coinType, derived.address, derived.privateKey, derived.derivationPath, ts]
+          `INSERT INTO wallets (user_id, wallet_id, wallet_type, mnemonic, chain_id, coin_type, address, private_key, derivation_path, created_at, _hlc)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [userId, finalWalletId, 'imported_mnemonic', mnemonic, chain.chainId, chain.coinType, derived.address, derived.privateKey, derived.derivationPath, getMonotonicSqliteNow(), ts]
         );
 
         wallets.push({

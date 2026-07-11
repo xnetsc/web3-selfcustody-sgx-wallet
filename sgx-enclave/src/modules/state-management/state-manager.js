@@ -80,9 +80,9 @@ export class StateManager {
       // 不存在则创建
       console.log(`[StateManager] getOrCreateState: creating new state, grantee=${grantee || 'unknown'}`);
       conn.query(
-        `INSERT INTO authorization_states (authorization_id, user_id, grantee, status, total_amount_used, total_count_used, _hlc)
-         VALUES (?, ?, ?, 'active', '0', 0, ?)`,
-        [authorizationId, userId, grantee || '*', ts]
+        `INSERT INTO authorization_states (authorization_id, user_id, grantee, status, total_amount_used, total_count_used, created_at, updated_at, _hlc)
+         VALUES (?, ?, ?, 'active', '0', 0, ?, ?, ?)`,
+        [authorizationId, userId, grantee || '*', getMonotonicSqliteNow(), getMonotonicSqliteNow(), ts]
       );
 
       // 返回刚创建的记录
@@ -349,9 +349,9 @@ export class StateManager {
     await this._engine.write(async (db) => {
       const ts = this._engine.hlc.tick();
       db.run(
-        `INSERT OR IGNORE INTO authorization_records (user_id, authorization_id, grantee, authorization_json, authorization_hash, _hlc)
-         VALUES (?, ?, ?, ?, ?, ?)`,
-        [userId, authorizationId, JSON.stringify(grantee), JSON.stringify(authorizationJson), authorizationHash, ts]
+        `INSERT OR IGNORE INTO authorization_records (user_id, authorization_id, grantee, authorization_json, authorization_hash, created_at, _hlc)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        [userId, authorizationId, JSON.stringify(grantee), JSON.stringify(authorizationJson), authorizationHash, getMonotonicSqliteNow(), ts]
       );
     }, userId);
   }
@@ -368,9 +368,9 @@ export class StateManager {
   _saveAuthorizationRecordInTransaction(conn, userId, authorizationId, grantee, authorizationJson, authorizationHash) {
     const ts = this._engine.hlc.tick();
     conn.query(
-      `INSERT OR IGNORE INTO authorization_records (user_id, authorization_id, grantee, authorization_json, authorization_hash, _hlc)
-       VALUES (?, ?, ?, ?, ?, ?)`,
-      [userId, authorizationId, JSON.stringify(grantee), JSON.stringify(authorizationJson), authorizationHash, ts]
+      `INSERT OR IGNORE INTO authorization_records (user_id, authorization_id, grantee, authorization_json, authorization_hash, created_at, _hlc)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [userId, authorizationId, JSON.stringify(grantee), JSON.stringify(authorizationJson), authorizationHash, getMonotonicSqliteNow(), ts]
     );
   }
 
@@ -392,9 +392,9 @@ export class StateManager {
       // 不存在则创建
       const ts = this._engine.hlc.tick();
       conn.query(
-        `INSERT INTO authorization_states (authorization_id, user_id, grantee, status, total_amount_used, total_count_used, _hlc)
-         VALUES (?, ?, ?, 'active', '0', 0, ?)`,
-        [authorizationId, userId, JSON.stringify(grantee), ts]
+        `INSERT INTO authorization_states (authorization_id, user_id, grantee, status, total_amount_used, total_count_used, created_at, updated_at, _hlc)
+         VALUES (?, ?, ?, 'active', '0', 0, ?, ?, ?)`,
+        [authorizationId, userId, JSON.stringify(grantee), getMonotonicSqliteNow(), getMonotonicSqliteNow(), ts]
       );
     }
   }
@@ -558,8 +558,8 @@ export class StateManager {
     }
     const ts = this._engine.hlc.tick();
     conn.query(
-      'INSERT INTO tx_sign_nonces (authorization_id, guid, _hlc) VALUES (?, ?, ?)',
-      [authorizationId, guid, ts]
+      'INSERT INTO tx_sign_nonces (authorization_id, guid, created_at, _hlc) VALUES (?, ?, ?, ?)',
+      [authorizationId, guid, getMonotonicSqliteNow(), ts]
     );
   }
 

@@ -215,9 +215,9 @@ export class KeyExporter {
 
         // 写入导出会话（同一事务内）
         conn.query(
-          `INSERT INTO export_sessions (session_id, user_id, export_info, key_type, expires_at, _hlc)
-           VALUES (?, ?, ?, ?, ?, ?)`,
-          [sessionId, userId, exportInfoJson, keyType, getMonotonicSqliteAfter(ttl), ts]
+          `INSERT INTO export_sessions (session_id, user_id, export_info, key_type, created_at, expires_at, _hlc)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          [sessionId, userId, exportInfoJson, keyType, getMonotonicSqliteNow(), getMonotonicSqliteAfter(ttl), ts]
         );
 
         console.log(`[KeyExporter] initiateExport: success (RSA), sessionId=${sessionId}, keyType=${keyType}, ttl=${ttl}s, totalKeyCount=${totalKeyCount}`);
@@ -230,9 +230,9 @@ export class KeyExporter {
 
         // 写入导出会话（同一事务内）
         conn.query(
-          `INSERT INTO export_sessions (session_id, user_id, export_info, key_type, expires_at, _hlc)
-           VALUES (?, ?, ?, ?, ?, ?)`,
-          [sessionId, userId, exportInfoJson, keyType, getMonotonicSqliteAfter(ttl), ts]
+          `INSERT INTO export_sessions (session_id, user_id, export_info, key_type, created_at, expires_at, _hlc)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          [sessionId, userId, exportInfoJson, keyType, getMonotonicSqliteNow(), getMonotonicSqliteAfter(ttl), ts]
         );
 
         console.log(`[KeyExporter] initiateExport: success (ECDH), sessionId=${sessionId}, keyType=${keyType}, ttl=${ttl}s, totalKeyCount=${totalKeyCount}`);

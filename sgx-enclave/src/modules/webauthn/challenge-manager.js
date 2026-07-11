@@ -83,9 +83,9 @@ export class WebAuthnChallengeManager {
     const challenge = crypto.randomBytes(32).toString('base64url');
 
     this._db.writeQuery(
-      `INSERT INTO webauthn_challenges (challenge, user_id, purpose, credential_id, expires_at)
-       VALUES (?, ?, ?, ?, ?)`,
-      [challenge, userId, purpose, credentialId, expiresAt]
+      `INSERT INTO webauthn_challenges (challenge, user_id, purpose, credential_id, created_at, expires_at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [challenge, userId, purpose, credentialId, getMonotonicSqliteNow(), expiresAt]
     );
 
     console.log(`[WebAuthnChallengeManager] Created challenge for userId=${userId}, purpose=${purpose}, expiresAt=${expiresAt}`);

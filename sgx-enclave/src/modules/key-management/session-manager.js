@@ -48,9 +48,9 @@ export class SessionManager {
     await this._engine.write(async (db) => {
       const ts = this._engine.hlc.tick();
       db.run(
-        `INSERT INTO import_sessions (session_id, user_id, key_type, secret_key, import_type, expires_at, _hlc)
-         VALUES (?, ?, 'ecdh', ?, ?, ?, ?)`,
-        [sessionId, userId, keyPair.privateKey, importType, getMonotonicSqliteAfter(expireSeconds), ts]
+        `INSERT INTO import_sessions (session_id, user_id, key_type, secret_key, import_type, created_at, expires_at, _hlc)
+         VALUES (?, ?, 'ecdh', ?, ?, ?, ?, ?)`,
+        [sessionId, userId, keyPair.privateKey, importType, getMonotonicSqliteNow(), getMonotonicSqliteAfter(expireSeconds), ts]
       );
     }, userId);
 
@@ -96,9 +96,9 @@ export class SessionManager {
     await this._engine.write(async (db) => {
       const ts = this._engine.hlc.tick();
       db.run(
-        `INSERT INTO import_sessions (session_id, user_id, key_type, secret_key, import_type, expires_at, _hlc)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
-        [sessionId, userId, rsaResult.keyType, aesKey.toString('hex'), importType, getMonotonicSqliteAfter(expireSeconds), ts]
+        `INSERT INTO import_sessions (session_id, user_id, key_type, secret_key, import_type, created_at, expires_at, _hlc)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        [sessionId, userId, rsaResult.keyType, aesKey.toString('hex'), importType, getMonotonicSqliteNow(), getMonotonicSqliteAfter(expireSeconds), ts]
       );
     }, userId);
 

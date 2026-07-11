@@ -14,7 +14,7 @@ import { getMonotonicSqliteNow } from '../utils/monotonic-clock.js';
 export const CREATE_ACCOUNTS_SQL = `
 CREATE TABLE IF NOT EXISTS accounts (
     user_id TEXT NOT NULL,
-    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    created_at TEXT NOT NULL,
     _hlc TEXT NOT NULL DEFAULT '0',
     PRIMARY KEY (user_id)
 )`;
@@ -26,7 +26,7 @@ CREATE TABLE IF NOT EXISTS passkeys (
     credential_id TEXT NOT NULL,
     public_key_cose BLOB NOT NULL,
     sign_count INTEGER NOT NULL DEFAULT 0,
-    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    created_at TEXT NOT NULL,
     _hlc TEXT NOT NULL DEFAULT '0',
     UNIQUE (user_id, credential_id)
 )`;
@@ -48,7 +48,7 @@ CREATE TABLE IF NOT EXISTS wallets (
     address TEXT NOT NULL,
     private_key TEXT NOT NULL,
     derivation_path TEXT,
-    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    created_at TEXT NOT NULL,
     _hlc TEXT NOT NULL DEFAULT '0',
     UNIQUE (user_id, chain_id, address)
 )`;
@@ -67,8 +67,8 @@ CREATE TABLE IF NOT EXISTS authorization_states (
     total_amount_used TEXT NOT NULL DEFAULT '0',
     total_count_used INTEGER NOT NULL DEFAULT 0,
     status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'revoked', 'expired', 'exceeded')),
-    created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
     _hlc TEXT NOT NULL DEFAULT '0',
     UNIQUE (user_id, authorization_id)
 )`;
@@ -102,7 +102,7 @@ CREATE TABLE IF NOT EXISTS import_sessions (
     key_type TEXT NOT NULL DEFAULT 'ecdh',
     secret_key TEXT NOT NULL,
     import_type TEXT NOT NULL CHECK (import_type IN ('private_key', 'mnemonic', 'batch')),
-    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    created_at TEXT NOT NULL,
     expires_at TEXT NOT NULL,
     _hlc TEXT NOT NULL DEFAULT '0',
     PRIMARY KEY (session_id)
@@ -119,7 +119,7 @@ CREATE TABLE IF NOT EXISTS export_sessions (
     user_id TEXT NOT NULL,
     export_info TEXT NOT NULL,
     key_type TEXT NOT NULL DEFAULT 'ecdh',
-    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    created_at TEXT NOT NULL,
     expires_at TEXT NOT NULL,
     _hlc TEXT NOT NULL DEFAULT '0',
     PRIMARY KEY (session_id)
@@ -137,7 +137,7 @@ CREATE TABLE IF NOT EXISTS authorization_records (
     grantee TEXT NOT NULL,
     authorization_json TEXT NOT NULL,
     authorization_hash TEXT NOT NULL,
-    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    created_at TEXT NOT NULL,
     _hlc TEXT NOT NULL DEFAULT '0',
     PRIMARY KEY (user_id, authorization_id)
 )`;
@@ -153,7 +153,7 @@ export const CREATE_TX_SIGN_NONCES_SQL = `
 CREATE TABLE IF NOT EXISTS tx_sign_nonces (
     authorization_id TEXT NOT NULL,
     guid TEXT NOT NULL,
-    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    created_at TEXT NOT NULL,
     _hlc TEXT NOT NULL DEFAULT '0',
     PRIMARY KEY (authorization_id, guid)
 )`;
@@ -171,7 +171,7 @@ CREATE TABLE IF NOT EXISTS webauthn_challenges (
     user_id TEXT NOT NULL,
     purpose TEXT NOT NULL CHECK (purpose IN ('register', 'register_passkey', 'authenticate', 'wallet_create', 'wallet_delete', 'passkey_delete', 'wallet_entry_delete', 'key_export', 'key_export_confirm', 'evidence_query', 'key_import_init', 'key_import_complete')),
     credential_id TEXT,
-    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    created_at TEXT NOT NULL,
     expires_at TEXT NOT NULL,
     _hlc TEXT NOT NULL DEFAULT '0'
 )`;
@@ -187,7 +187,7 @@ export const CREATE_ACCOUNT_FREEZES_SQL = `
 CREATE TABLE IF NOT EXISTS account_freezes (
     user_id TEXT NOT NULL,
     credential_id TEXT NOT NULL,
-    frozen_at TEXT NOT NULL DEFAULT (datetime('now')),
+    frozen_at TEXT NOT NULL,
     freeze_until TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'frozen' CHECK (status IN ('frozen', 'lifted')),
     lifted_at TEXT,
@@ -216,8 +216,8 @@ CREATE TABLE IF NOT EXISTS pinned_contract (
     allow_non_ra_tls INTEGER NOT NULL DEFAULT 0,
     rpc_tls_ca_cert TEXT NOT NULL DEFAULT '',
     snapshot_json TEXT,
-    pinned_at TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    pinned_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
     _hlc TEXT NOT NULL DEFAULT '0'
 )`;
 
