@@ -134,6 +134,7 @@ If `CONTRACT_RPC_URL`, `CONTRACT_CHAIN_ID`, or `CONTRACT_ADDRESS` are omitted, t
 | `SGX_HTTP_PORT` | No | `3000` | HTTP port for the API server |
 | `SYNC_NODES` | No | — | Comma-separated WSS peer URLs for multi-node sync; omit for single-node mode |
 | `SYNC_LISTEN_PORT` | No | `3307` | WebSocket listening port for P2P sync |
+| `SYNC_ADVERTISED_URL` | No | auto-inferred | Externally reachable WSS URL of this node, advertised to peers during pin-check for P2P discovery. Auto-inferred from the first non-internal network interface when unset (set explicitly behind NAT/proxy). |
 | `NODE_ID` | No | random UUID per start | Stable per-instance identifier. Injection-only (never from contract, since contract config is shared across nodes). A stable `NODE_ID` allows full-sync senders to resume across receiver restarts; when unset, a fresh UUID is generated every start and any in-flight full-sync restarts from scratch on the sender side (idempotent, but wastes bandwidth). |
 | `NUM_SHARDS` | No | `16` | Number of shards for horizontal scaling (do not change after first deployment); ENV takes priority over `runtimeParams.sync.numShards` from contract |
 | `MIN_QUORUM` | No | `2` (multi-node) / `1` (single) | Minimum peers required for quorum; overridden by `runtimeParams.sync.minQuorum` from contract |

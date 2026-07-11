@@ -69,6 +69,10 @@ loader.env.SGX_HTTP_PORT = { passthrough = true }
 loader.env.SYNC_NODES = { passthrough = true }
 # SYNC_LISTEN_PORT: WSS sync server listening port (default 3307)
 loader.env.SYNC_LISTEN_PORT = { passthrough = true }
+# SYNC_ADVERTISED_URL: externally reachable WSS URL of this node, advertised
+# to peers during pin-check for P2P discovery (optional; auto-inferred from
+# the first non-internal network interface when unset)
+loader.env.SYNC_ADVERTISED_URL = { passthrough = true }
 # NODE_ID: stable per-instance identifier. MUST be unique per node — cannot
 # come from contract (contract config is shared). When unset, a fresh random
 # UUID is generated on each process start; full-resync on the sender side

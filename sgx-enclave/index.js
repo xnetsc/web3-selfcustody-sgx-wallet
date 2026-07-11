@@ -8,7 +8,7 @@
  *     / freezeDuration / numShards / minQuorum 等）一律从合约读取，不再有 env 兜底。
  *   - .env 文件不被 enclave 加载（dotenv 已移除，allowed_files 也不含 .env）。
  *
- * 本地透传环境变量（仅以下 9 项，由 manifest 显式 passthrough）：
+ * 本地透传环境变量（仅以下 10 项，由 manifest 显式 passthrough）：
  *   CONTRACT_RPC_URL    — 区块链 RPC 地址（引导）
  *   CONTRACT_CHAIN_ID   — 链 ID（引导）
  *   CONTRACT_ADDRESS    — WalletTrustContract 合约地址（引导）
@@ -16,6 +16,7 @@
  *   SGX_HTTP_PORT       — 本地 HTTP 监听端口（默认 3000）
  *   SYNC_NODES          — 同步节点 WSS 地址（逗号分隔，可选）
  *   SYNC_LISTEN_PORT    — 本地 WSS 监听端口（默认 3307）
+ *   SYNC_ADVERTISED_URL — 本节点对外通告的监听地址（P2P 发现自报地址，可选）
  *   RATLS_CERT_PATH     — RA-TLS 证书路径（与 allowed_files 绑定）
  *   PROXY_API_KEY       — Intel PCCS API key（敏感，永不上链）
  *
@@ -220,6 +221,7 @@ async function main() {
     hlc,
     peerUrls: syncNodes,
     listenPort,
+    advertisedUrl: process.env.SYNC_ADVERTISED_URL || null,
     raTlsOptions,
     verifier,
     reconnect: runtimeParams.reconnect || {},
