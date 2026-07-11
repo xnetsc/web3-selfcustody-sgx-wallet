@@ -13,6 +13,7 @@
 import { v4 as uuidv4 } from 'uuid';
 import { generateECDHKeyPair } from './ecdh.js';
 import { generateAESKey, encryptAESKeyWithRSA, validateAndDetectRSAPublicKey } from './rsa.js';
+import { getMonotonicSqliteNow, getMonotonicSqliteAfter } from '../../utils/monotonic-clock.js';
 
 export class SessionManager {
   /**
@@ -48,8 +49,8 @@ export class SessionManager {
       const ts = this._engine.hlc.tick();
       db.run(
         `INSERT INTO import_sessions (session_id, user_id, key_type, secret_key, import_type, expires_at, _hlc)
-         VALUES (?, ?, 'ecdh', ?, ?, datetime('now', '+' || ? || ' seconds'), ?)`,
-        [sessionId, userId, keyPair.privateKey, importType, expireSeconds, ts]
+         VALUES (?, ?, 'ecdh', ?, ?, ?, ?)`,
+        [sessionId, userId, keyPair.privateKey, importType, getMonotonicSqliteAfter(expireSeconds), ts]
       );
     }, userId);
 
@@ -96,8 +97,8 @@ export class SessionManager {
       const ts = this._engine.hlc.tick();
       db.run(
         `INSERT INTO import_sessions (session_id, user_id, key_type, secret_key, import_type, expires_at, _hlc)
-         VALUES (?, ?, ?, ?, ?, datetime('now', '+' || ? || ' seconds'), ?)`,
-        [sessionId, userId, rsaResult.keyType, aesKey.toString('hex'), importType, expireSeconds, ts]
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        [sessionId, userId, rsaResult.keyType, aesKey.toString('hex'), importType, getMonotonicSqliteAfter(expireSeconds), ts]
       );
     }, userId);
 
@@ -124,8 +125,8 @@ export class SessionManager {
     console.log(`[SessionManager] findSession: sessionId=${sessionId}`);
 
     const rows = await this._db.readQuery(
-      `SELECT session_id, user_id, key_type, secret_key, import_type FROM import_sessions WHERE session_id = ? AND expires_at > datetime('now')`,
-      [sessionId]
+      `SELECT session_id, user_id, key_type, secret_key, import_type FROM import_sessions WHERE session_id = ? AND expires_at > ?`,
+      [sessionId, getMonotonicSqliteNow()]
     );
 
     if (rows.length === 0) {

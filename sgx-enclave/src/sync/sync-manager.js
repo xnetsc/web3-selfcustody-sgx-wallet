@@ -16,6 +16,7 @@ import { WebSocketServer, WebSocket } from 'ws';
 import { createRequire } from 'module';
 import { SyncEngine } from '@xnetx/raft-hlc-sync';
 import { createSQLiteAdapter, registerBusinessTables } from './sync-adapter.js';
+import { getMonotonicNow, getMonotonicMs } from '../utils/monotonic-clock.js';
 
 const require_fn = createRequire(import.meta.url);
 const os = require_fn('os');
@@ -142,7 +143,7 @@ export class SyncManager {
             nodeId: options.hlc.nodeId,
             db: dbAdapter,
             dialect: 'sqlite',
-            getNow: () => ({ value: Date.now(), unit: 'ms' }),
+            getNow: () => getMonotonicNow(),
             memonicNow: () => ({ value: Number(process.hrtime.bigint()), unit: 'ns' }),
             numShards: this._numShards,
             getMinQuorum: this._getMinQuorum,
@@ -797,10 +798,10 @@ export class SyncManager {
                 nextInterval = this._reconnectInitialMs;
             }
             existing.currentInterval = nextInterval;
-            existing.nextRetryAt = Date.now() + nextInterval;
+            existing.nextRetryAt = getMonotonicMs() + nextInterval;
         } else {
             this.pendingConnections.set(url, {
-                nextRetryAt: Date.now() + this._reconnectInitialMs,
+                nextRetryAt: getMonotonicMs() + this._reconnectInitialMs,
                 currentInterval: this._reconnectInitialMs,
                 _connecting: false,
             });
@@ -809,7 +810,7 @@ export class SyncManager {
 
     _reconnectPending() {
         if (this.pendingConnections.size === 0) return;
-        const now = Date.now();
+        const now = getMonotonicMs();
         for (const [url, info] of this.pendingConnections) {
             if (this._peerWsMap.has(url)) {
                 this.pendingConnections.delete(url);

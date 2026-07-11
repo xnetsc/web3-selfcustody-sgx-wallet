@@ -28,12 +28,13 @@ async function main() {
   //      attestation.allowNonRaTls        — direct/sim 测试模式必需（生产部署必须为 false）
   //      sync.numShards / sync.minQuorum  — 共识/分片参数（之前 NUM_SHARDS / MIN_QUORUM）
   //      security.freezeDurationSeconds   — 账户冻结时长（之前 FREEZE_DURATION_SECONDS）
+  //      security.ntpServers              — NTP 时间源列表，用于校正单调时钟锚点，确保跨节点时间一致
   const runtimeParams = JSON.stringify({
     session: { importTtlSeconds: 300, exportTtlSeconds: 86400 },
     cache: { refreshInterval: 600000 },
     attestation: { allowNonRaTls: true },
     sync: { numShards: 16, minQuorum: 1 },
-    security: { freezeDurationSeconds: 259200 },
+    security: { freezeDurationSeconds: 259200, ntpServers: ['pool.ntp.org', 'time.google.com', 'time.cloudflare.com'] },
   });
 
   const tx1 = await contract.updateRuntimeParams(runtimeParams);

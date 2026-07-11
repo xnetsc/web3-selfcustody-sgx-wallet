@@ -18,6 +18,8 @@
  *   - 冻结解除后：所有接口调用恢复正常
  */
 
+import { getMonotonicDate, getMonotonicSqliteNow } from '../../utils/monotonic-clock.js';
+
 /**
  * 默认冻结时长（秒），72 小时 = 259200 秒
  */
@@ -84,7 +86,7 @@ export class AccountFreezeManager {
 
     // 计算冻结截止时间（动态获取最新冻结时长，确保合约配置变更后新冻结使用新值）
     const freezeDurationSeconds = this._getFreezeDurationSeconds();
-    const frozenAt = new Date();
+    const frozenAt = getMonotonicDate();
     const freezeUntil = new Date(frozenAt.getTime() + freezeDurationSeconds * 1000);
     const frozenAtStr = frozenAt.toISOString().slice(0, 19).replace('T', ' ');
     const freezeUntilStr = freezeUntil.toISOString().slice(0, 19).replace('T', ' ');
@@ -145,7 +147,7 @@ export class AccountFreezeManager {
     }
 
     const row = rows[0];
-    const now = new Date();
+    const now = getMonotonicDate();
     const freezeUntil = new Date(row.freeze_until + 'Z'); // 确保 UTC 解析
     const withinFreezePeriod = now < freezeUntil;
 
@@ -193,7 +195,7 @@ export class AccountFreezeManager {
 
     // 计算新的冻结时间（动态获取最新冻结时长）
     const freezeDurationSeconds = this._getFreezeDurationSeconds();
-    const frozenAt = new Date();
+    const frozenAt = getMonotonicDate();
     const freezeUntil = new Date(frozenAt.getTime() + freezeDurationSeconds * 1000);
     const frozenAtStr = frozenAt.toISOString().slice(0, 19).replace('T', ' ');
     const freezeUntilStr = freezeUntil.toISOString().slice(0, 19).replace('T', ' ');
@@ -223,7 +225,7 @@ export class AccountFreezeManager {
   liftFreeze(userId) {
     if (!userId) throw new Error('userId is required');
 
-    const now = new Date().toISOString().slice(0, 19).replace('T', ' ');
+    const now = getMonotonicSqliteNow();
 
     const result = this._db.writeQuery(
       `UPDATE account_freezes SET status = 'lifted', lifted_at = ? WHERE user_id = ? AND status = 'frozen'`,

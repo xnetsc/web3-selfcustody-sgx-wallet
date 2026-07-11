@@ -7,6 +7,7 @@
  */
 
 import { createConnProxy } from '../../sync/sync-adapter.js';
+import { getMonotonicSqliteNow } from '../../utils/monotonic-clock.js';
 
 /**
  * 构造 tokenLimits 的 key
@@ -240,10 +241,10 @@ export class StateManager {
           `UPDATE authorization_states
            SET total_amount_used = ?,
                total_count_used = total_count_used + 1,
-               updated_at = datetime('now'),
+               updated_at = ?,
                _hlc = ?
            WHERE authorization_id = ?`,
-          [newTotal, ts, authorizationId]
+          [newTotal, getMonotonicSqliteNow(), ts, authorizationId]
         );
       }
 
@@ -286,8 +287,8 @@ export class StateManager {
     const result = await this._engine.write(async (db) => {
       const ts = this._engine.hlc.tick();
       return db.run(
-        `UPDATE authorization_states SET status = ?, updated_at = datetime('now'), _hlc = ? WHERE authorization_id = ? AND status = ?`,
-        [newStatus, ts, authorizationId, 'active']
+        `UPDATE authorization_states SET status = ?, updated_at = ?, _hlc = ? WHERE authorization_id = ? AND status = ?`,
+        [newStatus, getMonotonicSqliteNow(), ts, authorizationId, 'active']
       );
     }, authorizationId);
 
@@ -477,10 +478,10 @@ export class StateManager {
         `UPDATE authorization_states
          SET total_amount_used = ?,
              total_count_used = total_count_used + 1,
-             updated_at = datetime('now'),
+             updated_at = ?,
              _hlc = ?
          WHERE authorization_id = ?`,
-        [newTotal, this._engine.hlc.tick(), authorizationId]
+        [newTotal, getMonotonicSqliteNow(), this._engine.hlc.tick(), authorizationId]
       );
     }
 

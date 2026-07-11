@@ -88,6 +88,41 @@ describe("WalletTrustContract", function () {
       expect(parsed.cache.refreshInterval).to.equal(60000);
     });
 
+    it("Owner can update runtime params with ntpServers in security config", async function () {
+      const ntpServers = ['pool.ntp.org', 'time.google.com', 'time.cloudflare.com'];
+      const params = JSON.stringify({
+        session: { importTtlSeconds: 300, exportTtlSeconds: 86400 },
+        cache: { refreshInterval: 60000 },
+        security: { freezeDurationSeconds: 259200, ntpServers },
+      });
+      const tx = await contract.updateRuntimeParams(params);
+      await expect(tx).to.emit(contract, "RuntimeParamsUpdated").withArgs(params);
+      const stored = await contract.getRuntimeParams();
+      expect(stored).to.equal(params);
+      const parsed = JSON.parse(stored);
+      expect(parsed.security.freezeDurationSeconds).to.equal(259200);
+      expect(parsed.security.ntpServers).to.deep.equal(ntpServers);
+      expect(parsed.security.ntpServers).to.have.lengthOf(3);
+    });
+
+    it("Owner can update ntpServers without losing other security fields", async function () {
+      // 先设置初始配置
+      const initialParams = JSON.stringify({
+        security: { freezeDurationSeconds: 259200, ntpServers: ['pool.ntp.org'] },
+      });
+      await contract.updateRuntimeParams(initialParams);
+
+      // 更新 ntpServers
+      const updatedParams = JSON.stringify({
+        security: { freezeDurationSeconds: 259200, ntpServers: ['time.google.com', 'time.cloudflare.com', 'time.apple.com'] },
+      });
+      await contract.updateRuntimeParams(updatedParams);
+      const stored = await contract.getRuntimeParams();
+      const parsed = JSON.parse(stored);
+      expect(parsed.security.ntpServers).to.deep.equal(['time.google.com', 'time.cloudflare.com', 'time.apple.com']);
+      expect(parsed.security.freezeDurationSeconds).to.equal(259200);
+    });
+
     it("Non-owner cannot update runtime params", async function () {
       await expect(
         contract.connect(addr1).updateRuntimeParams("{}")

@@ -16,6 +16,8 @@
 
 const PIN_ROW_ID = 1;
 
+import { getMonotonicSqliteNow } from '../../utils/monotonic-clock.js';
+
 export class ContractPinStore {
   /**
    * @param {import('../../database/connection-manager.js').default|import('../../database/connection-manager.js').LazyConnectionManager} connMgr
@@ -97,8 +99,8 @@ export class ContractPinStore {
 
     // 已钉住：只更新快照，身份保持不变（即使传入的身份不同也忽略，防止被覆盖）
     this._connMgr.writeQuery(
-      `UPDATE pinned_contract SET snapshot_json = ?, updated_at = datetime('now') WHERE id = ?`,
-      [snapshotJson, PIN_ROW_ID]
+      `UPDATE pinned_contract SET snapshot_json = ?, updated_at = ? WHERE id = ?`,
+      [snapshotJson, getMonotonicSqliteNow(), PIN_ROW_ID]
     );
   }
 
@@ -132,8 +134,8 @@ export class ContractPinStore {
          allow_non_ra_tls = excluded.allow_non_ra_tls,
          rpc_tls_ca_cert = excluded.rpc_tls_ca_cert,
          snapshot_json = excluded.snapshot_json,
-         updated_at = datetime('now')`,
-      [PIN_ROW_ID, rpcUrl, Number(chainId), contractAddress, allowNonRaTlsVal, caCert, snapshotJson]
+         updated_at = ?`,
+      [PIN_ROW_ID, rpcUrl, Number(chainId), contractAddress, allowNonRaTlsVal, caCert, snapshotJson, getMonotonicSqliteNow()]
     );
     console.log(
       `[ContractPinStore] contract identity migrated to: rpcUrl=${rpcUrl}, chainId=${Number(chainId)}, address=${contractAddress}, allowNonRaTls=${!!allowNonRaTlsVal}, hasCaCert=${!!caCert}`

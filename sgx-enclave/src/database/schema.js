@@ -7,6 +7,7 @@
  */
 
 import { DB_PATH } from './constants.js';
+import { getMonotonicSqliteNow } from '../utils/monotonic-clock.js';
 
 // ========== 表创建 SQL（SQLite 语法） ==========
 
@@ -312,7 +313,8 @@ export function dropAllTables(db) {
  */
 export function cleanExpiredSessions(connectionManager) {
     const result = connectionManager.writeQuery(
-        "DELETE FROM import_sessions WHERE expires_at < datetime('now')"
+        "DELETE FROM import_sessions WHERE expires_at < ?",
+        [getMonotonicSqliteNow()]
     );
     if (result.changes > 0) {
         console.log(`Cleaned ${result.changes} expired import sessions.`);
@@ -331,7 +333,8 @@ export function cleanExpiredSessions(connectionManager) {
  */
 export function cleanExpiredExportSessions(connectionManager) {
     const result = connectionManager.writeQuery(
-        "DELETE FROM export_sessions WHERE expires_at < datetime('now')"
+        "DELETE FROM export_sessions WHERE expires_at < ?",
+        [getMonotonicSqliteNow()]
     );
     if (result.changes > 0) {
         console.log(`Cleaned ${result.changes} expired export sessions (wallets preserved).`);
@@ -346,7 +349,8 @@ export function cleanExpiredExportSessions(connectionManager) {
  */
 export function cleanExpiredWebAuthnChallenges(connectionManager) {
     const result = connectionManager.writeQuery(
-        "DELETE FROM webauthn_challenges WHERE expires_at < datetime('now')"
+        "DELETE FROM webauthn_challenges WHERE expires_at < ?",
+        [getMonotonicSqliteNow()]
     );
     if (result.changes > 0) {
         console.log(`[Schema] Cleaned ${result.changes} expired webauthn challenges.`);

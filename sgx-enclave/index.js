@@ -61,6 +61,7 @@ import {
 } from './src/api/index.js';
 
 import { createApp, startServer } from './src/server.js';
+import { getMonotonicNow, calibrateFromNtp, getLastNtpServers } from './src/utils/monotonic-clock.js';
 
 async function main() {
   console.log('[SGX Enclave] Starting...');
@@ -105,6 +106,19 @@ async function main() {
   const importTtlSeconds = sessionConfig.importTtlSeconds || 300;
   const exportTtlSeconds = sessionConfig.exportTtlSeconds || 86400;
 
+  // 3.1 NTP 时间源校正：如果合约配置了 security.ntpServers，用 NTP 校正单调时钟锚点
+  //     确保所有节点的时间基准一致，消除宿主机时钟偏差
+  const ntpServers = runtimeParams.security?.ntpServers;
+  if (Array.isArray(ntpServers) && ntpServers.length > 0) {
+    console.log(`[SGX Enclave] NTP calibration: servers=${ntpServers.join(', ')}`);
+    const calibrated = await calibrateFromNtp(ntpServers);
+    if (!calibrated) {
+      console.warn('[SGX Enclave] NTP calibration failed at startup, using local clock as anchor');
+    }
+  } else {
+    console.log('[SGX Enclave] No NTP servers configured, using local clock as monotonic anchor');
+  }
+
   // 分片数（部署后不得修改，默认 16）—— 仅来自合约 runtimeParams.sync.numShards
   const numShards = parseInt(
     String((runtimeParams.sync && runtimeParams.sync.numShards) || 16),
@@ -147,7 +161,7 @@ async function main() {
   // 稳定的 nodeId 使发送方重启后仍可触发全量同步的断点续传；
   // 随机 fallback 只适合一次性/短命实例，发送方重启后会从头重传（幂等，不丢数据，只浪费带宽）。
   const nodeId = (process.env.NODE_ID && process.env.NODE_ID.trim()) || crypto.randomUUID();
-  const hlc = new HLC(nodeId, () => ({ value: Date.now(), unit: 'ms' }));
+  const hlc = new HLC(nodeId, () => getMonotonicNow());
 
   // Attestation 配置 — 从 runtimeParams.attestation 读取（合约 > env RUNTIME_PARAMS > 默认值）
   // 但如果已 pin，allowNonRaTls 以 pin 的值为准，忽略合约/env 的值
@@ -360,6 +374,19 @@ async function main() {
       await stateManager.cleanInvalidatedStates();
       // 清理过期的 WebAuthn 挑战值
       challengeManager.cleanExpiredChallenges();
+      // 检查合约 NTP 配置是否变更，变更则重新校正单调时钟
+      const latestParams = contractClient.getRuntimeParams() || {};
+      const latestNtp = latestParams.security?.ntpServers;
+      const lastNtp = getLastNtpServers();
+      if (Array.isArray(latestNtp) && latestNtp.length > 0) {
+        const changed = !lastNtp ||
+          lastNtp.length !== latestNtp.length ||
+          latestNtp.some((s, i) => s !== lastNtp[i]);
+        if (changed) {
+          console.log('[SGX Enclave] NTP servers changed in contract, re-calibrating...');
+          await calibrateFromNtp(latestNtp);
+        }
+      }
     } catch (err) {
       console.error('[SGX Enclave] Session cleanup error:', err.message);
     }

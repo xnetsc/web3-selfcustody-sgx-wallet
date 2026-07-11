@@ -7,6 +7,7 @@
 import { ethers } from 'ethers';
 import { CONTRACT_ABI } from './abi.js';
 import https from 'node:https';
+import { getMonotonicMs, calibrateFromNtp, getLastNtpServers } from '../../utils/monotonic-clock.js';
 
 /** 默认缓存刷新间隔（毫秒），合约连接成功后的正常刷新间隔 */
 const DEFAULT_REFRESH_INTERVAL = 60000;
@@ -402,7 +403,7 @@ export class ContractClient {
       enclaveWhitelist,
       enclaveWhitelistMap,
       codeRepository: mergedCodeRepository,
-      lastRefreshedAt: markRefreshed ? Date.now() : (this._cache?.lastRefreshedAt || 0),
+      lastRefreshedAt: markRefreshed ? getMonotonicMs() : (this._cache?.lastRefreshedAt || 0),
     };
 
     console.log(`[ContractClient] _buildCache: platformWhitelist=${platformWhitelist.length}, enclaveWhitelist=${enclaveWhitelist.length}, hasRuntimeParams=${!!runtimeParams}, fresh=${markRefreshed}, contractAvailable=${this._contractAvailable}`);
@@ -413,6 +414,21 @@ export class ContractClient {
     // 更新定时器间隔（仅在正常刷新模式下生效；重连模式下由 _onReconnectTick 管理）
     if (markRefreshed && !this._reconnecting && runtimeParams?.cache?.refreshInterval) {
       this._restartRefreshTimer(runtimeParams.cache.refreshInterval);
+    }
+
+    // NTP 时间源变更检测：合约刷新后发现 ntpServers 变化，立即重新校正单调时钟
+    if (markRefreshed && runtimeParams?.security?.ntpServers) {
+      const latestNtp = runtimeParams.security.ntpServers;
+      const lastNtp = getLastNtpServers();
+      const changed = !lastNtp ||
+        lastNtp.length !== latestNtp.length ||
+        latestNtp.some((s, i) => s !== lastNtp[i]);
+      if (changed) {
+        console.log('[ContractClient] NTP servers changed, re-calibrating monotonic clock...');
+        calibrateFromNtp(latestNtp).catch((err) => {
+          console.warn('[ContractClient] NTP re-calibration failed:', err.message);
+        });
+      }
     }
   }
 

@@ -13,6 +13,7 @@
 import { parseAuthorization, computeAuthorizationHash } from './authorization-parser.js';
 import { matchCron } from './cron-matcher.js';
 import { verifyWebAuthnSignature } from '../webauthn/verifier.js';
+import { getMonotonicDate } from '../../utils/monotonic-clock.js';
 
 /**
  * 统一的地址匹配函数，支持 "*" 通配符
@@ -158,7 +159,7 @@ export class AuthEngine {
     }
 
     // ===== 第 7 项：检查授权截止日期 =====
-    const now = new Date();
+    const now = getMonotonicDate();
     if (auth.timePolicy.deadline && new Date(auth.timePolicy.deadline) < now) {
       console.log(`[AuthEngine] verify: REJECTED at step 7 - expired, deadline=${auth.timePolicy.deadline}`);
       return { approved: false, step: 7, reason: 'Authorization has expired' };

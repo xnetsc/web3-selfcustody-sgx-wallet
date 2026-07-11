@@ -26,6 +26,7 @@
  */
 
 import crypto from 'crypto';
+import { getMonotonicDate, getMonotonicSqliteNow, getMonotonicSqliteAfter } from '../../utils/monotonic-clock.js';
 
 /**
  * 默认 TTL：5 分钟
@@ -109,8 +110,8 @@ export class WebAuthnChallengeManager {
     const rows = this._db.readQuery(
       `SELECT id, user_id, purpose, credential_id, expires_at
        FROM webauthn_challenges
-       WHERE challenge = ? AND expires_at > datetime('now')`,
-      [challenge]
+       WHERE challenge = ? AND expires_at > ?`,
+      [challenge, getMonotonicSqliteNow()]
     );
 
     if (rows.length === 0) {
@@ -169,8 +170,8 @@ export class WebAuthnChallengeManager {
     const rows = this._db.readQuery(
       `SELECT id, user_id, purpose, credential_id, expires_at
        FROM webauthn_challenges
-       WHERE challenge = ? AND expires_at > datetime('now')`,
-      [rawChallenge]
+       WHERE challenge = ? AND expires_at > ?`,
+      [rawChallenge, getMonotonicSqliteNow()]
     );
 
     if (rows.length === 0) {
@@ -213,7 +214,8 @@ export class WebAuthnChallengeManager {
    */
   cleanExpiredChallenges() {
     const result = this._db.writeQuery(
-      `DELETE FROM webauthn_challenges WHERE expires_at < datetime('now')`
+      `DELETE FROM webauthn_challenges WHERE expires_at < ?`,
+      [getMonotonicSqliteNow()]
     );
     if (result.changes > 0) {
       console.log(`[WebAuthnChallengeManager] Cleaned ${result.changes} expired challenges`);
@@ -227,8 +229,6 @@ export class WebAuthnChallengeManager {
    * @private
    */
   _computeExpiresAt() {
-    const now = new Date();
-    now.setSeconds(now.getSeconds() + this._ttlSeconds);
-    return now.toISOString().slice(0, 19).replace('T', ' ');
+    return getMonotonicSqliteAfter(this._ttlSeconds);
   }
 }

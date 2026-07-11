@@ -49,6 +49,7 @@ import crypto from 'crypto';
 import { generateECDHKeyPair, deriveSharedSecret, encrypt } from './ecdh.js';
 import { generateAESKey, encryptAESKeyWithRSA, validateAndDetectRSAPublicKey } from './rsa.js';
 import { createConnProxy } from '../../sync/sync-adapter.js';
+import { getMonotonicSqliteNow, getMonotonicSqliteAfter } from '../../utils/monotonic-clock.js';
 
 const DEFAULT_EXPORT_TTL_SECONDS = 86400; // 24 小时
 
@@ -215,8 +216,8 @@ export class KeyExporter {
         // 写入导出会话（同一事务内）
         conn.query(
           `INSERT INTO export_sessions (session_id, user_id, export_info, key_type, expires_at, _hlc)
-           VALUES (?, ?, ?, ?, datetime('now', '+' || ? || ' seconds'), ?)`,
-          [sessionId, userId, exportInfoJson, keyType, ttl, ts]
+           VALUES (?, ?, ?, ?, ?, ?)`,
+          [sessionId, userId, exportInfoJson, keyType, getMonotonicSqliteAfter(ttl), ts]
         );
 
         console.log(`[KeyExporter] initiateExport: success (RSA), sessionId=${sessionId}, keyType=${keyType}, ttl=${ttl}s, totalKeyCount=${totalKeyCount}`);
@@ -230,8 +231,8 @@ export class KeyExporter {
         // 写入导出会话（同一事务内）
         conn.query(
           `INSERT INTO export_sessions (session_id, user_id, export_info, key_type, expires_at, _hlc)
-           VALUES (?, ?, ?, ?, datetime('now', '+' || ? || ' seconds'), ?)`,
-          [sessionId, userId, exportInfoJson, keyType, ttl, ts]
+           VALUES (?, ?, ?, ?, ?, ?)`,
+          [sessionId, userId, exportInfoJson, keyType, getMonotonicSqliteAfter(ttl), ts]
         );
 
         console.log(`[KeyExporter] initiateExport: success (ECDH), sessionId=${sessionId}, keyType=${keyType}, ttl=${ttl}s, totalKeyCount=${totalKeyCount}`);
@@ -264,8 +265,8 @@ export class KeyExporter {
 
     // 1. 查找有效的导出会话（未过期）
     const rows = await this._db.readQuery(
-      `SELECT session_id, user_id, export_info FROM export_sessions WHERE session_id = ? AND expires_at > datetime('now')`,
-      [sessionId]
+      `SELECT session_id, user_id, export_info FROM export_sessions WHERE session_id = ? AND expires_at > ?`,
+      [sessionId, getMonotonicSqliteNow()]
     );
 
     if (rows.length === 0) {
@@ -398,8 +399,8 @@ export class KeyExporter {
    */
   async findExportSession(sessionId) {
     const rows = await this._db.readQuery(
-      `SELECT session_id, user_id, export_info, key_type, created_at, expires_at FROM export_sessions WHERE session_id = ? AND expires_at > datetime('now')`,
-      [sessionId]
+      `SELECT session_id, user_id, export_info, key_type, created_at, expires_at FROM export_sessions WHERE session_id = ? AND expires_at > ?`,
+      [sessionId, getMonotonicSqliteNow()]
     );
     if (rows.length === 0) return null;
     const row = rows[0];
