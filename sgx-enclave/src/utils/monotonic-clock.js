@@ -34,9 +34,34 @@ function _monotonicMs() {
     return _anchorMs + elapsedMs;
 }
 
+const NTP_EPOCH_OFFSET_MS = 2208988800000;
+
 /**
- * 向单个 NTP 服务器发送查询，返回该服务器报告的绝对时间戳（毫秒）。
- * 超时或出错时返回 null。
+ * 把 NTP 时间戳（秒 + 分数）转换为 Unix 毫秒。
+ * @param {Buffer} buf - 包含 8 字节 NTP 时间戳的 Buffer
+ * @param {number} offset - 时间戳起始字节偏移
+ * @returns {number} Unix 毫秒
+ */
+function _ntpTimestampToMs(buf, offset) {
+    const seconds = buf.readUInt32BE(offset);
+    const fraction = buf.readUInt32BE(offset + 4);
+    // 分数部分为 32 位无符号整数，表示 1/2^32 秒
+    const ms = Math.floor(fraction / 4294967296 * 1000);
+    return seconds * 1000 + ms - NTP_EPOCH_OFFSET_MS;
+}
+
+/**
+ * 向单个 NTP 服务器发送完整 SNTP 查询，返回根据 NTP 算法校正后的绝对时间戳（毫秒）。
+ * 实现 RFC 4330 简化 SNTP 客户端：
+ *   - t0 = 客户端发送时间（Unix 毫秒）
+ *   - t1 = 服务器接收时间（来自 NTP bytes 32-39）
+ *   - t2 = 服务器发送时间（来自 NTP bytes 40-47）
+ *   - t3 = 客户端接收时间（Unix 毫秒）
+ *   偏移量 offset = ((t1 - t0) + (t2 - t3)) / 2
+ *   返回 estimatedMs = t3 + offset
+ *
+ * 超时、出错、或服务器返回异常（stratum=0 / mode!=4）时返回 null。
+ *
  * @param {string} host - NTP 服务器主机名
  * @param {number} [port=123] - NTP 端口
  * @param {number} [timeoutMs=5000] - 超时毫秒
@@ -45,8 +70,10 @@ function _monotonicMs() {
 function _queryNtpServer(host, port = 123, timeoutMs = 5000) {
     return new Promise((resolve) => {
         const socket = dgram.createSocket('udp4');
+        // NTP 请求包：48 字节，LI=0, VN=4, Mode=3 (client)
         const ntpData = Buffer.alloc(48);
-        ntpData[0] = 0x1B; // LI=0, VN=3, Mode=3 (client)
+        ntpData[0] = 0x23; // 00 100 011
+        // 其余字节保持为 0 即可
 
         let settled = false;
         const timer = setTimeout(() => {
@@ -66,19 +93,49 @@ function _queryNtpServer(host, port = 123, timeoutMs = 5000) {
             }
         });
 
+        // 记录客户端发送时间 t0：使用单调时钟的 Unix 毫秒值，避免在协议外再次读取系统时间
+        const t0Ms = _monotonicMs();
+
         socket.on('message', (msg) => {
             if (settled) return;
+            if (msg.length < 48) return;
+
+            const t3Ms = _monotonicMs();
+
+            const firstByte = msg[0];
+            const li = (firstByte >> 6) & 0x03;
+            const vn = (firstByte >> 3) & 0x07;
+            const mode = firstByte & 0x07;
+            const stratum = msg[1];
+            const poll = msg[2];
+            const precision = msg[3];
+
+            // 验证：必须是服务器响应（mode=4），stratum 不为 0（0 为 Kiss-o'-Death 或异常）
+            if (mode !== 4 || stratum === 0) {
+                if (!settled) {
+                    settled = true;
+                    clearTimeout(timer);
+                    socket.close();
+                    resolve(null);
+                }
+                return;
+            }
+
+            // 解析时间戳
+            const t1Ms = _ntpTimestampToMs(msg, 32); // Receive Timestamp
+            const t2Ms = _ntpTimestampToMs(msg, 40); // Transmit Timestamp
+
+            // 计算往返延迟和本地时钟偏移
+            const roundTripDelay = (t3Ms - t0Ms) - (t2Ms - t1Ms);
+            const localClockOffset = ((t1Ms - t0Ms) + (t2Ms - t3Ms)) / 2;
+            const estimatedMs = t3Ms + localClockOffset;
+
+            console.log(`[NTP] ${host}: li=${li}, vn=${vn}, stratum=${stratum}, poll=${poll}, precision=${precision}, delay=${roundTripDelay.toFixed(2)}ms, offset=${localClockOffset.toFixed(2)}ms, estimated=${estimatedMs}`);
+
             settled = true;
             clearTimeout(timer);
             socket.close();
-
-            // NTP 时间戳从 1900-01-01 起算，秒数在第 40-43 字节（大端），小数在第 44-47 字节
-            const secondsSince1900 = msg.readUInt32BE(40);
-            const fraction = msg.readUInt32BE(44);
-            const msSince1900 = secondsSince1900 * 1000 + Math.floor(fraction / 4294967296 * 1000);
-            // Unix 纪元与 NTP 纪元相差 2208988800 秒
-            const unixMs = msSince1900 - 2208988800000;
-            resolve(unixMs);
+            resolve(estimatedMs);
         });
 
         socket.send(ntpData, port, host, (err) => {

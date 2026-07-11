@@ -107,14 +107,16 @@ async function main() {
   const exportTtlSeconds = sessionConfig.exportTtlSeconds || 86400;
 
   // 3.1 NTP 时间源校正：如果合约配置了 security.ntpServers，用 NTP 校正单调时钟锚点
-  //     确保所有节点的时间基准一致，消除宿主机时钟偏差
+  //     确保所有节点的时间基准一致，消除宿主机时钟偏差。
+  //     若合约明确配置了 NTP 服务器但全部校准失败，则直接报错退出，避免在不可信时间基准下运行。
   const ntpServers = runtimeParams.security?.ntpServers;
   if (Array.isArray(ntpServers) && ntpServers.length > 0) {
     console.log(`[SGX Enclave] NTP calibration: servers=${ntpServers.join(', ')}`);
     const calibrated = await calibrateFromNtp(ntpServers);
     if (!calibrated) {
-      console.warn('[SGX Enclave] NTP calibration failed at startup, using local clock as anchor');
+      throw new Error(`[SGX Enclave] NTP calibration failed for all configured servers (${ntpServers.join(', ')}). Refusing to start with untrusted local clock.`);
     }
+    console.log('[SGX Enclave] NTP calibration succeeded');
   } else {
     console.log('[SGX Enclave] No NTP servers configured, using local clock as monotonic anchor');
   }
@@ -384,7 +386,11 @@ async function main() {
           latestNtp.some((s, i) => s !== lastNtp[i]);
         if (changed) {
           console.log('[SGX Enclave] NTP servers changed in contract, re-calibrating...');
-          await calibrateFromNtp(latestNtp);
+          const ok = await calibrateFromNtp(latestNtp);
+          if (!ok) {
+            console.error(`[SGX Enclave] NTP re-calibration failed for all configured servers (${latestNtp.join(', ')}). Stopping enclave.`);
+            process.exit(1);
+          }
         }
       }
     } catch (err) {

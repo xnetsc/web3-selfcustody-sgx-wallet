@@ -425,8 +425,14 @@ export class ContractClient {
         latestNtp.some((s, i) => s !== lastNtp[i]);
       if (changed) {
         console.log('[ContractClient] NTP servers changed, re-calibrating monotonic clock...');
-        calibrateFromNtp(latestNtp).catch((err) => {
-          console.warn('[ContractClient] NTP re-calibration failed:', err.message);
+        calibrateFromNtp(latestNtp).then((ok) => {
+          if (!ok) {
+            console.error(`[ContractClient] NTP re-calibration failed for all configured servers (${latestNtp.join(', ')}). Stopping enclave.`);
+            process.exit(1);
+          }
+        }).catch((err) => {
+          console.error('[ContractClient] NTP re-calibration failed:', err.message);
+          process.exit(1);
         });
       }
     }
