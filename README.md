@@ -40,7 +40,7 @@ sgx-wallet/
 | `auth-engine/` | 14-point authorization checklist with cryptographic proof verification |
 | `signing/` | Raw transaction signing; supports Ethereum, BSC, Polygon, and other EVM chains |
 | `key-management/` | ECDH-secured two-step key import and export flows |
-| `sync/` | P2P WebSocket synchronization using Raft-style leader election and Hybrid Logical Clocks |
+| `sync/` | P2P WebSocket synchronization using Raft-style leader election, Hybrid Logical Clocks, and automatic P2P node discovery |
 
 ## Prerequisites
 

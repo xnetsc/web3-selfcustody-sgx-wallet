@@ -39,6 +39,7 @@ const PROXY_WAIT_MS = 6000;
 const PROXY_TIMEOUT_MS = 10000;
 const PREPARE_TIMEOUT_MS = 5000;
 const FOLLOWER_TXN_TIMEOUT_MS = 15000;
+const PEERS_BROADCAST_INTERVAL_MS = 60000; // 每 60 秒广播一次已知节点列表
 
 // ========== 工具函数 ==========
 
@@ -120,6 +121,10 @@ export class SyncManager {
         this._pinCheckedPeers = new Set();
         // 等待对端 pin-check 的 Promise resolve 队列
         this._pinCheckWaiters = new Map(); // peerId → { resolve, reject }
+
+        // P2P 节点发现：已知节点列表（配置 + 动态发现）
+        this._knownPeers = new Set(this.peerUrls); // 存储所有已知的节点 URL
+        this._peersBroadcastTimer = null; // 定时广播节点列表
 
         const defaultMinQuorum = (this.peerUrls.length > 0) ? 2 : 1;
         this._getMinQuorum = typeof options.getMinQuorum === 'function'
@@ -218,6 +223,7 @@ export class SyncManager {
         }
 
         this._reconnectTimer = setInterval(() => this._reconnectPending(), RECONNECT_CHECK_MS);
+        this._peersBroadcastTimer = setInterval(() => this._broadcastPeers(), PEERS_BROADCAST_INTERVAL_MS);
 
         console.log('[SyncManager] Started — listening on port ' + this.listenPort +
             ', peers: ' + this.peerUrls.length + ', shards: ' + this._numShards);
@@ -229,6 +235,7 @@ export class SyncManager {
         this.engine.stop();
 
         if (this._reconnectTimer) { clearInterval(this._reconnectTimer); this._reconnectTimer = null; }
+        if (this._peersBroadcastTimer) { clearInterval(this._peersBroadcastTimer); this._peersBroadcastTimer = null; }
 
         for (const [, ws] of this._peerWsMap) {
             try { ws.close(); } catch (_) {}
@@ -549,7 +556,13 @@ export class SyncManager {
         } catch (_) {
             return false; // 不是 JSON，交给 SyncEngine
         }
-        if (!msg || (msg.type !== 'pin-check' && msg.type !== 'pin-check-ack')) return false;
+        if (!msg || (msg.type !== 'pin-check' && msg.type !== 'pin-check-ack' && msg.type !== 'peers-list')) return false;
+
+        // peers-list: 对端发来了它知道的节点列表
+        if (msg.type === 'peers-list') {
+            this._handlePeersList(peerId, ws, msg.peers);
+            return true;
+        }
 
         // pin-check-ack: 对端告知验证结果
         if (msg.type === 'pin-check-ack') {
@@ -773,6 +786,94 @@ export class SyncManager {
             if (this._localAddresses.has(normalized)) return true;
         } catch (_) {}
         return false;
+    }
+
+    // ========== P2P 节点发现 ==========
+
+    /**
+     * 向已通过 pin-check 的 peers 广播已知节点列表
+     */
+    _broadcastPeers() {
+        // 只广播给已通过 pin-check 的 peers
+        const trustedPeers = [];
+        for (const peerId of this._pinCheckedPeers) {
+            const ws = this._peerWsMap.get(peerId);
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                trustedPeers.push(peerId);
+            }
+        }
+
+        if (trustedPeers.length === 0 || this._knownPeers.size === 0) {
+            return;
+        }
+
+        const peersList = Array.from(this._knownPeers);
+        const msg = JSON.stringify({ type: 'peers-list', peers: peersList });
+        for (const peerId of trustedPeers) {
+            const ws = this._peerWsMap.get(peerId);
+            try {
+                ws.send(msg);
+            } catch (err) {
+                console.error('[SyncManager] Failed to broadcast peers-list to ' + peerId + ':', err.message);
+            }
+        }
+        console.log('[SyncManager] Broadcasted peers-list to ' + trustedPeers.length + ' trusted peers, ' + peersList.length + ' nodes');
+    }
+
+    /**
+     * 处理收到的 peers-list 消息
+     * 只接受已通过 pin-check 的 peers 的节点信息
+     */
+    _handlePeersList(peerId, ws, peers) {
+        // 安全检查：只接受已通过 pin-check 的 peers 的节点信息
+        if (!this._pinCheckedPeers.has(peerId)) {
+            console.warn('[SyncManager] Ignored peers-list from unverified peer: ' + peerId);
+            return;
+        }
+
+        if (!Array.isArray(peers)) {
+            console.warn('[SyncManager] Invalid peers-list format from ' + peerId);
+            return;
+        }
+
+        let newPeersCount = 0;
+        for (const peerUrl of peers) {
+            if (typeof peerUrl !== 'string') continue;
+            // 跳过自己
+            if (this._isSelf(peerUrl)) continue;
+            // 跳过已知的节点
+            if (this._knownPeers.has(peerUrl)) continue;
+            // 跳过配置中的节点（已经尝试连接）
+            if (this.peerUrls.includes(peerUrl)) continue;
+
+            this._knownPeers.add(peerUrl);
+            newPeersCount++;
+            console.log('[SyncManager] Discovered new peer via P2P: ' + peerUrl);
+        }
+
+        if (newPeersCount > 0) {
+            console.log('[SyncManager] Added ' + newPeersCount + ' new peers from ' + peerId + ', total known: ' + this._knownPeers.size);
+            // 尝试连接新发现的节点
+            this._tryConnectToNewPeers();
+        }
+    }
+
+    /**
+     * 尝试连接新发现的节点（去重 + 跳过自己）
+     */
+    _tryConnectToNewPeers() {
+        for (const peerUrl of this._knownPeers) {
+            // 跳过配置中的节点（由 _reconnectPending 处理）
+            if (this.peerUrls.includes(peerUrl)) continue;
+            // 跳过已连接的节点
+            if (this._peerWsMap.has(peerUrl)) continue;
+            // 跳过自己
+            if (this._isSelf(peerUrl)) continue;
+            // 跳过已在 pending 队列的节点
+            if (this.pendingConnections.has(peerUrl)) continue;
+
+            this._connectToPeer(peerUrl);
+        }
     }
 
     // ========== HTTP 回环（Leader 执行代理请求）==========
