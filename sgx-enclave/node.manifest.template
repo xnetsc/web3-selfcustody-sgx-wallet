@@ -155,6 +155,7 @@ sgx.trusted_files = [
   "file:/app/sgx-enclave/src/",
   "file:/app/sgx-enclave/config/",
   "file:/app/sgx-enclave/package.json",
+  "file:/app/sgx-enclave/package-lock.json",
 
   # SGX-enclave Node.js modules (includes @xnetx/sgx-ra-tls-verify, better-sqlite3, ethers, ws, etc.)
   "file:/app/sgx-enclave/node_modules/",
@@ -175,6 +176,9 @@ sgx.trusted_files = [
 sgx.allowed_files = [
   # RA-TLS certificate (public, written by Node.js cert generator at startup)
   "file:/app/sgx-enclave/ratls-cert.pem",
+
+  # Gramine manifest (generated at build time, readable for code integrity verification)
+  "file:/app/sgx-enclave/node.manifest",
 
   # NOTE: wallet/ directory is NOT in allowed_files.
   # It uses encrypted mount (see fs.mounts above) and files are written

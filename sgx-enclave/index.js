@@ -62,6 +62,7 @@ import {
 
 import { createApp, startServer } from './src/server.js';
 import { getMonotonicNow, calibrateFromNtp, getLastNtpServers, getMonotonicSystemDriftMs } from './src/utils/monotonic-clock.js';
+import { verifyCodeIntegrity } from './src/utils/code-integrity.js';
 
 async function main() {
   console.log('[SGX Enclave] Starting...');
@@ -85,6 +86,29 @@ async function main() {
   const contractClient = createContractClientFromEnv(pinStore);
   await contractClient.initialize();
   console.log(`[SGX Enclave] Config client initialized (contractAvailable=${contractClient.isContractAvailable()})`);
+
+  // 3.0 代码完整性验证：如果合约配置了 codeRepository，验证本地 enclave 代码与远程仓库一致
+  //     - codeRepository 为空：跳过验证
+  //     - 访问仓库失败或哈希不一致：立即退出，拒绝在不可信代码下运行
+  const codeRepository = contractClient.getCodeRepository();
+  if (codeRepository && codeRepository.trim()) {
+    console.log(`[SGX Enclave] Code integrity: verifying against repository ${codeRepository}`);
+    try {
+      const result = await verifyCodeIntegrity(codeRepository);
+      if (!result.verified) {
+        console.error(`[SGX Enclave] Code integrity verification FAILED: ${result.details}`);
+        console.error(`[SGX Enclave] Refusing to start — local code does not match published repository.`);
+        process.exit(1);
+      }
+      console.log(`[SGX Enclave] Code integrity verification PASSED: ${result.details}`);
+    } catch (err) {
+      console.error(`[SGX Enclave] Code integrity verification ERROR: ${err.message}`);
+      console.error(`[SGX Enclave] Refusing to start — cannot verify code against repository.`);
+      process.exit(1);
+    }
+  } else {
+    console.log('[SGX Enclave] Code integrity: no codeRepository configured, skipping verification');
+  }
 
   // 同步节点配置（可选，不设置则单节点运行）
   const syncNodesStr = process.env.SYNC_NODES || '';
