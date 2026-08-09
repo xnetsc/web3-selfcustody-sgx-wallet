@@ -301,24 +301,6 @@ The enclave verifies at startup that its running code matches the published sour
 | `codeRepository` configured but repository unreachable | **Fatal**: enclave exits with code `1`. |
 | `codeRepository` configured, archive downloaded, but file missing or hash mismatch | **Fatal**: enclave exits with code `1`. |
 
-**How it works**:
-
-1. The Gramine manifest (`node.manifest`, generated at build time) lists all `sgx.trusted_files` — files whose integrity is enforced by Gramine's signature mechanism. Tampering with any trusted file changes MRENCLAVE, causing RA-TLS attestation to fail.
-2. At startup, the enclave reads `node.manifest` (placed in `sgx.allowed_files`), parses `sgx.trusted_files`, and filters to application code files (excluding system libraries and `node_modules`).
-3. For each local file, it computes SHA256.
-4. It downloads the repository archive (`.tar.gz`) in a single request — either from GitHub (`codeload.github.com`) or from a direct archive URL (any `.tar.gz` endpoint, including self-hosted).
-5. The archive is decompressed and parsed in memory; each file's SHA256 is computed.
-6. File lists are compared (every local file must exist in the archive), then SHA256 hashes are compared one by one.
-7. `package-lock.json` is mandatory — it must be present in both the enclave's trusted files and the repository archive, ensuring dependency versions are publicly traceable.
-
-**`codeRepository` URL formats**:
-
-- `https://github.com/owner/repo` — GitHub repository (default branch resolved via API, archive via codeload CDN)
-- `https://github.com/owner/repo/tree/branch` — GitHub repository, specific branch
-- `https://example.com/path/to/archive.tar.gz` — Direct archive URL (self-hosted or any HTTP endpoint serving a `.tar.gz`)
-
-**Trust chain**: Local files are trusted because Gramine signs their hashes at build time (`gramine-sgx-sign`). The remote repository serves as the public disclosure baseline. If they match, the enclave is running exactly the published code.
-
 ## License
 
 xWallet Source Available License 1.0 — see [LICENSE](LICENSE) and [LICENSING.md](LICENSING.md).
