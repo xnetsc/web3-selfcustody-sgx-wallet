@@ -319,16 +319,6 @@ The enclave verifies at startup that its running code matches the published sour
 
 **Trust chain**: Local files are trusted because Gramine signs their hashes at build time (`gramine-sgx-sign`). The remote repository serves as the public disclosure baseline. If they match, the enclave is running exactly the published code.
 
-## Documentation
-
-Detailed design documents are in the docs/ directory:
-
-- docs/master-rules.md — Project governance, architecture, and data models
-- docs/eoa-wallet-solution.md — Full wallet design for mobile clients
-- docs/sgx-enclave-api.md — HTTP API reference
-- docs/authorization-json-guide.md — Authorization JSON structure reference
-- docs/security-risks.md — Security threat analysis
-
 ## License
 
 xWallet Source Available License 1.0 — see [LICENSE](LICENSE) and [LICENSING.md](LICENSING.md).
