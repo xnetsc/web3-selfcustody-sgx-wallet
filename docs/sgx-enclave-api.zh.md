@@ -1,10 +1,5 @@
 # SGX Enclave HTTP API 文档
 
-> [English version](sgx-enclave-api.md)
-
-> **版本**: 3.6
-> **最后更新**: 2026-04-08
-> **适用范围**: 中心化服务器后端通过 HTTP 请求对接 SGX Enclave 服务
 
 ---
 
