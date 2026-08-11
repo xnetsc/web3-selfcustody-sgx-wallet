@@ -1,11 +1,5 @@
 # SGX Enclave HTTP API Documentation
 
-> [中文版本](sgx-enclave-api.zh.md)
-
-> **Version**: 3.6
-> **Last Updated**: 2026-04-08
-> **Scope**: Centralized server backends integrate with the SGX Enclave service via HTTP requests
-
 ---
 
 ## Overview
