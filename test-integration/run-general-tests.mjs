@@ -2996,7 +2996,7 @@ async function testPasskeyRecovery() {
   assert(setupRegRes.status === 200, 'recovery/setup: register old passkey OK');
   console.log(`  [info] Recovery user created: ${recoveryUserId}, credentialId=${oldCredId}`);
 
-  // Create a wallet for this user (so recovery triggers freeze)
+  // Create a wallet for this user (recovery is exercised on a wallet-bearing account)
   // Need to track signCount for the old key separately
   let oldSignCount = 0;
   function makeOldWebAuthnSignature(challenge) {
@@ -3080,13 +3080,15 @@ async function testPasskeyRecovery() {
     console.log(`  [info] No contract entry → status=${noEntryRes.status}`);
   }
 
-  // ---- Test 2: Recovery with wrong oldPubKeyHash → rejected ----
-  console.log('\n  [Recovery] Test 2: Wrong oldPubKeyHash → rejected');
+  // ---- Test 2: Owner entry force-replaces (oldPubKeyHash is not consulted) ----
+  console.log('\n  [Recovery] Test 2: Owner entry with wrong oldPubKeyHash → force replacement succeeds');
 
-  // Set a recovery entry with a WRONG oldPubKeyHash
+  // Set a recovery entry with a WRONG oldPubKeyHash. Owner recovery trusts the
+  // entry's existence only: the old hash is audit metadata and must not block
+  // the replacement.
   const wrongOldHash = '0x' + crypto.randomBytes(32).toString('hex');
   const txWrong = await contract.setPasskeyRecovery(
-    recoveryUserId, newPubKeyHash, wrongOldHash, 'wrong-uuid-001', 'test wrong hash',
+    recoveryUserId, newPubKeyHash, wrongOldHash, 'force-uuid-001', 'test force replacement',
     { nonce: getOwnerNonce() }
   );
   await txWrong.wait();
@@ -3102,32 +3104,40 @@ async function testPasskeyRecovery() {
     const wrongRes = await httpPost('/api/passkey/register/complete', await buildRequest({
       userId: recoveryUserId, attestationResponse: attestation,
     }));
-    assert(wrongRes.status !== 200, 'recovery/wrongHash: rejected with wrong oldPubKeyHash');
-    console.log(`  [info] Wrong oldPubKeyHash → status=${wrongRes.status}`);
+    assert(wrongRes.status === 200, 'recovery/force: returns 200 despite wrong oldPubKeyHash');
+    const wrongParsed = parseAttestationResponse(wrongRes);
+    assert(wrongParsed?.data?.recovery === true, 'recovery/force: recovery=true');
+    assert(wrongParsed?.data?.recoveryUuid === 'force-uuid-001', 'recovery/force: recoveryUuid matches');
+    assert(wrongParsed?.data?.stateNormalized === true, 'recovery/force: stateNormalized=true');
+    assert(!wrongParsed?.data?.frozen, 'recovery/force: NOT frozen after owner recovery');
+    console.log(`  [info] Force replacement → recovery=${wrongParsed?.data?.recovery}, stateNormalized=${wrongParsed?.data?.stateNormalized}`);
   }
 
-  // Clean up wrong entry
+  // Clean up the entry
   await (await contract.removePasskeyRecovery(recoveryUserId, newPubKeyHash, { nonce: getOwnerNonce() })).wait();
 
-  // ---- Test 3: Recovery with correct entry → success ----
-  console.log('\n  [Recovery] Test 3: Correct recovery entry → success with freeze');
+  // ---- Test 3: Same key re-applied while account is normal → rejected ----
+  console.log('\n  [Recovery] Test 3: Same-key recovery re-applied → rejected');
 
+  // After Test 2 the account's only passkey IS this entry's key and the account
+  // is not frozen, so resetting with the same key again is a no-op repeat and
+  // must be rejected — no matter how much time passes.
   const recoveryUuid = `recovery-${crypto.randomBytes(6).toString('hex')}`;
   const txCorrect = await contract.setPasskeyRecovery(
-    recoveryUserId, newPubKeyHash, oldPubKeyHash, recoveryUuid, 'test correct recovery',
+    recoveryUserId, newPubKeyHash, oldPubKeyHash, recoveryUuid, 'test same-key repeat',
     { nonce: getOwnerNonce() }
   );
   await txCorrect.wait();
 
   // Verify entry exists on contract
   const exists = await contract.passkeyRecoveryExists(recoveryUserId, newPubKeyHash);
-  assert(exists === true, 'recovery/correct: contract entry exists');
+  assert(exists === true, 'recovery/sameKey: contract entry exists');
 
   const correctChRes = await httpPost('/api/challenge', await buildRequest({
     purpose: 'register', userId: recoveryUserId,
   }));
   const correctChParsed = parseAttestationResponse(correctChRes);
-  assert(correctChParsed?.data?.challenge, 'recovery/correct: got challenge');
+  assert(correctChParsed?.data?.challenge, 'recovery/sameKey: got challenge');
 
   if (correctChParsed?.data?.challenge) {
     const attestation = makeWebAuthnRegistrationResponse(correctChParsed.data.challenge, {
@@ -3136,24 +3146,13 @@ async function testPasskeyRecovery() {
     const correctRes = await httpPost('/api/passkey/register/complete', await buildRequest({
       userId: recoveryUserId, attestationResponse: attestation,
     }));
-    assert(correctRes.status === 200, 'recovery/correct: returns 200');
-    const correctParsed = parseAttestationResponse(correctRes);
-    assert(correctParsed?.data?.recovery === true, 'recovery/correct: recovery=true');
-    assert(correctParsed?.data?.recoveryUuid === recoveryUuid, 'recovery/correct: recoveryUuid matches');
-    assert(correctParsed?.data?.frozen === true, 'recovery/correct: frozen=true (account has wallets)');
-    assert(!!correctParsed?.data?.freezeUntil, 'recovery/correct: freezeUntil is set');
-    console.log(`  [info] Recovery success: recovery=${correctParsed?.data?.recovery}, uuid=${correctParsed?.data?.recoveryUuid}, frozen=${correctParsed?.data?.frozen}, freezeUntil=${correctParsed?.data?.freezeUntil}`);
+    assert(correctRes.status !== 200, 'recovery/sameKey: rejected (key already present, account normal)');
+    console.log(`  [info] Same-key repeat → status=${correctRes.status}`);
   }
 
-  // Wait for the 5s freeze to expire before testing replay
-  console.log('  [Recovery] Waiting 8s for freeze to expire (freezeDurationSeconds=5)...');
-  await new Promise(r => setTimeout(r, 8000));
+  // ---- Test 4: A different new key → recovery succeeds again ----
+  console.log('\n  [Recovery] Test 4: Recovery to a different new key → success');
 
-  // ---- Test 4: Replay recovery → rejected (old passkey already replaced) ----
-  console.log('\n  [Recovery] Test 4: Replay recovery → rejected');
-
-  // The old passkey has been replaced, so oldPubKeyHash no longer matches any existing passkey
-  // Need a NEW newPubKeyHash for a new recovery attempt (same newPubKeyHash challenge was consumed)
   const replayP256 = crypto.generateKeyPairSync('ec', { namedCurve: 'P-256' });
   const replayPubDer = replayP256.publicKey.export({ type: 'spki', format: 'der' });
   const replayUnc = replayPubDer.subarray(26);
@@ -3165,9 +3164,10 @@ async function testPasskeyRecovery() {
   ]));
   const replayNewPubKeyHash = '0x' + crypto.createHash('sha256').update(replayPublicKeyCose).digest('hex');
 
-  // Set a new recovery entry using the OLD oldPubKeyHash (which no longer matches any passkey)
+  // The entry's oldPubKeyHash points at the long-replaced setup passkey on
+  // purpose: it matches nothing current and must not matter.
   const txReplay = await contract.setPasskeyRecovery(
-    recoveryUserId, replayNewPubKeyHash, oldPubKeyHash, 'replay-uuid', 'test replay',
+    recoveryUserId, replayNewPubKeyHash, oldPubKeyHash, 'second-uuid', 'test second recovery',
     { nonce: getOwnerNonce() }
   );
   await txReplay.wait();
@@ -3183,9 +3183,35 @@ async function testPasskeyRecovery() {
     const replayRes = await httpPost('/api/passkey/register/complete', await buildRequest({
       userId: recoveryUserId, attestationResponse: attestation,
     }));
-    // Should fail because oldPubKeyHash doesn't match any current passkey (it was replaced)
-    assert(replayRes.status !== 200, 'recovery/replay: rejected (old passkey already replaced)');
-    console.log(`  [info] Replay recovery → status=${replayRes.status}`);
+    assert(replayRes.status === 200, 'recovery/second: returns 200 for a different new key');
+    const replayParsed = parseAttestationResponse(replayRes);
+    assert(replayParsed?.data?.recovery === true, 'recovery/second: recovery=true');
+    assert(replayParsed?.data?.stateNormalized === true, 'recovery/second: stateNormalized=true');
+    console.log(`  [info] Second recovery → recovery=${replayParsed?.data?.recovery}`);
+  }
+
+  // ---- Test 5: Previous key has left the account → its entry works again ----
+  console.log('\n  [Recovery] Test 5: Key no longer in account → same entry succeeds again');
+
+  // Test 4's replacement wiped the Test 2/3 key from the account, so the entry
+  // still on chain for it (from Test 3) no longer matches the account state:
+  // resetting with that key is a real change again, not a repeat.
+  const backChRes = await httpPost('/api/challenge', await buildRequest({
+    purpose: 'register', userId: recoveryUserId,
+  }));
+  const backChParsed = parseAttestationResponse(backChRes);
+  if (backChParsed?.data?.challenge) {
+    const attestation = makeWebAuthnRegistrationResponse(backChParsed.data.challenge, {
+      credentialId: newCredIdBuf, publicKeyX: newPkX, publicKeyY: newPkY,
+    });
+    const backRes = await httpPost('/api/passkey/register/complete', await buildRequest({
+      userId: recoveryUserId, attestationResponse: attestation,
+    }));
+    assert(backRes.status === 200, 'recovery/back: returns 200 (key had left the account)');
+    const backParsed = parseAttestationResponse(backRes);
+    assert(backParsed?.data?.recovery === true, 'recovery/back: recovery=true');
+    assert(backParsed?.data?.recoveryUuid === recoveryUuid, 'recovery/back: recoveryUuid matches Test 3 entry');
+    console.log(`  [info] Reset back to previous key → recovery=${backParsed?.data?.recovery}`);
   }
 
   console.log(`  [info] Passkey recovery tests completed`);
