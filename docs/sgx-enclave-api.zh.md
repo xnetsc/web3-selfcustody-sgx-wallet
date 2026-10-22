@@ -255,9 +255,10 @@ Passkey 注册流程第二步。提交 WebAuthn 注册仪式完成后的响应�
 - **场景C（Passkey 恢复，purpose=register）**：用户丢失所有 Passkey，Owner 通过合约授权恢复
   - `userId` 必须提供，**不提供** `existingWebauthnSignature`
   - 前置条件：Owner 已在合约中调用 `setPasskeyRecovery(userId, newPubKeyHash, oldPubKeyHash, uuid, memo)`
-  - SGX 查询合约匹配 `(userId, SHA256(newPublicKeyCose))`，验证 `oldPubKeyHash` 匹配现有 Passkey
-  - 保留匹配的旧 Passkey 记录，删除其余 Passkey，用新 Passkey 替换保留记录
-  - 自动触发账户冻结（72h），响应包含 `recovery=true` 和 `recoveryUuid`
+  - 用户信任 Owner 模型：SGX 查询合约匹配到 `(userId, SHA256(newPublicKeyCose))` 的条目即执行，不验证 `oldPubKeyHash` 是否匹配现有 Passkey（该字段仅作审计信息）
+  - 暴力替换：删除该账户全部 Passkey，只保留新 Passkey 一把；优先于冻结替换等一切其他场景，与账户此前状态（有无 Passkey、是否冻结）无关
+  - 替换后清除冻结记录，账户回到无冻结的正常状态（不触发新冻结），响应包含 `recovery=true`、`recoveryUuid` 和 `stateNormalized=true`
+  - 同一把钥匙不可重复重置：条目指定钥匙已在账户内且账户未冻结时，再次以该钥匙执行恢复直接报错（不论账户现有几把 Passkey、间隔多久）；该钥匙已不在账户内、或账户又被冻结时，状态已不一致，允许再次执行
   - ⚠️ 合约不可用时此功能不可用
 >
 > **安全增强**：为防止攻击者利用此后门冒充绑定 Passkey 盗取资产，当已有账户（有钱包）通过场景A补绑 Passkey 时，系统自动冻结账户（默认 72 小时，可配置）。详见附录 E。
@@ -304,7 +305,8 @@ Passkey 注册流程第二步。提交 WebAuthn 注册仪式完成后的响应�
 | `isFirstPasskey` | boolean | 该 userId 下此前无 Passkey 时为 `true`（包括全新用户和已有账户但尚无 Passkey 的用户） |
 | `recovery` | boolean | 可选。若为 `true`，表示本次注册是合约授权的 Passkey 恢复（场景C） |
 | `recoveryUuid` | string | 可选。恢复条目的唯一标识符，仅在 `recovery=true` 时返回 |
-| `frozen` | boolean | 可选。若为 `true`，表示账户已被冻结（场景A补绑有钱包、场景C恢复时触发） |
+| `frozen` | boolean | 可选。若为 `true`，表示账户已被冻结（场景A补绑有钱包时触发；场景C恢复不触发冻结） |
+| `stateNormalized` | boolean | 可选。若为 `true`，表示本次为场景C恢复，账户状态已归一化（仅保留新 Passkey、冻结已清除） |
 | `freezeUntil` | string | 可选。冻结截止时间（ISO 8601 格式），仅在 `frozen=true` 时返回 |
 
 ---
@@ -1218,7 +1220,7 @@ webauthnSignature = Passkey.sign(intentHash)
 
 ### 冻结账户的 Passkey 替换
 
-当账户处于冻结状态时，允许通过 `purpose=register` 重新注册 Passkey。此机制为真正的账户所有人提供了争议缓冲期：
+当账户处于冻结状态时，允许通过 `purpose=register` 重新注册 Passkey。此机制为真正的账户所有人提供了争议缓冲期（例外：若新 Passkey 匹配到 Owner 在合约中登记的恢复条目，则按场景C处理——暴力替换并清除冻结，账户直接回到正常状态，不走本节的续冻逻辑）：
 
 **替换流程**：
 1. 调用 `/api/challenge`（`purpose=register`）获取挑战值（冻结账户允许此 purpose）

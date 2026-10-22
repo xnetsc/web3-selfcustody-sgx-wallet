@@ -217,6 +217,31 @@ export class AccountFreezeManager {
   }
 
   /**
+   * 清除账户冻结记录（Owner 恢复专用）
+   * 无条件删除该 userId 的冻结记录，使账户回到无冻结的正常状态，
+   * 不受此前冻结状态（冻结期内 / 已到期未解除 / 已解除）影响。
+   *
+   * @param {string} userId - 用户 ID
+   * @returns {{ cleared: boolean, userId: string }}
+   */
+  clearFreeze(userId) {
+    if (!userId) throw new Error('userId is required');
+
+    const result = this._db.writeQuery(
+      `DELETE FROM account_freezes WHERE user_id = ?`,
+      [userId]
+    );
+
+    if (result.changes > 0) {
+      console.log(`[AccountFreeze] clearFreeze: userId=${userId} freeze record cleared (owner recovery)`);
+      return { cleared: true, userId };
+    }
+
+    console.log(`[AccountFreeze] clearFreeze: userId=${userId} no freeze record to clear`);
+    return { cleared: false, userId };
+  }
+
+  /**
    * 解除账户冻结
    *
    * @param {string} userId - 用户 ID

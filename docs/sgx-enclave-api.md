@@ -252,9 +252,10 @@ Three scenarios are supported:
 - **Scenario C (Passkey recovery, purpose=register)**: User lost all Passkeys; Owner authorizes recovery through the contract
   - `userId` must be provided, **without** `existingWebauthnSignature`
   - Precondition: Owner has called `setPasskeyRecovery(userId, newPubKeyHash, oldPubKeyHash, uuid, memo)` in the contract
-  - SGX queries the contract to match `(userId, SHA256(newPublicKeyCose))`, verifying `oldPubKeyHash` matches the existing Passkey
-  - Keeps the matched old Passkey record, deletes other Passkeys, and replaces the kept record with the new Passkey
-  - Automatically triggers account freeze (72h); response includes `recovery=true` and `recoveryUuid`
+  - Owner-trust model: once SGX finds a contract entry matching `(userId, SHA256(newPublicKeyCose))`, it executes unconditionally; `oldPubKeyHash` is not checked against existing Passkeys (audit information only)
+  - Force replacement: deletes all Passkeys of the account and keeps only the new one; takes precedence over every other scenario (including frozen-account replacement), regardless of the account's prior state
+  - After replacement the freeze record is cleared and the account returns to a normal, unfrozen state (no new freeze); response includes `recovery=true`, `recoveryUuid` and `stateNormalized=true`
+  - The same key cannot be used to reset twice: if the entry's key is already present in the account and the account is not frozen, running recovery with that key again errors out (regardless of how many Passkeys the account has or how much time has passed); if that key is no longer in the account, or the account is frozen again, the state no longer matches and recovery may run again
   - ⚠️ This feature is unavailable when the contract is unavailable
 
 > **Security enhancement**: To prevent attackers from exploiting this backdoor to impersonate a bound Passkey and steal assets, when an existing account (with wallets) binds a Passkey via Scenario A, the system automatically freezes the account (default 72 hours, configurable). See Appendix E.
@@ -301,7 +302,8 @@ Three scenarios are supported:
 | `isFirstPasskey` | boolean | `true` when there was no Passkey under this userId before (including brand-new users and existing accounts without a Passkey) |
 | `recovery` | boolean | Optional. `true` means this registration is a contract-authorized Passkey recovery (Scenario C) |
 | `recoveryUuid` | string | Optional. Unique identifier of the recovery entry, only returned when `recovery=true` |
-| `frozen` | boolean | Optional. `true` means the account has been frozen (Scenario A binding to an account with wallets, or Scenario C recovery) |
+| `frozen` | boolean | Optional. `true` means the account has been frozen (Scenario A binding to an account with wallets; Scenario C recovery does not freeze) |
+| `stateNormalized` | boolean | Optional. `true` means this registration was a Scenario C recovery and the account state was normalized (only the new Passkey remains, freeze cleared) |
 | `freezeUntil` | string | Optional. Freeze deadline (ISO 8601 format), only returned when `frozen=true` |
 
 ---
@@ -1206,7 +1208,7 @@ The freeze period (default 72 hours, configurable via contract or environment va
 
 ### Frozen Account Passkey Replacement
 
-When an account is in a frozen state, re-registering a Passkey via `purpose=register` is allowed. This mechanism provides a dispute buffer period for the true account owner:
+When an account is in a frozen state, re-registering a Passkey via `purpose=register` is allowed. This mechanism provides a dispute buffer period for the true account owner (exception: if the new Passkey matches an Owner recovery entry in the contract, Scenario C applies instead — force replacement with the freeze cleared and the account back to normal, without the re-freeze logic of this section):
 
 **Replacement Flow**:
 1. Call `/api/challenge` (`purpose=register`) to get a challenge (frozen accounts allow this purpose)

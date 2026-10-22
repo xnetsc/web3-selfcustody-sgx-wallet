@@ -159,9 +159,10 @@ export function createApp(handlers, accountFreezeManager, syncManager = null) {
   app.post('/api/challenge', wrap(req => handlers.challengeHandler.handleChallenge(req.body), accountFreezeManager, syncManager, req => req.path, { allowPurposeRegister: true }));
 
   // Passkey 注册
-  // 冻结账户可通过此接口重新注册 Passkey（替换旧的冻结 Passkey）
-  // 中间件自动检测：userId 冻结 + 有 attestationResponse + credentialId 与冻结记录不同 → 跳过冻结检查
-  app.post('/api/passkey/register/complete', wrap(req => handlers.registerHandler.handleComplete(req.body), accountFreezeManager, syncManager, req => req.path));
+  // 注册接口本身即争议/恢复处理入口，豁免包装层冻结检查：
+  // 冻结替换、场景A 首绑冻结、Owner 恢复的状态归一化全部由 handler 内部规则处理，
+  // 包装层不得以冻结为由拦截（否则 Owner 恢复在到期未解冻等状态下到不了 handler）
+  app.post('/api/passkey/register/complete', wrap(req => handlers.registerHandler.handleComplete(req.body), accountFreezeManager, syncManager, req => req.path, { exemptFromFreezeCheck: true }));
 
   // Passkey 删除
   app.post('/api/passkey/delete', wrap(req => handlers.walletCrudHandler.handleDeletePasskey(req.body), accountFreezeManager, syncManager, req => req.path));
@@ -231,6 +232,7 @@ export function createApp(handlers, accountFreezeManager, syncManager = null) {
  * @param {(req: express.Request) => string} getPath - 获取请求路径的函数
  * @param {Object} [options] - 冻结检查选项
  * @param {boolean} [options.allowPurposeRegister] - 若为 true，当 payload.purpose=register 时跳过冻结检查（用于 challenge 接口）
+ * @param {boolean} [options.exemptFromFreezeCheck] - 若为 true，整条路由跳过冻结检查（用于 Passkey 注册接口，冻结状态由 handler 内部处理）
  * @returns {express.RequestHandler}
  */
 function wrap(fn, accountFreezeManager, syncManager, getPath, options = {}) {
@@ -244,6 +246,11 @@ function wrap(fn, accountFreezeManager, syncManager, getPath, options = {}) {
 
           // 检查是否应跳过冻结检查
           let skipFreezeCheck = false;
+
+          // 0. 整条路由豁免（如 Passkey 注册接口：冻结状态由 handler 内部处理）
+          if (options.exemptFromFreezeCheck) {
+            skipFreezeCheck = true;
+          }
 
           // 1. challenge 接口：purpose=register 时跳过冻结检查
           if (options.allowPurposeRegister && payload.purpose === 'register') {

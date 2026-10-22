@@ -248,66 +248,66 @@ export class PasskeyManager {
   }
 
   /**
-   * 恢复替换（Owner 授权的 Passkey 找回流程）
-   * 1. 在 userId 下查找公钥哈希匹配 oldPubKeyHash 的 Passkey 记录
-   * 2. 删除该 userId 下所有其他 Passkey（仅保留匹配的那条，防止级联删除账户）
-   * 3. 用新 Passkey 信息原地替换保留的那条记录
+   * 恢复替换（Owner 授权的 Passkey 找回流程，用户信任 Owner 模型）
+   * 暴力替换，一切以 Owner 在合约中登记的条目为准，与账户此前状态无关：
+   * 1. 删除该 userId 下的全部 Passkey（不查 oldPubKeyHash 是否匹配现存记录）
+   * 2. 写入 Owner 指定的新 Passkey，使其成为该 userId 下唯一一把 Passkey
+   * 账户行不存在时一并创建。oldPubKeyHash 参数保留仅作审计/兼容，不再作为门槛。
    *
    * @param {string} userId - 用户 ID
-   * @param {string} oldPubKeyHash - 旧 Passkey 公钥的 SHA256 哈希（0x bytes32 hex）
+   * @param {string|null} oldPubKeyHash - 合约条目中的旧公钥哈希（可空，不参与判定）
    * @param {string} newCredentialId - 新 Passkey 凭证 ID
    * @param {Uint8Array|Buffer} newPublicKeyCose - 新 Passkey 的 COSE 格式公钥
    * @returns {Promise<{ success: boolean, replacedCredentialId: string|null, deletedCount: number }>}
    */
   async recoveryReplace(userId, oldPubKeyHash, newCredentialId, newPublicKeyCose) {
-    if (!userId || !oldPubKeyHash || !newCredentialId || !newPublicKeyCose) {
-      throw new Error('userId, oldPubKeyHash, newCredentialId and newPublicKeyCose are all required');
+    if (!userId || !newCredentialId || !newPublicKeyCose) {
+      throw new Error('userId, newCredentialId and newPublicKeyCose are all required');
     }
 
     const newPublicKeyCoseBuf = Buffer.isBuffer(newPublicKeyCose) ? newPublicKeyCose : Buffer.from(newPublicKeyCose);
 
-    // 1. 读取该用户所有 Passkey，找到匹配 oldPubKeyHash 的那条
-    const allPasskeys = await this._db.readQuery(
-      'SELECT credential_id, public_key_cose FROM passkeys WHERE user_id = ?',
-      [userId]
-    );
-
-    let matchedCredentialId = null;
-    for (const row of allPasskeys) {
-      const hash = PasskeyManager.computePubKeyHash(row.public_key_cose);
-      if (hash === oldPubKeyHash) {
-        matchedCredentialId = row.credential_id;
-        break;
-      }
-    }
-
-    if (!matchedCredentialId) {
-      return { success: false, replacedCredentialId: null, deletedCount: 0 };
-    }
-
-    // 2. 在写事务中：删除其他所有 Passkey + 替换匹配的那条
+    // 在单个写事务中完成：确保账户存在 → 删除全部旧 Passkey → 写入新 Passkey
     const result = await this._engine.write(async (db) => {
       const conn = createConnProxy(db);
       const ts = this._engine.hlc.tick();
 
-      // 删除 userId 下除 matchedCredentialId 以外的所有 Passkey
-      const deleteResult = conn.query(
-        'DELETE FROM passkeys WHERE user_id = ? AND credential_id != ?',
-        [userId, matchedCredentialId]
-      );
+      // 若能匹配到 oldPubKeyHash 对应的记录，仅用于结果报告，不影响替换本身
+      let matchedCredentialId = null;
+      if (oldPubKeyHash) {
+        const existing = conn.query(
+          'SELECT credential_id, public_key_cose FROM passkeys WHERE user_id = ?',
+          [userId]
+        );
+        for (const row of existing) {
+          if (PasskeyManager.computePubKeyHash(row.public_key_cose) === oldPubKeyHash) {
+            matchedCredentialId = row.credential_id;
+            break;
+          }
+        }
+      }
 
-      // 替换保留的那条 Passkey
       conn.query(
-        'UPDATE passkeys SET credential_id = ?, public_key_cose = ?, sign_count = 0, _hlc = ? WHERE user_id = ? AND credential_id = ?',
-        [newCredentialId, newPublicKeyCoseBuf, ts, userId, matchedCredentialId]
+        'INSERT OR IGNORE INTO accounts (user_id, created_at, _hlc) VALUES (?, ?, ?)',
+        [userId, getMonotonicSqliteNow(), ts]
       );
 
-      return { deletedCount: deleteResult.changes };
+      const deleteResult = conn.query(
+        'DELETE FROM passkeys WHERE user_id = ?',
+        [userId]
+      );
+
+      conn.query(
+        'INSERT INTO passkeys (user_id, credential_id, public_key_cose, created_at, _hlc) VALUES (?, ?, ?, ?, ?)',
+        [userId, newCredentialId, newPublicKeyCoseBuf, getMonotonicSqliteNow(), ts]
+      );
+
+      return { deletedCount: deleteResult.changes, matchedCredentialId };
     }, userId);
 
     return {
       success: true,
-      replacedCredentialId: matchedCredentialId,
+      replacedCredentialId: result.matchedCredentialId,
       deletedCount: result.deletedCount,
     };
   }

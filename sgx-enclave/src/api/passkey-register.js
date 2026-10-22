@@ -14,13 +14,18 @@
  *   userId 必须提供
  * - 场景C（Passkey 恢复，purpose=register）：用户丢失所有 Passkey，Owner 通过合约授权恢复
  *   Owner 预先在合约设置 setPasskeyRecovery(userId, newPubKeyHash, oldPubKeyHash, uuid, memo)。
- *   用户用新 Passkey 注册时，SGX 查询合约匹配 (userId, SHA256(newPublicKeyCose))：
- *   - 找到恢复条目 → 验证 oldPubKeyHash 匹配现有某个 Passkey
- *   - 保留匹配的旧 Passkey 记录（防止级联删除），删除其余 Passkey
- *   - 用新 Passkey 替换保留的记录，触发冻结（72h）
+ *   用户信任 Owner 模型：一切以 Owner 登记的条目为准。只要 SGX 查询合约匹配到
+ *   (userId, SHA256(newPublicKeyCose)) 的恢复条目，即执行暴力替换（见步骤 6.5）：
+ *   - 优先于一切其他场景（冻结替换 / 场景A / 场景B），与账户此前状态无关
+ *   - 不校验 oldPubKeyHash 是否匹配现存 Passkey（该字段仅作审计信息）
+ *   - 删除该 userId 下全部 Passkey，只保留新 Passkey 一把
+ *   - 清除冻结记录，账户回到无冻结的正常状态（不触发新冻结）
+ *   - 同钥匙重复重置守卫：条目钥匙已在账户内且账户未冻结时报错，不再重复
+ *     重置（不论现有 Passkey 数量、间隔多久）；该钥匙已不在账户内、或账户
+ *     又被冻结时，状态已配不上，允许再次走重置
  *   合约不可用时此功能不可用。
  *
- * 冻结账户替换逻辑：
+ * 冻结账户替换逻辑（仅当新 Passkey 未匹配到 Owner 恢复条目时适用）：
  *   当账户处于冻结状态时，若通过 purpose=register 重新注册，则：
  *   - 删除旧的冻结 Passkey（导致冻结的那个）
  *   - 注册新的 Passkey
@@ -186,6 +191,7 @@ export class PasskeyRegisterHandler {
     //     - 有 Passkey → 场景B（需要现有 Passkey 的 WebAuthn 签名验证）
     //   - 特殊：若账户被冻结且 challenge purpose=register → 冻结替换场景
     let finalUserId = request.userId || null;
+    let userIdWasProvided = !!request.userId; // Owner 恢复条目只能按调用方给定的 userId 查询；challenge 生成的随机 userId 不可能预先登记
     let hasNoPasskeys = true;
     let isExistingAccount = false; // 标记是否为已有账户（用于冻结判断）
     let isFrozenReplacement = false; // 标记是否为冻结账户的 Passkey 替换
@@ -308,39 +314,45 @@ export class PasskeyRegisterHandler {
 
     console.log(`[PasskeyRegister] handleComplete: credentialId=${credentialId}`);
 
-    // 6.5. 场景C：合约授权 Passkey 恢复
-    //   用户有 Passkey 但未提供 existingWebauthnSignature → 查询合约恢复条目
-    //   若合约中存在 (userId, SHA256(newPublicKeyCose)) 的恢复条目，执行恢复流程
+    // 6.5. 场景C：合约授权 Passkey 恢复（Owner 优先，用户信任 Owner 模型）
+    //   对任何给定了 userId 的注册请求，按 (userId, SHA256(newPublicKeyCose)) 查询合约：
+    //   匹配到恢复条目 → 暴力替换，覆盖冻结替换 / 场景A / 场景B 的一切在先判定，
+    //   且不校验 oldPubKeyHash 与现存 Passkey 是否匹配（该字段仅作审计信息）。
+    //   未匹配到条目时，仅保留一条原有拒绝规则：账户已有 Passkey 且未提供现有
+    //   Passkey 签名的请求（isPotentialRecovery）无权注册新 Passkey，直接拒绝。
     let isRecovery = false;
     let recoveryEntry = null;
-    if (isPotentialRecovery) {
+    if (userIdWasProvided && finalUserId) {
       const newPubKeyHash = PasskeyManager.computePubKeyHash(publicKeyCose);
       recoveryEntry = await this._contract.getPasskeyRecovery(finalUserId, newPubKeyHash);
-      if (!recoveryEntry) {
-        // 合约无恢复条目 → 无法恢复，也无法走场景B（缺少 existingWebauthnSignature）
-        throw new Error('Passkey recovery not authorized: no recovery entry found in contract for this userId and new passkey public key');
-      }
-
-      // 验证 oldPubKeyHash 在用户现有 Passkey 中存在
-      const allPasskeys = await this._passkey.listPasskeys(finalUserId);
-      const oldPubKeyHash = recoveryEntry.oldPubKeyHash;
-      let oldMatchFound = false;
-      for (const pk of allPasskeys) {
-        if (PasskeyManager.computePubKeyHash(pk.publicKeyCose) === oldPubKeyHash) {
-          oldMatchFound = true;
-          break;
+      if (recoveryEntry) {
+        // 同钥匙重复重置守卫（不设期限）：条目指定钥匙已重置进该账户、且账户
+        // 处于正常（未冻结）状态时，再用同一把钥匙重置纯属重复，直接报错——
+        // 不论账户里现有几把 Passkey、距上次重置过了多久。
+        // 例外（状态已配不上，允许走重置）：该钥匙已不在账户内，或账户又被冻结。
+        const currentPasskeys = await this._passkey.listPasskeys(finalUserId);
+        const hasTargetPasskey = currentPasskeys.some(
+          (pk) => PasskeyManager.computePubKeyHash(pk.publicKeyCose) === newPubKeyHash
+        );
+        if (hasTargetPasskey && !this._accountFreeze.getFreezeStatus(finalUserId).frozen) {
+          throw new Error('Owner recovery rejected: target passkey already present and account is in normal state');
+        }
+        isRecovery = true;
+        console.log(`[PasskeyRegister] handleComplete: contract recovery entry found, uuid=${recoveryEntry.uuid}, proceeding with OWNER force recovery (overrides frozenReplacement=${isFrozenReplacement}, scenarioB=${!hasNoPasskeys && !isPotentialRecovery})`);
+        // 若本次提交走的是场景B的 challenge（register_passkey），在此消费掉，避免残留
+        if (challenge1DbId) {
+          this._challenge.consumeChallengeById(challenge1DbId);
+          challenge1DbId = null;
         }
       }
-      if (!oldMatchFound) {
-        throw new Error('Passkey recovery failed: oldPubKeyHash from contract does not match any existing passkey for this user');
-      }
-
-      isRecovery = true;
-      console.log(`[PasskeyRegister] handleComplete: contract recovery entry found, uuid=${recoveryEntry.uuid}, proceeding with recovery`);
+    }
+    if (!isRecovery && isPotentialRecovery) {
+      // 合约无恢复条目 → 无法恢复，也无法走场景B（缺少 existingWebauthnSignature）
+      throw new Error('Passkey recovery not authorized: no recovery entry found in contract for this userId and new passkey public key');
     }
 
-    // 7. 场景B：验证已有 Passkey 的签名
-    if (!hasNoPasskeys) {
+    // 7. 场景B：验证已有 Passkey 的签名（Owner 恢复时跳过，Owner 条目即为授权）
+    if (!hasNoPasskeys && !isRecovery) {
       // 验证现有 Passkey 的归属
       const ownershipValid = await this._passkey.verifyPasskeyOwnership(finalUserId, request.existingCredentialId);
       if (!ownershipValid) {
@@ -379,19 +391,16 @@ export class PasskeyRegisterHandler {
 
     // 8. 注册/替换 Passkey（存储 COSE 格式公钥）
     //    冻结替换场景：原地替换（UPDATE），保留 wallets 等关联数据，避免级联删除
-    //    恢复场景（Scenario C）：保留匹配旧公钥的 Passkey，删除其余，用新 Passkey 替换保留的
+    //    恢复场景（Scenario C）：删除全部 Passkey，只写入新 Passkey（Owner 暴力替换）
     //    其他场景：正常注册（INSERT）
     let result;
     if (isRecovery) {
-      // 场景C：合约授权 Passkey 恢复
+      // 场景C：Owner 暴力替换（删除全部旧 Passkey，只留新 Passkey 一把，与此前状态无关）
       const recoveryResult = await this._passkey.recoveryReplace(
         finalUserId, recoveryEntry.oldPubKeyHash, credentialId, publicKeyCose
       );
-      if (!recoveryResult.success) {
-        throw new Error('Passkey recovery replace failed: old passkey matching oldPubKeyHash not found');
-      }
       result = { userId: finalUserId, credentialId };
-      console.log(`[PasskeyRegister] handleComplete: RECOVERY complete, userId=${finalUserId}, replaced=${recoveryResult.replacedCredentialId}, deletedOthers=${recoveryResult.deletedCount}, uuid=${recoveryEntry.uuid}`);
+      console.log(`[PasskeyRegister] handleComplete: OWNER force recovery complete, userId=${finalUserId}, deletedOld=${recoveryResult.deletedCount}, previouslyMatched=${recoveryResult.replacedCredentialId || 'none'}, uuid=${recoveryEntry.uuid}`);
     } else if (isFrozenReplacement) {
       const replaced = await this._passkey.replacePasskey(finalUserId, frozenOldCredentialId, credentialId, publicKeyCose);
       if (!replaced) {
@@ -403,18 +412,21 @@ export class PasskeyRegisterHandler {
     }
 
     // 9. 安全增强：处理冻结逻辑
-    //    a. 冻结替换场景：重置冻结时间（用新 credentialId 替换旧的，72h 重新计算）
-    //    b. 恢复场景（Scenario C）：触发冻结（账户有钱包，新 Passkey 通过合约授权注册）
+    //    a. 恢复场景（Scenario C，Owner 优先）：清除冻结记录，账户回到正常状态，
+    //       不触发、不延续任何冻结（无论此前是冻结期内、已到期未解除还是无冻结）
+    //    b. 冻结替换场景：重置冻结时间（用新 credentialId 替换旧的，72h 重新计算）
     //    c. 场景A补绑场景：若为已有账户且有钱包，则冻结账户 72 小时
     let freezeResult = null;
-    if (isFrozenReplacement) {
-      // 9a. 冻结替换：重置冻结（新 credentialId + 重新计算 72h）
+    let stateNormalized = false;
+    if (isRecovery) {
+      // 9a. Owner 恢复：状态归一化
+      this._accountFreeze.clearFreeze(finalUserId);
+      stateNormalized = true;
+      console.log(`[PasskeyRegister] handleComplete: OWNER recovery state normalized (freeze cleared), userId=${finalUserId}, uuid=${recoveryEntry.uuid}`);
+    } else if (isFrozenReplacement) {
+      // 9b. 冻结替换：重置冻结（新 credentialId + 重新计算 72h）
       freezeResult = this._accountFreeze.resetFreeze(finalUserId, credentialId);
       console.log(`[PasskeyRegister] handleComplete: frozen account passkey REPLACED, userId=${finalUserId}, new freezeUntil=${freezeResult.freezeUntil}`);
-    } else if (isRecovery) {
-      // 9b. 恢复场景：触发冻结（恢复后账户一定有钱包，否则不需要恢复）
-      freezeResult = this._accountFreeze.freezeAccount(finalUserId, credentialId);
-      console.log(`[PasskeyRegister] handleComplete: RECOVERY account FROZEN, userId=${finalUserId}, freezeUntil=${freezeResult.freezeUntil}, uuid=${recoveryEntry.uuid}`);
     } else if (isExistingAccount && hasNoPasskeys) {
       // 9c. 场景A补绑：若该 userId 下有钱包（助记词或纯私钥），则冻结账户 72 小时
       const wallets = await this._wallet.listWallets(finalUserId);
@@ -436,6 +448,10 @@ export class PasskeyRegisterHandler {
     if (isRecovery) {
       response.recovery = true;
       response.recoveryUuid = recoveryEntry.uuid;
+    }
+
+    if (stateNormalized) {
+      response.stateNormalized = true;
     }
 
     if (freezeResult) {
