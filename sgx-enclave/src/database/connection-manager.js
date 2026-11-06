@@ -61,6 +61,16 @@ class ConnectionManager {
         this._readDb = new Database(dbPath, { readonly: true });
         this._readDb.pragma('busy_timeout = 5000');
 
+        // 初始化时单独取出原始函数自持：trapRawDatabases() 给原始实例装探针后，
+        // 本类内部也只用这里提取的引用执行 SQL，永不再经实例调用原始接口。
+        this._rawPrepare = this.db.prepare.bind(this.db);
+        this._rawExec = this.db.exec.bind(this.db);
+        this._rawTransaction = this.db.transaction.bind(this.db);
+        this._rawClose = this.db.close.bind(this.db);
+        this._readRawPrepare = this._readDb.prepare.bind(this._readDb);
+        this._readRawClose = this._readDb.close.bind(this._readDb);
+        this._rawTrapped = false;
+
         this.initialized = true;
     }
 
@@ -103,7 +113,7 @@ class ConnectionManager {
      */
     writeQuery(sql, params = []) {
         this._ensureInitialized();
-        const stmt = this.db.prepare(sql);
+        const stmt = this._rawPrepare(sql);
         const result = stmt.run(...params);
         if (result.changes > 0 && !this._isInManualTxn()) {
             this._notifyWrite();
@@ -120,8 +130,7 @@ class ConnectionManager {
     readQuery(sql, params = []) {
         this._ensureInitialized();
         // 使用独立只读连接：WAL 模式下读取已提交快照，不受 2PC 事务影响
-        const db = this._readDb || this.db;
-        const stmt = db.prepare(sql);
+        const stmt = this._readDb ? this._readRawPrepare(sql) : this._rawPrepare(sql);
         return stmt.all(...params);
     }
 
@@ -134,16 +143,16 @@ class ConnectionManager {
     writeTransaction(callback) {
         this._ensureInitialized();
         const self = this;
-        const txn = this.db.transaction(() => {
+        const txn = this._rawTransaction(() => {
             // 构造事务内的查询代理对象
             const connProxy = {
                 query(sql, params = []) {
                     const trimmed = sql.trimStart().toUpperCase();
                     if (trimmed.startsWith('SELECT') || trimmed.startsWith('WITH')) {
-                        const stmt = self.db.prepare(sql);
+                        const stmt = self._rawPrepare(sql);
                         return stmt.all(...params);
                     } else {
-                        const stmt = self.db.prepare(sql);
+                        const stmt = self._rawPrepare(sql);
                         return stmt.run(...params);
                     }
                 },
@@ -168,11 +177,31 @@ class ConnectionManager {
     }
 
     /**
-     * 获取底层 better-sqlite3 Database 实例（供 sync 模块等高级用途）
+     * 获取底层 better-sqlite3 Database 实例（供 sync 模块在启动期构造适配器）
+     * 注意：trapRawDatabases() 之后该实例的原始执行接口全部是探针，
+     * 只能用于构造适配器（适配器在构造时提取原始函数），不能执行 SQL。
      */
     getDatabase() {
         this._ensureInitialized();
         return this.db;
+    }
+
+    /**
+     * 给原始 better-sqlite3 Database 实例（主连接 + 只读连接）装探针。
+     *
+     * 设计：统一引擎（SyncEngine 适配器）与本类需要的原始函数都已在初始化时
+     * 单独提取自持（见 createSQLiteAdapter 与 initialize），此后永不再经实例取用。
+     * 装探针后，任何经原始实例调用 prepare/exec/transaction/pragma 等原始执行
+     * 接口的代码都会立刻走到探针函数并报错——把"直写绕过同步"从约定禁止
+     * 变成一调用就失败。由启动流程在 SyncManager 启动完成后调用。
+     */
+    trapRawDatabases() {
+        this._ensureInitialized();
+        if (this._rawTrapped) return;
+        this._rawTrapped = true;
+        installRawDbTrap(this.db, 'main');
+        if (this._readDb) installRawDbTrap(this._readDb, 'read');
+        console.log('[ConnectionManager] raw better-sqlite3 interfaces trapped: direct SQL execution bypassing SyncEngine is forbidden');
     }
 
     /**
@@ -188,10 +217,10 @@ class ConnectionManager {
             throw new Error('ConnectionManager: already has an active manual transaction (writeId=' + this._activeManualTxn.writeId + ')');
         }
         // 记录事务开始前的 maxSeq
-        const prevMaxSeqRow = this.db.prepare('SELECT MAX(id) AS max_seq FROM _sync_log').get();
+        const prevMaxSeqRow = this._rawPrepare('SELECT MAX(id) AS max_seq FROM _sync_log').get();
         const prevMaxSeq = prevMaxSeqRow?.max_seq || 0;
         // 开启手动事务（IMMEDIATE 模式：立即获取写锁，防止死锁）
-        this.db.exec('BEGIN IMMEDIATE');
+        this._rawExec('BEGIN IMMEDIATE');
         this._activeManualTxn = { writeId, prevMaxSeq };
     }
 
@@ -208,7 +237,7 @@ class ConnectionManager {
             throw new Error('ConnectionManager: no active manual transaction for writeId=' + writeId);
         }
         const { prevMaxSeq } = this._activeManualTxn;
-        return this.db.prepare(
+        return this._rawPrepare(
             'SELECT id AS seq, table_name, operation, row_key, row_data, _hlc, created_at FROM _sync_log WHERE id > ? ORDER BY id ASC'
         ).all(prevMaxSeq);
     }
@@ -224,7 +253,7 @@ class ConnectionManager {
         if (!this._activeManualTxn || this._activeManualTxn.writeId !== writeId) {
             throw new Error('ConnectionManager: no active manual transaction for writeId=' + writeId);
         }
-        this.db.exec('COMMIT');
+        this._rawExec('COMMIT');
         this._activeManualTxn = null;
         this._notifyWrite();
     }
@@ -241,7 +270,7 @@ class ConnectionManager {
             throw new Error('ConnectionManager: writeId mismatch in rollback: expected=' + this._activeManualTxn.writeId + ', got=' + writeId);
         }
         try {
-            this.db.exec('ROLLBACK');
+            this._rawExec('ROLLBACK');
         } catch (err) {
             // 事务可能已经自动回滚（如 SQLite 错误），忽略
             console.warn('[ConnectionManager] ROLLBACK error (may be already rolled back):', err.message);
@@ -262,15 +291,15 @@ class ConnectionManager {
      */
     close() {
         if (this._activeManualTxn) {
-            try { this.db.exec('ROLLBACK'); } catch {}
+            try { this._rawExec('ROLLBACK'); } catch {}
             this._activeManualTxn = null;
         }
         if (this._readDb) {
-            try { this._readDb.close(); } catch {}
+            try { this._readRawClose(); } catch {}
             this._readDb = null;
         }
         if (this.db) {
-            this.db.close();
+            this._rawClose();
             this.db = null;
             this.initialized = false;
         }
@@ -280,6 +309,31 @@ class ConnectionManager {
         if (!this.initialized) {
             throw new Error('ConnectionManager not initialized. Call initialize() first.');
         }
+    }
+}
+
+/** 需要装探针的原始执行接口：全部是能直接执行 SQL 或改变执行环境的入口 */
+const RAW_DB_TRAPPED_METHODS = [
+    'prepare', 'exec', 'transaction', 'pragma',
+    'function', 'aggregate', 'table', 'loadExtension',
+    'backup', 'serialize', 'deserialize', 'unsafeMode', 'close',
+];
+
+/**
+ * 把原始 Database 实例的执行接口逐个换成探针函数：一调用就报错。
+ * 合法通道（适配器、本类）持有初始化时提取的原始函数引用，不受影响。
+ * @param {import('better-sqlite3').Database} db
+ * @param {string} label - 连接标识（报错信息用）
+ */
+function installRawDbTrap(db, label) {
+    for (const name of RAW_DB_TRAPPED_METHODS) {
+        db[name] = () => {
+            throw new Error(
+                `[RawDbTrap] better-sqlite3 raw API "${name}" (${label} connection) must not be called directly: ` +
+                'all database access goes through SyncEngine (engine.write) / ConnectionManager captured channels. ' +
+                'Raw handles are trapped after startup to prevent bypassing data sync.'
+            );
+        };
     }
 }
 
@@ -338,6 +392,11 @@ class LazyConnectionManager {
     getDatabase() {
         this._ensureReady();
         return this._inner.getDatabase();
+    }
+
+    trapRawDatabases() {
+        this._ensureReady();
+        return this._inner.trapRawDatabases();
     }
 
     // ===== 2PC 手动事务方法代理 =====

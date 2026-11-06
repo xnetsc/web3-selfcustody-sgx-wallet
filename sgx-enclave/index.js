@@ -275,6 +275,11 @@ async function main() {
   await syncManager.start();
   console.log(`[SGX Enclave] SyncManager started (nodeId=${nodeId}, peers=${syncNodes.length}, port=${listenPort})`);
 
+  // 原始 sqlite 接口装探针：统一引擎的适配器与 ConnectionManager 已在初始化时
+  // 单独提取原始函数自持，此后任何经原始 Database 实例执行 SQL 的调用都会
+  // 直接走到探针报错，杜绝绕过统一引擎（事务 + 同步）直写数据库。
+  connectionManager.trapRawDatabases();
+
   // 注册 push-on-write 回调：本地写操作后主动推送给所有 peer
   connectionManager.onWrite(() => {
     if (syncManager) syncManager.pushToAllPeers();

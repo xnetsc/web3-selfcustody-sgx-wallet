@@ -22,11 +22,17 @@
  * @returns {object} DatabaseAdapter（基础查询部分）
  */
 export function createSQLiteAdapter(sqliteDb) {
+    // 初始化时单独取出原始函数自持：原始 Database 实例随后会被装上探针
+    // （见 ConnectionManager.trapRawDatabases），此后任何人再经实例调用
+    // prepare/exec 都只会走到探针报错；适配器凭此处提取的引用继续工作，
+    // 且永不再经实例取用原始函数。
+    const rawPrepare = sqliteDb.prepare.bind(sqliteDb);
+    const rawExec = sqliteDb.exec.bind(sqliteDb);
     return {
-        run(sql, params = []) { return sqliteDb.prepare(sql).run(...params); },
-        get(sql, params = []) { return sqliteDb.prepare(sql).get(...params) || null; },
-        all(sql, params = []) { return sqliteDb.prepare(sql).all(...params); },
-        exec(sql)             { sqliteDb.exec(sql); },
+        run(sql, params = []) { return rawPrepare(sql).run(...params); },
+        get(sql, params = []) { return rawPrepare(sql).get(...params) || null; },
+        all(sql, params = []) { return rawPrepare(sql).all(...params); },
+        exec(sql)             { rawExec(sql); },
     };
 }
 
