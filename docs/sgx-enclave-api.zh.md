@@ -1064,7 +1064,7 @@ digest = SHA256(utf8(userId) || utf8(authorizationId) || grantee 地址 20 字�
 | `grantee` | string | 否 | 按被授权平台地址过滤 |
 | `source` | string | 否 | 按来源过滤：`platform` / `contract` |
 | `page` | number | 否 | 列表查询页码，从 1 开始，默认 1 |
-| `pageSize` | number | 否 | 列表查询每页条数，默认 100，**最大 1000**，超出范围报错 |
+| `pageSize` | number | 否 | 列表查询每页条数，默认 10，**下限 1、上限 10**，超出范围报错 |
 
 按 key 字段等值精确匹配（无模糊查询）。批量精确查询（`keys`）逐项返回 `revoked`（boolean，表示该撤销记录是否存在）与 `revocationRecord`（记录原始数据），方便用户或平台一次确认多个撤销的存在性与内容；`userId` + `authorizationId` 都给时为单条精确查询，返回同样的 `revoked` 与 `revocationRecord`（无记录时为 `null`）；提供任意一个或多个 key 字段时为列表查询，除当前页 `revocationRecords`（原始数据）外，还返回总条数 `count` 与总页数 `totalPages`（及 `page`、`pageSize`）。每条记录含 `source`、`revokedAt`、`authorizationExpiresAt`、`authorizationHash`、`grantee`。
 

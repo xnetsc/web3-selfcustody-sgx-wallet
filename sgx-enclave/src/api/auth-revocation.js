@@ -215,8 +215,8 @@ export class AuthRevocationHandler {
    *   3. 列表查询：{ userId?, authorizationId?, grantee?, source?, page?, pageSize? }
    *      按 key 字段等值精确匹配（无模糊），至少提供一个 key。除当前页的
    *      revocationRecords（原始数据）外，还返回总条数 count 与总页数
-   *      totalPages。分页：page 从 1 开始（默认 1），pageSize 默认 100、
-   *      最大 1000，超出范围直接报错（与管理员列表接口一致）。
+   *      totalPages。分页：page 从 1 开始（默认 1），pageSize 默认 10、
+   *      下限 1、上限 10，超出范围直接报错。
    *
    * @param {Object} request - HTTP body（无需 platformSignature）
    * @returns {Promise<Object>}
@@ -275,14 +275,14 @@ export class AuthRevocationHandler {
       };
     }
 
-    // 列表查询：分页参数校验（pageSize 硬上限 1000，防止无鉴权接口被用来全量拖库）
+    // 列表查询：分页参数校验（pageSize 下限 1、上限 10，防止无鉴权接口被用来全量拖库）
     const page = query.page === undefined ? 1 : parseInt(query.page, 10);
     if (!Number.isInteger(page) || page < 1) {
       throw new Error('page must be greater than or equal to 1');
     }
-    const pageSize = query.pageSize === undefined ? 100 : parseInt(query.pageSize, 10);
-    if (!Number.isInteger(pageSize) || pageSize < 1 || pageSize > 1000) {
-      throw new Error('pageSize must be between 1 and 1000');
+    const pageSize = query.pageSize === undefined ? 10 : parseInt(query.pageSize, 10);
+    if (!Number.isInteger(pageSize) || pageSize < 1 || pageSize > 10) {
+      throw new Error('pageSize must be between 1 and 10');
     }
 
     const total = await this._state.countRevocations(filter);

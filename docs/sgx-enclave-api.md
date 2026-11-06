@@ -1053,7 +1053,7 @@ Query the revocation records cached locally by SGX. **Public endpoint, no authen
 | `grantee` | string | No | Filter by grantee platform address |
 | `source` | string | No | Filter by source: `platform` / `contract` |
 | `page` | number | No | List page number, starting from 1, default 1 |
-| `pageSize` | number | No | List page size, default 100, **maximum 1000**; out-of-range values are rejected |
+| `pageSize` | number | No | List page size, default 10, **minimum 1, maximum 10**; out-of-range values are rejected |
 
 Matching is exact (equality on the given key fields, no fuzzy search). Batch exact query (`keys`) returns, per key, `revoked` (boolean — whether that revocation record exists) and `revocationRecord` (the record's original data), so a user or platform can confirm the existence and contents of several revocations in one call. When both `userId` and `authorizationId` are given directly, the query is exact for a single record with the same `revoked` / `revocationRecord` pair (`null` when absent). With any one or more key fields, it is a list query returning the current page of `revocationRecords` (original data) plus the total `count` and `totalPages` (and `page`, `pageSize`). Each record includes `source`, `revokedAt`, `authorizationExpiresAt`, `authorizationHash`, and `grantee`.
 
