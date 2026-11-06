@@ -15,6 +15,8 @@
  *   POST /api/wallet/delete                → WalletCrudHandler.handleDelete
  *   POST /api/wallet/entry/delete          → WalletEntryDeleteHandler.handleDelete
  *   POST /api/auth/status                  → AuthStatusHandler.handleGetStatus
+ *   POST /api/auth/revoke                  → AuthRevocationHandler.handleRevoke   (平台转发用户撤销，SGX 本地落库)
+ *   POST /api/auth/revocation/query        → AuthRevocationHandler.handleQuery    (本地撤销记录查询，无需鉴权)
  *   POST /api/tx/sign                      → TxSigningHandler.handleSigningRequest    (支持txParams和rawTxHex两种模式)
  *   POST /api/key/import/init              → KeyImportHandler.handleInit              (密钥导入：私钥/助记词)
  *   POST /api/key/import/complete          → KeyImportHandler.handleComplete          (密钥导入确认)
@@ -60,6 +62,7 @@ const WRITE_PATHS = new Set([
   '/api/wallet/create',
   '/api/wallet/delete',
   '/api/wallet/entry/delete',
+  '/api/auth/revoke',
   '/api/tx/sign',
   '/api/key/import/init',
   '/api/key/import/complete',
@@ -137,6 +140,7 @@ function createWriteProxyMiddleware(syncManager) {
  * @param {import('./api/wallet-get.js').WalletGetHandler} handlers.walletGetHandler
  * @param {import('./api/wallet-entry-delete.js').WalletEntryDeleteHandler} handlers.walletEntryDeleteHandler
  * @param {import('./api/auth-status.js').AuthStatusHandler} handlers.authStatusHandler
+ * @param {import('./api/auth-revocation.js').AuthRevocationHandler} handlers.authRevocationHandler
  * @param {import('./api/enclave-info.js').EnclaveInfoHandler} handlers.enclaveInfoHandler
  * @param {import('./api/wallet-list-for-platform.js').WalletListForPlatformHandler} handlers.walletListForPlatformHandler
  * @param {import('./modules/webauthn/account-freeze-manager.js').AccountFreezeManager} [accountFreezeManager] - 账户冻结管理器
@@ -181,6 +185,12 @@ export function createApp(handlers, accountFreezeManager, syncManager = null) {
 
   // 授权状态查询（读操作）
   app.post('/api/auth/status', wrap(req => handlers.authStatusHandler.handleGetStatus(req.body), accountFreezeManager, null, null, req => req.path));
+
+  // 授权撤销（平台转发用户撤销请求，SGX 验证用户签名后本地落库；写操作，走 2PC）
+  app.post('/api/auth/revoke', wrap(req => handlers.authRevocationHandler.handleRevoke(req.body), accountFreezeManager, syncManager, req => req.path));
+
+  // 本地撤销记录查询（公开接口：无需平台签名或 Passkey，不受账户冻结影响，只读本地表）
+  app.post('/api/auth/revocation/query', wrap(req => handlers.authRevocationHandler.handleQuery(req.body), null, null, null, req => req.path));
 
   // 交易签名
   app.post('/api/tx/sign', wrap(req => handlers.txSigningHandler.handleSigningRequest(req.body), accountFreezeManager, syncManager, req => req.path));
@@ -420,6 +430,8 @@ function _extractFreezeCheckFields(payload) {
  */
 function classifyError(msg) {
   if (msg.startsWith('Platform verification failed')) return 401;
+  if (msg.startsWith('Revocation signature verification failed')) return 401;
+  if (msg.startsWith('Authorization signature verification failed')) return 401;
   if (msg.startsWith('Passkey not bound')) return 401;
   if (msg.startsWith('Passkey not found')) return 401;
   if (msg.startsWith('WebAuthn verification failed')) return 401;

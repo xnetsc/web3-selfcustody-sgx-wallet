@@ -108,6 +108,8 @@ The `webauthnSignature` field structure used in the endpoints below (Browser Web
 | 17 | `/api/evidence/list` | Evidence — list records summary |
 | 18 | `/api/enclave/info` | Query Enclave info (no authentication required) |
 | 19 | `/api/admin/userId/list` | Admin — list all users |
+| 20 | `/api/auth/revoke` | Authorization revocation — platform-forwarded, stored locally by SGX |
+| 21 | `/api/auth/revocation/query` | Query locally cached revocation records (no authentication) |
 
 ---
 
@@ -994,6 +996,69 @@ Admin endpoint: list all users' authorization ID lists (no sensitive information
 
 ---
 
+## 20. POST /api/auth/revoke
+
+The routine revocation channel: the user signs a revocation statement, the platform forwards it, and SGX verifies the user's signature and stores the revocation directly in its local database. The on-chain `revokeAuthorization` is only a fallback — when the platform refuses to forward, the user revokes on-chain directly, bypassing the platform; SGX discovers it during the signing-time revocation check on a local miss and caches it.
+
+**Revocation check order (step 6 of transaction signing)**: the local revocation table is checked first; a hit is authoritative and no contract call is made. On a local miss the contract is queried, and a found revocation is cached locally with `source=contract`. The `source` field distinguishes record origins: `platform` (stored via this endpoint, independent of the contract) vs `contract` (a cache of the on-chain state). During the cleanup cycle the cache is reconciled: a `contract`-sourced record whose on-chain record no longer exists is deleted and logged; `platform` records are unaffected. Once the revoked authorization itself expires, its revocation record is deleted and logged for operations monitoring.
+
+**Revocation signature (identical to the contract's `revokeAuthorization`; the same signature can be forwarded or submitted on-chain)**:
+
+```
+digest = SHA256(utf8(userId) || utf8(authorizationId) || grantee address as 20 bytes)
+```
+
+Signed by the user's Passkey (P256). SGX checks that the submitted X/Y match the Passkey bound to `credentialId` and that the signature is valid; the outer platform signature only proves the forwarder is whitelisted and cannot substitute for the user's signature.
+
+**Payload Field Definitions**:
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `userId` | string | Yes | User ID |
+| `authorizationId` | string | Yes | Authorization ID to revoke |
+| `grantee` | string | Yes | Grantee platform address (bound into the revocation signature) |
+| `credentialId` | string | Yes | Credential ID of the Passkey that signed the revocation |
+| `passkeyPubKeyX` / `passkeyPubKeyY` | string | Yes | Passkey P256 public key coordinates (bytes32 hex) |
+| `signatureR` / `signatureS` | string | Yes | P256 signature (bytes32 hex) |
+| `authorizationJson` | string | Conditional | Original authorization JSON string; required when SGX has no stored record of this authorization, and stored after its signature verifies |
+| `authorizationSignature` | object | Conditional | The original authorization's WebAuthn signature, paired with `authorizationJson` |
+
+The revoked authorization's expiry is taken only from a verified authorization record (a stored record, or an `authorizationJson` whose signature verified in this request) — never from a bare time field in the request.
+
+**`data` field (after JSON.parse)**:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `revoked` | boolean | Always `true` |
+| `userId` / `authorizationId` / `grantee` | string | The revoked authorization |
+| `source` | string | Always `platform` |
+| `revocationRecord` | object | The stored revocation record (`source`, `revokedAt`, `authorizationExpiresAt`, `authorizationHash`, etc.) |
+| `authorizationRecord` | object | The authorization record (original JSON, hash, creation time) |
+
+The whole response `data` (including both records) is hashed with SHA256 into `user_report_data` to generate `attestationQuote`, so verifying the quote proves SGX recorded exactly this revocation against exactly this authorization record.
+
+---
+
+## 21. POST /api/auth/revocation/query
+
+Query the revocation records cached locally by SGX. **Public endpoint, no authentication of any kind** (no platform signature, no Passkey). It reads only the local table and never queries the contract: records stored via platform forwarding (`source=platform`) and records cached from the contract (`source=contract`) are both returned.
+
+**Request fields** (sent directly, or inside `payload`):
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `keys` | array | One of the three modes | Batch exact query: `[{ userId, authorizationId }, ...]`, **at most 5 keys per request; more is an error** |
+| `userId` | string | At least one key | User ID (part of the primary key) |
+| `authorizationId` | string | At least one key | Authorization ID (part of the primary key) |
+| `grantee` | string | No | Filter by grantee platform address |
+| `source` | string | No | Filter by source: `platform` / `contract` |
+| `page` | number | No | List page number, starting from 1, default 1 |
+| `pageSize` | number | No | List page size, default 100, **maximum 1000**; out-of-range values are rejected |
+
+Matching is exact (equality on the given key fields, no fuzzy search). Batch exact query (`keys`) returns, per key, `revoked` (boolean — whether that revocation record exists) and `revocationRecord` (the record's original data), so a user or platform can confirm the existence and contents of several revocations in one call. When both `userId` and `authorizationId` are given directly, the query is exact for a single record with the same `revoked` / `revocationRecord` pair (`null` when absent). With any one or more key fields, it is a list query returning the current page of `revocationRecords` (original data) plus the total `count` and `totalPages` (and `page`, `pageSize`). Each record includes `source`, `revokedAt`, `authorizationExpiresAt`, `authorizationHash`, and `grantee`.
+
+---
+
 ## Appendix A: Endpoint Route Summary
 
 **Main endpoints (recommended)**:
@@ -1010,6 +1075,8 @@ Admin endpoint: list all users' authorization ID lists (no sensitive information
 | `POST /api/wallet/delete` | Wallet deletion | Platform signature + WebAuthn signature |
 | `POST /api/wallet/entry/delete` | Single logical wallet deletion | Platform signature + WebAuthn signature |
 | `POST /api/auth/status` | Authorization status query | Platform signature |
+| `POST /api/auth/revoke` | Authorization revocation (platform-forwarded) | Platform signature + user's P256 revocation signature |
+| `POST /api/auth/revocation/query` | Local revocation record query | No authentication |
 | `POST /api/tx/sign` | Transaction signing | Platform signature + authorization verification + WebAuthn signature |
 | `POST /api/key/import/init` | Key import - initialize (private key/mnemonic) | Platform signature (+ WebAuthn signature for user-side import) |
 | `POST /api/key/import/complete` | Key import - complete | Platform signature (+ WebAuthn signature for user-side import) |
@@ -1153,6 +1220,8 @@ The following endpoints are not affected by account freeze and can be called nor
 |----------|-------------|
 | `/api/enclave/info` | Enclave info query (no authentication required) |
 | `/api/admin/userId/list` | Admin user list (platform signature) |
+| `/api/auth/revocation/query` | Local revocation record query (no authentication) |
+| `/api/passkey/register/complete` | Passkey registration/recovery (freeze state handled inside the handler) |
 
 ### Freeze Response Format
 

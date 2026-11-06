@@ -49,6 +49,7 @@ import {
   PasskeyListHandler,
   ChallengeHandler,
   AuthStatusHandler,
+  AuthRevocationHandler,
   TxSigningHandler,
   KeyImportHandler,
   WalletCrudHandler,
@@ -380,6 +381,11 @@ async function main() {
       whitelistVerifier,
       stateManager,
     }),
+    authRevocationHandler: new AuthRevocationHandler({
+      whitelistVerifier,
+      passkeyManager,
+      stateManager,
+    }),
     enclaveInfoHandler: new EnclaveInfoHandler({
       contractClient,
     }),
@@ -411,6 +417,11 @@ async function main() {
     try {
       cleanExpiredSessions(connectionManager);
       cleanExpiredExportSessions(connectionManager);
+      // 清理已过期的授权撤销记录（被撤销授权到期后撤销记录失去意义，删除打日志）
+      await stateManager.cleanExpiredRevocations();
+      // 合约对账：contract 来源的撤销缓存若链上已无对应记录，删除该缓存
+      // （须在 cleanInvalidatedStates 之前：对账可能把仅由错误缓存置 revoked 的状态恢复 active）
+      await stateManager.reconcileContractRevocations(contractClient);
       // 清理已失效的授权缓存（revoked / expired / exceeded）
       await stateManager.cleanInvalidatedStates();
       // 清理过期的 WebAuthn 挑战值

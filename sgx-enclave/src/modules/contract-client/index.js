@@ -621,6 +621,44 @@ export class ContractClient {
   }
 
   /**
+   * 获取用户在合约上的全部撤销记录（实时查询合约）
+   * 合约不可用时抛出异常，由调用方决定降级策略
+   * @param {string} userId
+   * @returns {Promise<Array<{ authorizationId: string, grantee: string, passkeyPubKeyX: string, passkeyPubKeyY: string, revokedAt: string }>>}
+   *   revokedAt 已转换为 ISO 时间字符串
+   * @throws {Error} 合约不可用时抛出
+   */
+  async getRevokedAuthorizations(userId) {
+    this._ensureInitialized();
+    if (!this._contractAvailable) {
+      console.error(`[ContractClient] getRevokedAuthorizations: contract not available, cannot query revocations for userId=${userId}`);
+      throw new Error('Contract not available: cannot query authorization revocation status');
+    }
+    const records = await this._contract.getRevokedAuthorizations(userId);
+    return records.map((r) => ({
+      authorizationId: r.authorizationId,
+      grantee: r.grantee,
+      passkeyPubKeyX: r.passkeyPubKeyX,
+      passkeyPubKeyY: r.passkeyPubKeyY,
+      revokedAt: new Date(Number(r.revokedAt) * 1000).toISOString(),
+    }));
+  }
+
+  /**
+   * 查询单个授权在合约上的撤销记录（兜底查询用）
+   * @param {string} userId
+   * @param {string} authorizationId
+   * @returns {Promise<Object|null>} 撤销记录或 null（合约上不存在）
+   * @throws {Error} 合约不可用时抛出
+   */
+  async getAuthorizationRevocation(userId, authorizationId) {
+    const records = await this.getRevokedAuthorizations(userId);
+    const found = records.find((r) => r.authorizationId === authorizationId) || null;
+    console.log(`[ContractClient] getAuthorizationRevocation: userId=${userId}, authorizationId=${authorizationId}, found=${!!found}`);
+    return found;
+  }
+
+  /**
    * 检查平台是否被用户授权（综合检查）
    * 授权模型：平台白名单（必要条件）+ 用户授权给该 grantee（充分条件）
    * 两者缺一不可：只在白名单不够，必须被用户明确授权

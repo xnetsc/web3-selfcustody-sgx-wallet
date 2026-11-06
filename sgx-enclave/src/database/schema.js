@@ -147,6 +147,36 @@ export const CREATE_AUTHORIZATION_RECORDS_INDEXES_SQL = [
     `CREATE INDEX IF NOT EXISTS idx_auth_records_user_id ON authorization_records (user_id)`,
 ];
 
+// ========== 授权撤销记录表 ==========
+
+// SGX 本地撤销记录：交易签名时优先查此表，未命中才查合约兜底。
+// source 区分记录来源，语义完全不同，禁止混用：
+//   - platform：平台转发的用户撤销请求，SGX 本地直接记录，不依赖合约是否存在；
+//   - contract：合约查询结果的缓存，仅是对链上状态的镜像，合约对账时若链上
+//     已不存在该记录，必须删除此缓存。
+// authorization_expires_at 为被撤销授权的到期时间（来自经验证的授权原文），
+// 到期后撤销记录失去意义，由清理流程删除并打日志供运维监控。
+export const CREATE_AUTHORIZATION_REVOCATIONS_SQL = `
+CREATE TABLE IF NOT EXISTS authorization_revocations (
+    user_id TEXT NOT NULL,
+    authorization_id TEXT NOT NULL,
+    grantee TEXT,
+    source TEXT NOT NULL CHECK (source IN ('platform', 'contract')),
+    revoked_at TEXT NOT NULL,
+    authorization_expires_at TEXT,
+    authorization_hash TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    _hlc TEXT NOT NULL DEFAULT '0',
+    PRIMARY KEY (user_id, authorization_id)
+)`;
+
+export const CREATE_AUTHORIZATION_REVOCATIONS_INDEXES_SQL = [
+    `CREATE INDEX IF NOT EXISTS idx_auth_revocations_auth_id ON authorization_revocations (authorization_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_auth_revocations_source ON authorization_revocations (source)`,
+    `CREATE INDEX IF NOT EXISTS idx_auth_revocations_expires ON authorization_revocations (authorization_expires_at)`,
+];
+
 // ========== 签名防重放表 ==========
 
 export const CREATE_TX_SIGN_NONCES_SQL = `
@@ -262,6 +292,7 @@ export const ALL_TABLE_SQLS = [
     { name: 'authorization_states', sql: CREATE_AUTHORIZATION_STATES_SQL, indexes: CREATE_AUTHORIZATION_STATES_INDEXES_SQL },
     { name: 'authorization_token_states', sql: CREATE_AUTHORIZATION_TOKEN_STATES_SQL, indexes: CREATE_AUTHORIZATION_TOKEN_STATES_INDEXES_SQL },
     { name: 'authorization_records', sql: CREATE_AUTHORIZATION_RECORDS_SQL, indexes: CREATE_AUTHORIZATION_RECORDS_INDEXES_SQL },
+    { name: 'authorization_revocations', sql: CREATE_AUTHORIZATION_REVOCATIONS_SQL, indexes: CREATE_AUTHORIZATION_REVOCATIONS_INDEXES_SQL },
     { name: 'import_sessions', sql: CREATE_IMPORT_SESSIONS_SQL, indexes: CREATE_IMPORT_SESSIONS_INDEXES_SQL },
     { name: 'export_sessions', sql: CREATE_EXPORT_SESSIONS_SQL, indexes: CREATE_EXPORT_SESSIONS_INDEXES_SQL },
     { name: 'tx_sign_nonces', sql: CREATE_TX_SIGN_NONCES_SQL, indexes: CREATE_TX_SIGN_NONCES_INDEXES_SQL },

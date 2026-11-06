@@ -7,7 +7,38 @@
  */
 
 import { createConnProxy } from '../../sync/sync-adapter.js';
-import { getMonotonicSqliteNow } from '../../utils/monotonic-clock.js';
+import { getMonotonicDate, getMonotonicSqliteNow } from '../../utils/monotonic-clock.js';
+
+/**
+ * 将时间值规范化为 ISO 字符串（便于统一比较与存储），无法解析时返回 null
+ * @param {string|null|undefined} value
+ * @returns {string|null}
+ */
+function _normalizeIsoTime(value) {
+  if (!value) return null;
+  const d = new Date(value);
+  return Number.isNaN(d.getTime()) ? null : d.toISOString();
+}
+
+/**
+ * 将 authorization_revocations 表行转换为对外对象
+ * @param {Object} row
+ * @returns {Object|null}
+ */
+function _revocationFromRow(row) {
+  if (!row) return null;
+  return {
+    userId: row.user_id,
+    authorizationId: row.authorization_id,
+    grantee: row.grantee || null,
+    source: row.source,
+    revokedAt: row.revoked_at,
+    authorizationExpiresAt: row.authorization_expires_at || null,
+    authorizationHash: row.authorization_hash || null,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
 
 /**
  * 构造 tokenLimits 的 key
@@ -536,6 +567,291 @@ export class StateManager {
       row.authorization_json = JSON.parse(row.authorization_json);
     }
     return row;
+  }
+
+  // ========== 授权撤销记录（本地优先，合约兜底） ==========
+
+  /**
+   * 查询本地撤销记录（按组合键）
+   * @param {string} userId
+   * @param {string} authorizationId
+   * @returns {Promise<Object|null>} 撤销记录（见 _revocationFromRow）或 null
+   */
+  async getRevocation(userId, authorizationId) {
+    if (!userId || !authorizationId) {
+      throw new Error('userId and authorizationId are required');
+    }
+    const rows = await this._db.readQuery(
+      'SELECT * FROM authorization_revocations WHERE user_id = ? AND authorization_id = ?',
+      [userId, authorizationId]
+    );
+    return _revocationFromRow(rows[0]);
+  }
+
+  /**
+   * 构造撤销记录查询条件（listRevocations / countRevocations 共用）
+   * 支持按记录的 key 字段任意组合精确匹配：userId、authorizationId（主键）、
+   * grantee、source；至少提供一个。
+   * @param {{ userId?: string, authorizationId?: string, grantee?: string, source?: string }} filter
+   * @returns {{ where: string, params: string[] }}
+   */
+  _revocationWhere(filter = {}) {
+    const { userId, authorizationId, grantee, source } = filter;
+    if (!userId && !authorizationId && !grantee && !source) {
+      throw new Error('at least one query key is required (userId, authorizationId, grantee or source)');
+    }
+    if (source && !['platform', 'contract'].includes(source)) {
+      throw new Error(`Invalid revocation source: ${source}`);
+    }
+    const conditions = [];
+    const params = [];
+    if (userId) { conditions.push('user_id = ?'); params.push(userId); }
+    if (authorizationId) { conditions.push('authorization_id = ?'); params.push(authorizationId); }
+    if (grantee) { conditions.push('grantee = ?'); params.push(grantee); }
+    if (source) { conditions.push('source = ?'); params.push(source); }
+    return { where: conditions.join(' AND '), params };
+  }
+
+  /**
+   * 列出本地撤销记录（供无鉴权查询接口使用，只读本地表，不查合约）
+   * userId / authorizationId 至少提供一个；两者都给时精确匹配一条。
+   * @param {{ userId?: string, authorizationId?: string }} filter
+   * @param {{ limit: number, offset: number }} [pagination] - 分页（由调用方校验范围）
+   * @returns {Promise<Object[]>} 撤销记录列表（按 revoked_at 升序）
+   */
+  async listRevocations(filter = {}, pagination = null) {
+    const { where, params } = this._revocationWhere(filter);
+    let sql = `SELECT * FROM authorization_revocations WHERE ${where} ORDER BY revoked_at ASC`;
+    if (pagination) {
+      sql += ' LIMIT ? OFFSET ?';
+      params.push(pagination.limit, pagination.offset);
+    }
+    const rows = await this._db.readQuery(sql, params);
+    return rows.map(_revocationFromRow);
+  }
+
+  /**
+   * 统计本地撤销记录总数（分页用）
+   * @param {{ userId?: string, authorizationId?: string }} filter
+   * @returns {Promise<number>}
+   */
+  async countRevocations(filter = {}) {
+    const { where, params } = this._revocationWhere(filter);
+    const rows = await this._db.readQuery(
+      `SELECT COUNT(*) AS cnt FROM authorization_revocations WHERE ${where}`,
+      params
+    );
+    return rows[0]?.cnt || 0;
+  }
+
+  /**
+   * 记录/更新一条撤销记录，并同步将授权状态置为 revoked。
+   *
+   * 来源优先级：platform（平台转发的用户撤销，本地直接记录）高于 contract
+   * （合约查询结果的缓存）：已存在 platform 记录时，合约缓存不得覆盖它，
+   * 只允许补齐缺失的到期时间/授权哈希；contract 记录可被 platform 记录升级。
+   *
+   * @param {Object} record
+   * @param {string} record.userId
+   * @param {string} record.authorizationId
+   * @param {string} [record.grantee] - 被授权平台地址（单个）
+   * @param {'platform'|'contract'} record.source - 记录来源
+   * @param {string} [record.revokedAt] - 撤销发生时间（ISO），缺省为当前单调时间
+   * @param {string} [record.authorizationExpiresAt] - 被撤销授权的到期时间（ISO）
+   * @param {string} [record.authorizationHash] - 授权原文哈希
+   * @returns {Promise<Object>} 落库后的撤销记录
+   */
+  async recordRevocation(record) {
+    const { userId, authorizationId, source } = record || {};
+    if (!userId || !authorizationId) {
+      throw new Error('userId and authorizationId are required');
+    }
+    if (!['platform', 'contract'].includes(source)) {
+      throw new Error(`Invalid revocation source: ${source}`);
+    }
+    const revokedAt = _normalizeIsoTime(record.revokedAt) || getMonotonicDate().toISOString();
+    const expiresAt = _normalizeIsoTime(record.authorizationExpiresAt);
+    const authorizationHash = record.authorizationHash || null;
+    const grantee = record.grantee || null;
+
+    await this._engine.write(async (db) => {
+      const conn = createConnProxy(db);
+      const ts = this._engine.hlc.tick();
+      const now = getMonotonicSqliteNow();
+
+      const existing = conn.query(
+        'SELECT * FROM authorization_revocations WHERE user_id = ? AND authorization_id = ?',
+        [userId, authorizationId]
+      );
+
+      if (existing.length > 0) {
+        const ex = existing[0];
+        if (ex.source === 'platform' && source === 'contract') {
+          // platform 记录优先：合约缓存只补元数据，不覆盖来源与撤销时间
+          conn.query(
+            `UPDATE authorization_revocations
+             SET authorization_expires_at = COALESCE(authorization_expires_at, ?),
+                 authorization_hash = COALESCE(authorization_hash, ?),
+                 updated_at = ?, _hlc = ?
+             WHERE user_id = ? AND authorization_id = ?`,
+            [expiresAt, authorizationHash, now, ts, userId, authorizationId]
+          );
+        } else {
+          const earliestRevokedAt = [ex.revoked_at, revokedAt].sort()[0];
+          conn.query(
+            `UPDATE authorization_revocations
+             SET grantee = COALESCE(?, grantee), source = ?, revoked_at = ?,
+                 authorization_expires_at = COALESCE(?, authorization_expires_at),
+                 authorization_hash = COALESCE(?, authorization_hash),
+                 updated_at = ?, _hlc = ?
+             WHERE user_id = ? AND authorization_id = ?`,
+            [grantee, source, earliestRevokedAt, expiresAt, authorizationHash, now, ts, userId, authorizationId]
+          );
+        }
+      } else {
+        conn.query(
+          `INSERT INTO authorization_revocations
+             (user_id, authorization_id, grantee, source, revoked_at, authorization_expires_at, authorization_hash, created_at, updated_at, _hlc)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [userId, authorizationId, grantee, source, revokedAt, expiresAt, authorizationHash, now, now, ts]
+        );
+      }
+
+      // 同步授权状态为 revoked（状态行不存在则创建），供 /api/auth/status 等读取方看到一致结果
+      const stateRows = conn.query(
+        'SELECT status FROM authorization_states WHERE user_id = ? AND authorization_id = ?',
+        [userId, authorizationId]
+      );
+      if (stateRows.length > 0) {
+        if (stateRows[0].status !== 'revoked') {
+          conn.query(
+            `UPDATE authorization_states SET status = 'revoked', updated_at = ?, _hlc = ? WHERE user_id = ? AND authorization_id = ?`,
+            [now, ts, userId, authorizationId]
+          );
+        }
+      } else {
+        conn.query(
+          `INSERT INTO authorization_states (authorization_id, user_id, grantee, status, total_amount_used, total_count_used, created_at, updated_at, _hlc)
+           VALUES (?, ?, ?, 'revoked', '0', 0, ?, ?, ?)`,
+          [authorizationId, userId, grantee || '*', now, now, ts]
+        );
+      }
+    }, userId);
+
+    console.log(`[AuthorizationRevocation] recorded: userId=${userId}, authorizationId=${authorizationId}, source=${source}, revokedAt=${revokedAt}, authorizationExpiresAt=${expiresAt || 'none'}`);
+    return this.getRevocation(userId, authorizationId);
+  }
+
+  /**
+   * 删除本地撤销记录（删除必打日志，供运维监控跟踪每一次撤销记录消失的原因）
+   * @param {string} userId
+   * @param {string} authorizationId
+   * @param {Object} [options]
+   * @param {string} [options.expectedSource] - 仅当现有记录来源与此一致时才删除
+   * @param {string} [options.reason] - 删除原因（写入日志）
+   * @param {boolean} [options.restoreState] - 删除后若授权状态为 revoked 则恢复为 active
+   *   （用于合约对账删除错误缓存：该状态的 revoked 仅来自这条缓存记录）
+   * @returns {Promise<boolean>} 是否实际删除
+   */
+  async deleteRevocation(userId, authorizationId, options = {}) {
+    const existing = await this.getRevocation(userId, authorizationId);
+    if (!existing) return false;
+    if (options.expectedSource && existing.source !== options.expectedSource) return false;
+
+    await this._engine.write(async (db) => {
+      const conn = createConnProxy(db);
+      conn.query(
+        'DELETE FROM authorization_revocations WHERE user_id = ? AND authorization_id = ?',
+        [userId, authorizationId]
+      );
+      if (options.restoreState) {
+        const ts = this._engine.hlc.tick();
+        conn.query(
+          `UPDATE authorization_states SET status = 'active', updated_at = ?, _hlc = ?
+           WHERE user_id = ? AND authorization_id = ? AND status = 'revoked'`,
+          [getMonotonicSqliteNow(), ts, userId, authorizationId]
+        );
+      }
+    }, userId);
+
+    console.log(`[AuthorizationRevocation] local revocation record deleted: userId=${userId}, authorizationId=${authorizationId}, source=${existing.source}, revokedAt=${existing.revokedAt}, reason=${options.reason || 'unspecified'}`);
+    return true;
+  }
+
+  /**
+   * 清理已过期的撤销记录：被撤销的授权一旦到期，撤销记录失去意义，删除并打日志。
+   * 无到期时间的记录不清理（无法判定授权何时过期，保守保留）。
+   * @returns {Promise<{ cleaned: number }>}
+   */
+  async cleanExpiredRevocations() {
+    const nowIso = getMonotonicDate().toISOString();
+    const rows = await this._db.readQuery(
+      `SELECT user_id, authorization_id FROM authorization_revocations
+       WHERE authorization_expires_at IS NOT NULL AND authorization_expires_at <= ?`,
+      [nowIso]
+    );
+    let cleaned = 0;
+    for (const row of rows) {
+      if (await this.deleteRevocation(row.user_id, row.authorization_id, { reason: 'authorization expired' })) {
+        cleaned++;
+      }
+    }
+    if (cleaned > 0) {
+      console.log(`[AuthorizationRevocation] cleanup: deleted ${cleaned} expired revocation record(s)`);
+    }
+    return { cleaned };
+  }
+
+  /**
+   * 合约对账：contract 来源的本地记录只是链上状态的缓存，链上已不存在对应
+   * 撤销记录时，该缓存必须删除（并把仅由它置 revoked 的授权状态恢复 active）。
+   * platform 来源的记录不参与对账删除——它不依赖合约存在。
+   * 合约不可达的用户跳过，不删除任何记录。
+   * @param {import('../../modules/contract-client/index.js').ContractClient} contractClient
+   * @returns {Promise<{ checked: number, deleted: number }>}
+   */
+  async reconcileContractRevocations(contractClient) {
+    const rows = await this._db.readQuery(
+      `SELECT * FROM authorization_revocations WHERE source = 'contract'`
+    );
+    if (rows.length === 0) return { checked: 0, deleted: 0 };
+
+    const nowIso = getMonotonicDate().toISOString();
+    const byUser = new Map();
+    for (const row of rows) {
+      // 已到期的记录由 cleanExpiredRevocations 负责删除并说明原因，对账不重复处理
+      if (row.authorization_expires_at && row.authorization_expires_at <= nowIso) continue;
+      if (!byUser.has(row.user_id)) byUser.set(row.user_id, []);
+      byUser.get(row.user_id).push(row);
+    }
+
+    let checked = 0;
+    let deleted = 0;
+    for (const [userId, userRows] of byUser) {
+      let chainRecords;
+      try {
+        chainRecords = await contractClient.getRevokedAuthorizations(userId);
+      } catch (err) {
+        console.warn(`[AuthorizationRevocation] reconcile skipped for userId=${userId}: contract unavailable (${err.message})`);
+        continue;
+      }
+      const chainIds = new Set(chainRecords.map((r) => r.authorizationId));
+      for (const row of userRows) {
+        checked++;
+        if (!chainIds.has(row.authorization_id)) {
+          const removed = await this.deleteRevocation(userId, row.authorization_id, {
+            expectedSource: 'contract',
+            reason: 'contract reconciliation: no revocation record on contract',
+            restoreState: true,
+          });
+          if (removed) deleted++;
+        }
+      }
+    }
+    if (deleted > 0) {
+      console.log(`[AuthorizationRevocation] reconcile: checked=${checked}, deleted=${deleted} stale contract-sourced cache record(s)`);
+    }
+    return { checked, deleted };
   }
 
   // ========== 签名防重放（GUID nonce） ==========

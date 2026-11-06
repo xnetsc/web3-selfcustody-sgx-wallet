@@ -111,6 +111,8 @@ curl -X POST http://localhost:3000/api/<接口路径> \
 | 17 | `/api/evidence/list` | 取证 — 列出记录摘要 |
 | 18 | `/api/enclave/info` | 查询 Enclave 信息（无需鉴权） |
 | 19 | `/api/admin/userId/list` | 管理员 — 列出所有用户 |
+| 20 | `/api/auth/revoke` | 授权撤销 — 平台转发用户撤销，SGX 本地落库 |
+| 21 | `/api/auth/revocation/query` | 本地撤销记录查询（无需鉴权） |
 
 ---
 
@@ -1005,6 +1007,69 @@ payload 区分两种发起方式：
 
 ---
 
+## 20. POST /api/auth/revoke
+
+授权撤销的日常通道：用户签署撤销声明后由平台转发，SGX 验证用户签名后把撤销记录直接存入本地数据库。合约上的 `revokeAuthorization` 只作兜底——平台不配合转发时，用户绕过平台直接上链撤销，SGX 在交易签名的撤销检查中本地未命中时查合约发现并缓存。
+
+**撤销检查顺序（交易签名第 6 项）**：先查本地撤销记录，命中即以本地为准、不查合约；未命中才查合约，查到后以 `source=contract` 缓存到本地。本地记录的 `source` 字段区分来源：`platform`（本接口落库，不依赖合约是否存在）与 `contract`（合约查询结果的缓存）；清理周期内会对账：合约上已不存在对应记录时，删除 `contract` 来源的缓存记录并打日志，`platform` 来源不受影响。被撤销的授权到期后，撤销记录被删除并打日志，供运维监控。
+
+**撤销签名（与合约 `revokeAuthorization` 同构，同一份签名既可转发也可上链）**：
+
+```
+digest = SHA256(utf8(userId) || utf8(authorizationId) || grantee 地址 20 字节)
+```
+
+由该用户的 Passkey（P256）对 digest 签名。SGX 校验提交的公钥 X/Y 与 `credentialId` 绑定的 Passkey 一致且签名有效；外层平台签名只证明转发方在白名单内，不能代替用户签名。
+
+**payload 字段定义**：
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `userId` | string | 是 | 用户 ID |
+| `authorizationId` | string | 是 | 要撤销的授权 ID |
+| `grantee` | string | 是 | 被授权平台地址（撤销签名绑定此地址） |
+| `credentialId` | string | 是 | 签署撤销的 Passkey 凭证 ID |
+| `passkeyPubKeyX` / `passkeyPubKeyY` | string | 是 | Passkey P256 公钥坐标（bytes32 hex） |
+| `signatureR` / `signatureS` | string | 是 | P256 签名（bytes32 hex） |
+| `authorizationJson` | string | 条件必填 | 授权原文 JSON 字符串；SGX 无该授权的原文记录时必填，验签通过后存入原文记录 |
+| `authorizationSignature` | object | 条件必填 | 原授权的 WebAuthn 签名，与 `authorizationJson` 配套 |
+
+被撤销授权的到期时间只取自经验证的授权原文（已存记录或本次验签通过的 `authorizationJson`），不采信请求中裸填的时间字段。
+
+**data 字段（JSON.parse 后）**：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `revoked` | boolean | 固定 `true` |
+| `userId` / `authorizationId` / `grantee` | string | 撤销对象 |
+| `source` | string | 固定 `platform` |
+| `revocationRecord` | object | 落库后的撤销记录（`source`、`revokedAt`、`authorizationExpiresAt`、`authorizationHash` 等） |
+| `authorizationRecord` | object | 授权原文记录（原文、哈希、创建时间） |
+
+响应 `data` 整体（含上述两份记录）会被计算 SHA256 注入 `user_report_data` 生成 `attestationQuote`，发起人验证 quote 即等于验证 SGX 确实按这份授权原文记住了这条撤销。
+
+---
+
+## 21. POST /api/auth/revocation/query
+
+查询 SGX 本地缓存的撤销记录。**公开接口，无需任何身份验证**（不验平台签名、不验 Passkey），任何人可调用。只读本地表，不查合约：平台转发落库的记录（`source=platform`）与合约同步缓存的记录（`source=contract`）都可查到。
+
+**请求字段**（直传，或放在 `payload` 中均可）：
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `keys` | array | 三选一 | 批量精确查询：`[{ userId, authorizationId }, ...]`，**单次最多 5 个 key，超过报错** |
+| `userId` | string | 至少一个 key | 用户 ID（主键之一） |
+| `authorizationId` | string | 至少一个 key | 授权 ID（主键之一） |
+| `grantee` | string | 否 | 按被授权平台地址过滤 |
+| `source` | string | 否 | 按来源过滤：`platform` / `contract` |
+| `page` | number | 否 | 列表查询页码，从 1 开始，默认 1 |
+| `pageSize` | number | 否 | 列表查询每页条数，默认 100，**最大 1000**，超出范围报错 |
+
+按 key 字段等值精确匹配（无模糊查询）。批量精确查询（`keys`）逐项返回 `revoked`（boolean，表示该撤销记录是否存在）与 `revocationRecord`（记录原始数据），方便用户或平台一次确认多个撤销的存在性与内容；`userId` + `authorizationId` 都给时为单条精确查询，返回同样的 `revoked` 与 `revocationRecord`（无记录时为 `null`）；提供任意一个或多个 key 字段时为列表查询，除当前页 `revocationRecords`（原始数据）外，还返回总条数 `count` 与总页数 `totalPages`（及 `page`、`pageSize`）。每条记录含 `source`、`revokedAt`、`authorizationExpiresAt`、`authorizationHash`、`grantee`。
+
+---
+
 ## 附录 A：接口路由汇总
 
 **主要接口（推荐使用）**：
@@ -1021,6 +1086,8 @@ payload 区分两种发起方式：
 | `POST /api/wallet/delete` | 钱包删除 | 平台签名 + WebAuthn 签名 |
 | `POST /api/wallet/entry/delete` | 单个逻辑钱包删除 | 平台签名 + WebAuthn 签名 |
 | `POST /api/auth/status` | 授权状态查询 | 平台签名 |
+| `POST /api/auth/revoke` | 授权撤销（平台转发） | 平台签名 + 用户 P256 撤销签名 |
+| `POST /api/auth/revocation/query` | 本地撤销记录查询 | 无需鉴权 |
 | `POST /api/tx/sign` | 交易签名 | 平台签名 + 授权验证 + WebAuthn 签名 |
 | `POST /api/key/import/init` | 密钥导入 - 初始化（私钥/助记词） | 平台签名（用户端导入时 + WebAuthn 签名） |
 | `POST /api/key/import/complete` | 密钥导入 - 完成 | 平台签名（用户端导入时 + WebAuthn 签名） |
@@ -1165,6 +1232,8 @@ webauthnSignature = Passkey.sign(intentHash)
 |------|------|
 | `/api/enclave/info` | Enclave 信息查询（无需鉴权） |
 | `/api/admin/userId/list` | 管理员用户列表（平台签名） |
+| `/api/auth/revocation/query` | 本地撤销记录查询（无需鉴权） |
+| `/api/passkey/register/complete` | Passkey 注册/恢复（冻结状态由 handler 内部处理） |
 
 ### 冻结响应格式
 

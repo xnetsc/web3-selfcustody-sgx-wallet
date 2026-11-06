@@ -83,6 +83,14 @@ const TABLE_VALIDATORS = {
             throw new Error('authorization_states: invalid status: ' + rowData.status);
         }
     },
+    authorization_revocations(rowData) {
+        if (!rowData.user_id || !rowData.authorization_id) {
+            throw new Error('authorization_revocations: user_id and authorization_id are required');
+        }
+        if (!['platform', 'contract'].includes(rowData.source)) {
+            throw new Error('authorization_revocations: invalid source: ' + rowData.source);
+        }
+    },
 };
 
 /**
@@ -129,6 +137,11 @@ export const BUSINESS_TABLES = {
     authorization_records: {
         keyColumns: ['user_id', 'authorization_id'],
         dataColumns: ['user_id', 'authorization_id', 'grantee', 'authorization_json', 'authorization_hash', 'created_at', '_hlc'],
+    },
+    authorization_revocations: {
+        keyColumns: ['user_id', 'authorization_id'],
+        dataColumns: ['user_id', 'authorization_id', 'grantee', 'source', 'revoked_at', 'authorization_expires_at', 'authorization_hash', 'created_at', 'updated_at', '_hlc'],
+        validator: TABLE_VALIDATORS.authorization_revocations,
     },
     import_sessions: {
         keyColumns: ['session_id'],

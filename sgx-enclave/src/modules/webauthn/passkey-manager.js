@@ -175,6 +175,7 @@ export class PasskeyManager {
         // 3. 无剩余 Passkey → 删除账户记录及授权数据，级联删除整个账户及所有下属数据
         conn.query('DELETE FROM tx_sign_nonces WHERE authorization_id IN (SELECT authorization_id FROM authorization_states WHERE user_id = ?)', [userId]);
         conn.query('DELETE FROM authorization_token_states WHERE authorization_id IN (SELECT authorization_id FROM authorization_states WHERE user_id = ?)', [userId]);
+        conn.query('DELETE FROM authorization_revocations WHERE user_id = ?', [userId]);
         conn.query('DELETE FROM authorization_states WHERE user_id = ?', [userId]);
         conn.query('DELETE FROM import_sessions WHERE user_id = ?', [userId]);
         conn.query('DELETE FROM wallets WHERE user_id = ?', [userId]);

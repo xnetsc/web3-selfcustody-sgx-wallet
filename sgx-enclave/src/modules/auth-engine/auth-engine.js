@@ -5,7 +5,7 @@
  * 依赖模块：
  * - whitelist (TODO-06): verifyRequest() — 第 1 项
  * - webauthn (TODO-07): verifyPasskeyOwnership(), verifyWebAuthnSignature() — 第 3-5 项
- * - ContractClient (TODO-05): isAuthorizationRevoked() — 第 6 项
+ * - ContractClient (TODO-05): getAuthorizationRevocation() — 第 6 项（本地撤销记录未命中时的兜底查询）
  * - state-management (TODO-10): checkLimits() — 第 13 项
  * - wallet-management (TODO-08): getWalletByAddress() — 第 14 项
  */
@@ -126,32 +126,86 @@ export class AuthEngine {
       return { approved: false, step: 5, reason: sigResult.reason };
     }
 
-    // ===== 第 6 项：查询撤销列表，确认授权未被撤销 =====
-    // revocationPolicy.allowContractUnavailable（必填布尔值）决定合约不可用时行为：
-    //   - true:  RPC 不通 → 查本地缓存（authorization_states 表）→ 缓存有以缓存为准 → 没缓存则放过
-    //   - false: RPC 不通 → 直接拒绝
+    // ===== 第 6 项：查询撤销记录，确认授权未被撤销（本地优先，合约兜底） =====
+    // 顺序与来源语义：
+    //   1. 先查本地 authorization_revocations 表。命中即以本地为准，不查合约：
+    //      - source=platform：平台转发的用户撤销，SGX 直接记录，与合约无关；
+    //      - source=contract：此前合约查询结果的缓存。缓存若与链上不一致（链上
+    //        已无此记录），由 StateManager.reconcileContractRevocations 在清理
+    //        周期内对账删除，本项不为单笔交易重复对账。
+    //   2. 本地未命中才查合约（兜底：平台不配合转发时，用户直接在合约上撤销，
+    //      合约不受平台控制，平台无法拒绝）。查到撤销 → 以 source=contract
+    //      写入本地缓存，后续交易走第 1 步；未查到 → 放行。
+    //   3. 本地记录已随授权到期失效（authorizationExpiresAt <= now）→ 删除并
+    //      打日志（deleteRevocation 内含），按未命中处理；授权本身是否过期由
+    //      第 7 项判定。
+    // revocationPolicy.allowContractUnavailable（必填布尔值）只决定第 2 步合约
+    // 不可用时的行为：true → 无本地记录时放行；false → 拒绝。
     const allowContractUnavailable = auth.revocationPolicy.allowContractUnavailable;
+    const authorizationExpiresAt = auth.timePolicy?.deadline
+      ? new Date(auth.timePolicy.deadline).toISOString()
+      : null;
+
+    let localRevocation = await this._state.getRevocation(auth.userId, auth.authorizationId);
+    if (localRevocation?.authorizationExpiresAt
+        && new Date(localRevocation.authorizationExpiresAt) <= getMonotonicDate()) {
+      await this._state.deleteRevocation(auth.userId, auth.authorizationId, { reason: 'authorization expired' })
+        .catch(() => {});
+      localRevocation = null;
+    }
+
+    if (localRevocation) {
+      // 用本次已验签的授权原文补齐本地记录缺失的到期时间/哈希（不改变来源）
+      if ((!localRevocation.authorizationExpiresAt && authorizationExpiresAt)
+          || (!localRevocation.authorizationHash && authHash)) {
+        localRevocation = await this._state.recordRevocation({
+          userId: auth.userId,
+          authorizationId: auth.authorizationId,
+          grantee: localRevocation.grantee,
+          source: localRevocation.source,
+          revokedAt: localRevocation.revokedAt,
+          authorizationExpiresAt: authorizationExpiresAt || localRevocation.authorizationExpiresAt,
+          authorizationHash: authHash || localRevocation.authorizationHash,
+        }).catch(() => localRevocation);
+      }
+      console.log(`[AuthEngine] verify: REJECTED at step 6 - authorization revoked (local record, source=${localRevocation.source})`);
+      return { approved: false, step: 6, reason: `Authorization has been revoked (source: ${localRevocation.source})` };
+    }
+
+    // 本地未命中 → 合约兜底查询
     try {
-      const revoked = await this._contract.isAuthorizationRevoked(auth.userId, auth.authorizationId);
-      if (revoked) {
-        // 实时查询确认已撤销 → 同步更新本地缓存
-        await this._state.updateStatus(auth.authorizationId, 'revoked').catch(() => {});
-        console.log(`[AuthEngine] verify: REJECTED at step 6 - authorization revoked`);
+      const contractRevocation = await this._contract.getAuthorizationRevocation(auth.userId, auth.authorizationId);
+      if (contractRevocation) {
+        // 合约确认已撤销 → 缓存到本地（source=contract），后续交易本地命中
+        await this._state.recordRevocation({
+          userId: auth.userId,
+          authorizationId: auth.authorizationId,
+          grantee: contractRevocation.grantee,
+          source: 'contract',
+          revokedAt: contractRevocation.revokedAt,
+          authorizationExpiresAt,
+          authorizationHash: authHash,
+        }).catch(() => {});
+        console.log(`[AuthEngine] verify: REJECTED at step 6 - authorization revoked (contract)`);
         return { approved: false, step: 6, reason: 'Authorization has been revoked' };
       }
-      // RPC 可用且未撤销 → 确保本地有 active 缓存，供 RPC 断开时回退查询
+      // 合约明确无此撤销记录：若本地在此期间同步来一条 contract 来源记录，
+      // 它与链上状态矛盾，按来源规则删除该缓存（platform 来源不受此影响，
+      // 上面的本地命中分支已先行处理，不会走到这里）。
+      const concurrentRevocation = await this._state.getRevocation(auth.userId, auth.authorizationId);
+      if (concurrentRevocation?.source === 'contract') {
+        await this._state.deleteRevocation(auth.userId, auth.authorizationId, {
+          expectedSource: 'contract',
+          reason: 'contract query returned no revocation record',
+          restoreState: true,
+        }).catch(() => {});
+      }
+      // 确保本地有 active 状态缓存，供后续回退查询
       await this._state.getOrCreateState(auth.authorizationId, auth.userId, auth.grantee).catch(() => {});
     } catch (err) {
-      // 合约不可用（未配置或不可达）
+      // 合约不可用（未配置或不可达），且本地无撤销记录
       if (allowContractUnavailable) {
-        // 查本地缓存
-        const localState = await this._state.getState(auth.authorizationId);
-        if (localState && localState.status === 'revoked') {
-          console.log(`[AuthEngine] verify: REJECTED at step 6 - contract unavailable, local cache shows revoked`);
-          return { approved: false, step: 6, reason: 'Authorization revoked (from local cache, contract unavailable)' };
-        }
-        // 没有缓存或缓存状态非 revoked → 放过
-        console.warn(`[AuthEngine] verify: step 6 - contract unavailable, allowContractUnavailable=true, localState=${localState?.status || 'none'}, skipping revocation check`);
+        console.warn(`[AuthEngine] verify: step 6 - contract unavailable, allowContractUnavailable=true, no local revocation record, skipping revocation check`);
       } else {
         console.log(`[AuthEngine] verify: REJECTED at step 6 - contract unavailable, cannot verify revocation: ${err.message}`);
         return { approved: false, step: 6, reason: 'Contract unavailable: cannot verify revocation status' };
