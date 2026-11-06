@@ -854,6 +854,87 @@ export class StateManager {
     return { checked, deleted };
   }
 
+  /**
+   * 定时全量同步：把合约上的撤销记录同步进本地数据库（source='contract'）。
+   * 枚举本地全部用户（accounts 表），逐用户拉取链上撤销列表：
+   *   - 链上有、本地无 → 以 source='contract' 落库；到期时间与授权哈希从本地
+   *     已存的授权原文记录补全（链上撤销记录本身不含这两项），供过期清理使用；
+   *     本地已有 platform 记录时，来源优先级保证其不会被降级覆盖；
+   *   - 本地有 contract 记录、链上已无 → 在同一次同步中删除并恢复授权状态
+   *    （与 reconcileContractRevocations 相同的删除规则）；platform 来源的
+   *     记录不参与删除。
+   * 合约不可达的用户整户跳过：不落库、不删除。
+   * 由 enclave 定时清理任务周期调用（见 sgx-enclave/index.js）。
+   * @param {import('../../modules/contract-client/index.js').ContractClient} contractClient
+   * @returns {Promise<{ users: number, synced: number, deleted: number, skippedUsers: number }>}
+   */
+  async syncRevocationsFromContract(contractClient) {
+    const userRows = await this._db.readQuery('SELECT user_id FROM accounts');
+    let synced = 0;
+    let deleted = 0;
+    let skippedUsers = 0;
+
+    for (const { user_id: userId } of userRows) {
+      let chainRecords;
+      try {
+        chainRecords = await contractClient.getRevokedAuthorizations(userId);
+      } catch (err) {
+        skippedUsers++;
+        console.warn(`[AuthorizationRevocation] contract sync skipped for userId=${userId}: contract unavailable (${err.message})`);
+        continue;
+      }
+
+      const chainIds = new Set();
+      for (const rec of chainRecords) {
+        chainIds.add(rec.authorizationId);
+        // 到期时间/哈希从本地授权原文记录补全（没有存量记录时留空，不影响撤销效力）
+        let authorizationExpiresAt;
+        let authorizationHash;
+        const stored = await this.getAuthorizationRecord(userId, rec.authorizationId).catch(() => null);
+        if (stored) {
+          // getAuthorizationRecord 返回原始行字段（snake_case）
+          authorizationHash = stored.authorizationHash ?? stored.authorization_hash;
+          try {
+            const deadline = JSON.parse(stored.authorizationJson ?? stored.authorization_json)?.data?.deadline;
+            if (deadline) authorizationExpiresAt = new Date(deadline).toISOString();
+          } catch { /* 授权原文不可解析时不补全 */ }
+        }
+        const before = await this.getRevocation(userId, rec.authorizationId);
+        await this.recordRevocation({
+          userId,
+          authorizationId: rec.authorizationId,
+          grantee: rec.grantee,
+          source: 'contract',
+          revokedAt: rec.revokedAt,
+          authorizationExpiresAt,
+          authorizationHash,
+        });
+        if (!before) synced++;
+      }
+
+      // 同一次同步内做删除对账：本地 contract 缓存中链上已不存在的记录删除
+      const localContractRows = await this._db.readQuery(
+        `SELECT authorization_id FROM authorization_revocations WHERE user_id = ? AND source = 'contract'`,
+        [userId]
+      );
+      for (const row of localContractRows) {
+        if (!chainIds.has(row.authorization_id)) {
+          const removed = await this.deleteRevocation(userId, row.authorization_id, {
+            expectedSource: 'contract',
+            reason: 'contract sync: no revocation record on contract',
+            restoreState: true,
+          });
+          if (removed) deleted++;
+        }
+      }
+    }
+
+    if (synced > 0 || deleted > 0 || skippedUsers > 0) {
+      console.log(`[AuthorizationRevocation] contract sync: users=${userRows.length}, synced=${synced}, deleted=${deleted}, skippedUsers=${skippedUsers}`);
+    }
+    return { users: userRows.length, synced, deleted, skippedUsers };
+  }
+
   // ========== 签名防重放（GUID nonce） ==========
 
   /**
