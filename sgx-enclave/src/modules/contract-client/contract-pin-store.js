@@ -10,13 +10,18 @@
  *   - 钉住的合约不可达时，使用该快照作为最后已知配置，绝不回退到环境变量。
  *
  * 本表参与跨节点同步（HLC LWW），确保所有节点用同一份钉住数据。
- * 使用 ConnectionManager 的标准 readQuery / writeQuery 接口，
- * 与其它所有业务表走相同的数据库逻辑。
+ * 写操作统一走 SyncEngine 的 engine.write（统一事务 + 跨节点同步），不直接写库。
+ *
+ * 启动顺序例外：ContractClient 在 SyncEngine 创建之前就要 initialize 并首次
+ * 钉住（同步引擎的 peer 验证本身依赖钉住身份）。此时发生的 save/updateIdentity
+ * 先暂存（pending），setEngine() 注入引擎后立即用同一条统一通道补写落库；
+ * 进程在补写前崩溃则钉住丢失，但此时尚未对外服务，下次启动会重新读合约再钉。
  */
 
 const PIN_ROW_ID = 1;
 
 import { getMonotonicSqliteNow } from '../../utils/monotonic-clock.js';
+import { createConnProxy } from '../../sync/sync-adapter.js';
 
 export class ContractPinStore {
   /**
@@ -25,6 +30,27 @@ export class ContractPinStore {
   constructor(connMgr) {
     if (!connMgr) throw new Error('ContractPinStore requires a ConnectionManager instance');
     this._connMgr = connMgr;
+    this._engine = null;
+    this._pending = null;
+  }
+
+  /**
+   * 注入 SyncEngine（在 SyncManager 创建后由启动流程调用）。
+   * 注入前暂存的钉住写入会在此立即经统一通道补写落库。
+   * @param {import('@xnetx/raft-hlc-sync').SyncEngine} engine
+   */
+  async setEngine(engine) {
+    this._engine = engine;
+    if (this._pending) {
+      const pending = this._pending;
+      this._pending = null;
+      console.log('[ContractPinStore] engine injected, flushing pending pin write');
+      if (pending.mode === 'identity') {
+        await this._writeIdentity(pending.record);
+      } else {
+        await this._writeSave(pending.record);
+      }
+    }
   }
 
   /**
@@ -70,38 +96,61 @@ export class ContractPinStore {
    * @param {string} record.contractAddress
    * @param {Object|null} [record.snapshot] - 安全相关合约配置快照
    */
-  save(record) {
-    const { rpcUrl, chainId, contractAddress, allowNonRaTls, rpcTlsCaCert } = record;
+  async save(record) {
+    const { rpcUrl, chainId, contractAddress } = record;
     if (!rpcUrl || chainId == null || !contractAddress) {
       throw new Error('ContractPinStore.save: rpcUrl/chainId/contractAddress are all required');
     }
+    if (!this._engine) {
+      // SyncEngine 尚未注入（启动早期）：暂存，setEngine 后补写（见文件头说明）
+      this._pending = { mode: 'save', record };
+      console.log('[ContractPinStore] engine not ready, pin write queued');
+      return;
+    }
+    await this._writeSave(record);
+  }
+
+  /**
+   * save 的实际落库（单个 engine.write 事务内完成读判 + 写，避免两段式）
+   * @param {Object} record
+   */
+  async _writeSave(record) {
+    const { rpcUrl, chainId, contractAddress, allowNonRaTls, rpcTlsCaCert } = record;
     const snapshotJson = record.snapshot ? JSON.stringify(record.snapshot) : null;
     const allowNonRaTlsVal = allowNonRaTls ? 1 : 0;
     const caCert = rpcTlsCaCert || '';
 
-    const existing = this._connMgr.readQuery(
-      'SELECT rpc_url, chain_id, contract_address FROM pinned_contract WHERE id = ?',
-      [PIN_ROW_ID]
-    );
-
-    if (!existing || existing.length === 0) {
-      // 首次钉住
-      this._connMgr.writeQuery(
-        `INSERT INTO pinned_contract (id, rpc_url, chain_id, contract_address, allow_non_ra_tls, rpc_tls_ca_cert, snapshot_json, pinned_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [PIN_ROW_ID, rpcUrl, Number(chainId), contractAddress, allowNonRaTlsVal, caCert, snapshotJson, getMonotonicSqliteNow(), getMonotonicSqliteNow()]
+    let firstPin = false;
+    await this._engine.write(async (db) => {
+      const conn = createConnProxy(db);
+      const ts = this._engine.hlc.tick();
+      const existing = conn.query(
+        'SELECT rpc_url, chain_id, contract_address FROM pinned_contract WHERE id = ?',
+        [PIN_ROW_ID]
       );
+
+      if (!existing || existing.length === 0) {
+        // 首次钉住
+        firstPin = true;
+        conn.query(
+          `INSERT INTO pinned_contract (id, rpc_url, chain_id, contract_address, allow_non_ra_tls, rpc_tls_ca_cert, snapshot_json, pinned_at, updated_at, _hlc)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [PIN_ROW_ID, rpcUrl, Number(chainId), contractAddress, allowNonRaTlsVal, caCert, snapshotJson, getMonotonicSqliteNow(), getMonotonicSqliteNow(), ts]
+        );
+      } else {
+        // 已钉住：只更新快照，身份保持不变（即使传入的身份不同也忽略，防止被覆盖）
+        conn.query(
+          `UPDATE pinned_contract SET snapshot_json = ?, updated_at = ?, _hlc = ? WHERE id = ?`,
+          [snapshotJson, getMonotonicSqliteNow(), ts, PIN_ROW_ID]
+        );
+      }
+    });
+
+    if (firstPin) {
       console.log(
         `[ContractPinStore] pinned contract identity: rpcUrl=${rpcUrl}, chainId=${Number(chainId)}, address=${contractAddress}, allowNonRaTls=${!!allowNonRaTlsVal}, hasCaCert=${!!caCert}`
       );
-      return;
     }
-
-    // 已钉住：只更新快照，身份保持不变（即使传入的身份不同也忽略，防止被覆盖）
-    this._connMgr.writeQuery(
-      `UPDATE pinned_contract SET snapshot_json = ?, updated_at = ? WHERE id = ?`,
-      [snapshotJson, getMonotonicSqliteNow(), PIN_ROW_ID]
-    );
   }
 
   /**
@@ -115,28 +164,46 @@ export class ContractPinStore {
    * @param {string} record.contractAddress
    * @param {Object|null} [record.snapshot]
    */
-  updateIdentity(record) {
-    const { rpcUrl, chainId, contractAddress, allowNonRaTls, rpcTlsCaCert } = record;
+  async updateIdentity(record) {
+    const { rpcUrl, chainId, contractAddress } = record;
     if (!rpcUrl || chainId == null || !contractAddress) {
       throw new Error('ContractPinStore.updateIdentity: rpcUrl/chainId/contractAddress are all required');
     }
+    if (!this._engine) {
+      this._pending = { mode: 'identity', record };
+      console.log('[ContractPinStore] engine not ready, pin identity write queued');
+      return;
+    }
+    await this._writeIdentity(record);
+  }
+
+  /**
+   * updateIdentity 的实际落库（engine.write 统一通道）
+   * @param {Object} record
+   */
+  async _writeIdentity(record) {
+    const { rpcUrl, chainId, contractAddress, allowNonRaTls, rpcTlsCaCert } = record;
     const snapshotJson = record.snapshot ? JSON.stringify(record.snapshot) : null;
     const allowNonRaTlsVal = allowNonRaTls ? 1 : 0;
     const caCert = rpcTlsCaCert || '';
 
-    this._connMgr.writeQuery(
-      `INSERT INTO pinned_contract (id, rpc_url, chain_id, contract_address, allow_non_ra_tls, rpc_tls_ca_cert, snapshot_json, pinned_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-       ON CONFLICT(id) DO UPDATE SET
-         rpc_url = excluded.rpc_url,
-         chain_id = excluded.chain_id,
-         contract_address = excluded.contract_address,
-         allow_non_ra_tls = excluded.allow_non_ra_tls,
-         rpc_tls_ca_cert = excluded.rpc_tls_ca_cert,
-         snapshot_json = excluded.snapshot_json,
-         updated_at = ?`,
-      [PIN_ROW_ID, rpcUrl, Number(chainId), contractAddress, allowNonRaTlsVal, caCert, snapshotJson, getMonotonicSqliteNow(), getMonotonicSqliteNow(), getMonotonicSqliteNow()]
-    );
+    await this._engine.write(async (db) => {
+      const conn = createConnProxy(db);
+      conn.query(
+        `INSERT INTO pinned_contract (id, rpc_url, chain_id, contract_address, allow_non_ra_tls, rpc_tls_ca_cert, snapshot_json, pinned_at, updated_at, _hlc)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET
+           rpc_url = excluded.rpc_url,
+           chain_id = excluded.chain_id,
+           contract_address = excluded.contract_address,
+           allow_non_ra_tls = excluded.allow_non_ra_tls,
+           rpc_tls_ca_cert = excluded.rpc_tls_ca_cert,
+           snapshot_json = excluded.snapshot_json,
+           updated_at = excluded.updated_at,
+           _hlc = excluded._hlc`,
+        [PIN_ROW_ID, rpcUrl, Number(chainId), contractAddress, allowNonRaTlsVal, caCert, snapshotJson, getMonotonicSqliteNow(), getMonotonicSqliteNow(), this._engine.hlc.tick()]
+      );
+    });
     console.log(
       `[ContractPinStore] contract identity migrated to: rpcUrl=${rpcUrl}, chainId=${Number(chainId)}, address=${contractAddress}, allowNonRaTls=${!!allowNonRaTlsVal}, hasCaCert=${!!caCert}`
     );

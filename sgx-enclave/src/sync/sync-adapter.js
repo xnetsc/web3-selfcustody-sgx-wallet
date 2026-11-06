@@ -159,6 +159,15 @@ export const BUSINESS_TABLES = {
         keyColumns: ['id'],
         dataColumns: ['id', 'rpc_url', 'chain_id', 'contract_address', 'allow_non_ra_tls', 'rpc_tls_ca_cert', 'snapshot_json', 'pinned_at', 'updated_at', '_hlc'],
     },
+    account_freezes: {
+        keyColumns: ['user_id'],
+        dataColumns: ['user_id', 'credential_id', 'frozen_at', 'freeze_until', 'status', 'lifted_at', '_hlc'],
+    },
+    webauthn_challenges: {
+        // id 是节点本地自增主键，不参与同步；以全局唯一的 challenge 字符串为同步键
+        keyColumns: ['challenge'],
+        dataColumns: ['challenge', 'user_id', 'purpose', 'credential_id', 'created_at', 'expires_at', '_hlc'],
+    },
 };
 
 /**

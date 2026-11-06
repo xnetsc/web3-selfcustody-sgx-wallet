@@ -135,7 +135,7 @@ export async function verifyWebAuthnSignature(params) {
   if (params.challengeManager) {
     if (params.rawChallenge && params.userIntentJson) {
       // 模式1：有 rawChallenge + userIntentJson，验证 rawChallenge 存在性，计算 intentHash
-      const challengeResult = params.challengeManager.verifyAndConsumeChallenge(
+      const challengeResult = await params.challengeManager.verifyAndConsumeChallenge(
         params.rawChallenge,
         params.userId,
         params.purpose
@@ -148,7 +148,7 @@ export async function verifyWebAuthnSignature(params) {
     } else if (params.rawChallenge) {
       // 模式1b：只有 rawChallenge，无 userIntentJson（register/authenticate 场景）
       // clientDataJSON 中的 challenge 直接是 rawChallenge
-      const challengeResult = params.challengeManager.verifyAndConsumeChallenge(
+      const challengeResult = await params.challengeManager.verifyAndConsumeChallenge(
         params.rawChallenge,
         params.userId,
         params.purpose
@@ -163,7 +163,7 @@ export async function verifyWebAuthnSignature(params) {
       if (!clientChallenge) {
         return { verified: false, reason: 'challenge not found in clientDataJSON' };
       }
-      const challengeResult = params.challengeManager.verifyAndConsumeChallenge(
+      const challengeResult = await params.challengeManager.verifyAndConsumeChallenge(
         clientChallenge,
         params.userId,
         params.purpose

@@ -27,6 +27,7 @@
 
 import crypto from 'crypto';
 import { getMonotonicDate, getMonotonicSqliteNow, getMonotonicSqliteAfter } from '../../utils/monotonic-clock.js';
+import { createConnProxy } from '../../sync/sync-adapter.js';
 
 /**
  * 默认 TTL：5 分钟
@@ -47,15 +48,24 @@ export function computeIntentHash(rawChallenge, userIntentJson) {
 
 export class WebAuthnChallengeManager {
   /**
+   * 所有写操作统一走 SyncEngine 的 engine.write（统一事务 + 跨节点同步），
+   * 不直接写数据库：webauthn_challenges 已注册为同步业务表（同步键为 challenge
+   * 字符串，节点本地自增 id 不参与同步），直写将绕过同步逻辑。
+   *
    * @param {import('../../database/connection-manager.js').default} connectionManager
+   * @param {import('@xnetx/raft-hlc-sync').SyncEngine} engine
    * @param {Object} options
    * @param {number} options.challengeTtlSeconds - 挑战值 TTL，默认 300 秒
    */
-  constructor(connectionManager, options = {}) {
+  constructor(connectionManager, engine, options = {}) {
     if (!connectionManager) {
       throw new Error('WebAuthnChallengeManager requires a ConnectionManager instance');
     }
+    if (!engine) {
+      throw new Error('WebAuthnChallengeManager requires a SyncEngine instance');
+    }
     this._db = connectionManager;
+    this._engine = engine;
     this._ttlSeconds = options.challengeTtlSeconds || DEFAULT_CHALLENGE_TTL_SECONDS;
   }
 
@@ -69,7 +79,7 @@ export class WebAuthnChallengeManager {
    * @param {string} [credentialId] - 可选，关联的凭证 ID
    * @returns {{ challenge: string, expiresAt: string }} 生成成功后的挑战值和过期时间
    */
-  createChallenge(userId, purpose, credentialId = null) {
+  async createChallenge(userId, purpose, credentialId = null) {
     if (!userId) {
       throw new Error('userId is required');
     }
@@ -82,11 +92,14 @@ export class WebAuthnChallengeManager {
     // 所有 purpose：challenge = 随机 32 字节
     const challenge = crypto.randomBytes(32).toString('base64url');
 
-    this._db.writeQuery(
-      `INSERT INTO webauthn_challenges (challenge, user_id, purpose, credential_id, created_at, expires_at)
-       VALUES (?, ?, ?, ?, ?, ?)`,
-      [challenge, userId, purpose, credentialId, getMonotonicSqliteNow(), expiresAt]
-    );
+    await this._engine.write(async (db) => {
+      const conn = createConnProxy(db);
+      conn.query(
+        `INSERT INTO webauthn_challenges (challenge, user_id, purpose, credential_id, created_at, expires_at, _hlc)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        [challenge, userId, purpose, credentialId, getMonotonicSqliteNow(), expiresAt, this._engine.hlc.tick()]
+      );
+    }, userId);
 
     console.log(`[WebAuthnChallengeManager] Created challenge for userId=${userId}, purpose=${purpose}, expiresAt=${expiresAt}`);
 
@@ -143,8 +156,11 @@ export class WebAuthnChallengeManager {
    * 与 findChallenge 配合使用
    * @param {number} id - 挑战值记录 ID
    */
-  consumeChallengeById(id) {
-    this._db.writeQuery(`DELETE FROM webauthn_challenges WHERE id = ?`, [id]);
+  async consumeChallengeById(id) {
+    await this._engine.write(async (db) => {
+      const conn = createConnProxy(db);
+      conn.query(`DELETE FROM webauthn_challenges WHERE id = ?`, [id]);
+    });
     console.log(`[WebAuthnChallengeManager] Challenge consumed by id=${id}`);
   }
 
@@ -161,7 +177,7 @@ export class WebAuthnChallengeManager {
    * @param {string} [purpose] - 可选，期望的用途
    * @returns {{ valid: boolean, reason: string, userId?: string, purpose?: string, credentialId?: string }}
    */
-  verifyAndConsumeChallenge(rawChallenge, userId = null, purpose = null) {
+  async verifyAndConsumeChallenge(rawChallenge, userId = null, purpose = null) {
     if (!rawChallenge) {
       return { valid: false, reason: 'challenge is required' };
     }
@@ -192,10 +208,13 @@ export class WebAuthnChallengeManager {
     }
 
     // 删除挑战值（一次性使用）
-    this._db.writeQuery(
-      `DELETE FROM webauthn_challenges WHERE id = ?`,
-      [row.id]
-    );
+    await this._engine.write(async (db) => {
+      const conn = createConnProxy(db);
+      conn.query(
+        `DELETE FROM webauthn_challenges WHERE id = ?`,
+        [row.id]
+      );
+    }, row.user_id);
 
     console.log(`[WebAuthnChallengeManager] Challenge verified and consumed: userId=${row.user_id}, purpose=${row.purpose}`);
 
@@ -212,15 +231,20 @@ export class WebAuthnChallengeManager {
    * 清理过期的挑战值
    * @returns {number} 删除的记录数
    */
-  cleanExpiredChallenges() {
-    const result = this._db.writeQuery(
-      `DELETE FROM webauthn_challenges WHERE expires_at < ?`,
-      [getMonotonicSqliteNow()]
-    );
-    if (result.changes > 0) {
-      console.log(`[WebAuthnChallengeManager] Cleaned ${result.changes} expired challenges`);
+  async cleanExpiredChallenges() {
+    let changes = 0;
+    await this._engine.write(async (db) => {
+      const conn = createConnProxy(db);
+      const result = conn.query(
+        `DELETE FROM webauthn_challenges WHERE expires_at < ?`,
+        [getMonotonicSqliteNow()]
+      );
+      changes = result?.changes || 0;
+    });
+    if (changes > 0) {
+      console.log(`[WebAuthnChallengeManager] Cleaned ${changes} expired challenges`);
     }
-    return result.changes;
+    return changes;
   }
 
   /**

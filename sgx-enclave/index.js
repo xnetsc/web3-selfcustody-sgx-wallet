@@ -287,9 +287,11 @@ async function main() {
 
   // 8. 创建模块实例
   const engine = syncManager.engine;
+  // 钉住存储改走统一通道：注入引擎，并补写启动早期暂存的首次钉住
+  await pinStore.setEngine(engine);
   const whitelistVerifier = new WhitelistVerifier(contractClient);
   const passkeyManager = new PasskeyManager(connectionManager, engine);
-  const challengeManager = new WebAuthnChallengeManager(connectionManager);
+  const challengeManager = new WebAuthnChallengeManager(connectionManager, engine);
   // 冻结时长：仅来自合约 runtimeParams.security.freezeDurationSeconds，缺失时默认 259200 秒（72 小时）
   // 使用动态获取函数，确保合约配置变更后新冻结使用最新的冻结时长
   // 已冻结账户的 freeze_until 在冻结时已写入数据库，不受后续配置变更影响
@@ -299,7 +301,7 @@ async function main() {
     const duration = parseFloat(security.freezeDurationSeconds) || 259200;
     return duration;
   };
-  const accountFreezeManager = new AccountFreezeManager(connectionManager, { freezeDurationSeconds: getFreezeDurationSeconds });
+  const accountFreezeManager = new AccountFreezeManager(connectionManager, engine, { freezeDurationSeconds: getFreezeDurationSeconds });
   const initialDuration = getFreezeDurationSeconds();
   console.log(`[SGX Enclave] Account freeze duration: ${initialDuration}s (dynamic, source: contract > env > default)`);
   const walletManager = new WalletManager(connectionManager, engine);
@@ -415,8 +417,8 @@ async function main() {
   const cleanupIntervalMs = (sessionConfig.cleanupIntervalSeconds || 3600) * 1000;
   const cleanupTimer = setInterval(async () => {
     try {
-      cleanExpiredSessions(connectionManager);
-      cleanExpiredExportSessions(connectionManager);
+      await cleanExpiredSessions(engine);
+      await cleanExpiredExportSessions(engine);
       // 合约撤销同步：把链上撤销记录全量同步进本地库（source='contract'），
       // 同一次同步中删除链上已不存在的 contract 缓存（platform 来源记录不参与删除）
       await stateManager.syncRevocationsFromContract(contractClient);
@@ -426,7 +428,7 @@ async function main() {
       // （须在撤销同步之后：同步删除错误缓存时可能把状态恢复 active，不应当作失效缓存清理）
       await stateManager.cleanInvalidatedStates();
       // 清理过期的 WebAuthn 挑战值
-      challengeManager.cleanExpiredChallenges();
+      await challengeManager.cleanExpiredChallenges();
       // 检查合约 NTP 配置是否变更，变更则重新校正单调时钟
       const latestParams = contractClient.getRuntimeParams() || {};
       const latestNtp = latestParams.security?.ntpServers;

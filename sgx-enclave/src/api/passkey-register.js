@@ -244,7 +244,7 @@ export class PasskeyRegisterHandler {
       // 场景A：无 Passkey，使用 purpose=register 的挑战值，直接绑定新 Passkey
       // challenge1 是纯随机数，直接验证并消费
       // 若 userId 未提供，从 challenge 记录中获取（不传 userId 给 verifyAndConsumeChallenge）
-      const challengeResult = this._challenge.verifyAndConsumeChallenge(
+      const challengeResult = await this._challenge.verifyAndConsumeChallenge(
         challenge1,
         finalUserId,  // 若为 null，则不验证 userId，从 challenge 记录中获取
         'register'
@@ -341,7 +341,7 @@ export class PasskeyRegisterHandler {
         console.log(`[PasskeyRegister] handleComplete: contract recovery entry found, uuid=${recoveryEntry.uuid}, proceeding with OWNER force recovery (overrides frozenReplacement=${isFrozenReplacement}, scenarioB=${!hasNoPasskeys && !isPotentialRecovery})`);
         // 若本次提交走的是场景B的 challenge（register_passkey），在此消费掉，避免残留
         if (challenge1DbId) {
-          this._challenge.consumeChallengeById(challenge1DbId);
+          await this._challenge.consumeChallengeById(challenge1DbId);
           challenge1DbId = null;
         }
       }
@@ -386,7 +386,7 @@ export class PasskeyRegisterHandler {
       console.log(`[PasskeyRegister] handleComplete: existing Passkey signature verified, new Passkey binding confirmed`);
 
       // 消费 challenge1（从 DB 删除）
-      this._challenge.consumeChallengeById(challenge1DbId);
+      await this._challenge.consumeChallengeById(challenge1DbId);
     }
 
     // 8. 注册/替换 Passkey（存储 COSE 格式公钥）
@@ -420,18 +420,18 @@ export class PasskeyRegisterHandler {
     let stateNormalized = false;
     if (isRecovery) {
       // 9a. Owner 恢复：状态归一化
-      this._accountFreeze.clearFreeze(finalUserId);
+      await this._accountFreeze.clearFreeze(finalUserId);
       stateNormalized = true;
       console.log(`[PasskeyRegister] handleComplete: OWNER recovery state normalized (freeze cleared), userId=${finalUserId}, uuid=${recoveryEntry.uuid}`);
     } else if (isFrozenReplacement) {
       // 9b. 冻结替换：重置冻结（新 credentialId + 重新计算 72h）
-      freezeResult = this._accountFreeze.resetFreeze(finalUserId, credentialId);
+      freezeResult = await this._accountFreeze.resetFreeze(finalUserId, credentialId);
       console.log(`[PasskeyRegister] handleComplete: frozen account passkey REPLACED, userId=${finalUserId}, new freezeUntil=${freezeResult.freezeUntil}`);
     } else if (isExistingAccount && hasNoPasskeys) {
       // 9c. 场景A补绑：若该 userId 下有钱包（助记词或纯私钥），则冻结账户 72 小时
       const wallets = await this._wallet.listWallets(finalUserId);
       if (wallets.length > 0) {
-        freezeResult = this._accountFreeze.freezeAccount(finalUserId, credentialId);
+        freezeResult = await this._accountFreeze.freezeAccount(finalUserId, credentialId);
         console.log(`[PasskeyRegister] handleComplete: account FROZEN, userId=${finalUserId}, freezeUntil=${freezeResult.freezeUntil}`);
       }
     }

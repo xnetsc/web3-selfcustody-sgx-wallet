@@ -19,6 +19,7 @@
  */
 
 import { getMonotonicDate, getMonotonicSqliteNow } from '../../utils/monotonic-clock.js';
+import { createConnProxy } from '../../sync/sync-adapter.js';
 
 /**
  * 默认冻结时长（秒），72 小时 = 259200 秒
@@ -27,18 +28,26 @@ const DEFAULT_FREEZE_DURATION_SECONDS = 259200;
 
 export class AccountFreezeManager {
   /**
+   * 所有写操作统一走 SyncEngine 的 engine.write（统一事务 + 跨节点同步），
+   * 不直接写数据库：account_freezes 已注册为同步业务表，直写将绕过同步逻辑。
+   *
    * @param {import('../../database/connection-manager.js').default} connectionManager
+   * @param {import('@xnetx/raft-hlc-sync').SyncEngine} engine
    * @param {Object} options
    * @param {number|function():number} options.freezeDurationSeconds - 冻结时长（秒），支持固定值或动态获取函数
    *   - 固定值：直接使用（如 259200）
    *   - 函数：每次冻结时调用，获取最新配置（如 () => contractClient.getFreezeDuration()）
    *   - 默认值：259200 秒（72 小时）
    */
-  constructor(connectionManager, options = {}) {
+  constructor(connectionManager, engine, options = {}) {
     if (!connectionManager) {
       throw new Error('AccountFreezeManager requires a ConnectionManager instance');
     }
+    if (!engine) {
+      throw new Error('AccountFreezeManager requires a SyncEngine instance');
+    }
     this._db = connectionManager;
+    this._engine = engine;
     this._freezeDurationSeconds = options.freezeDurationSeconds || DEFAULT_FREEZE_DURATION_SECONDS;
   }
 
@@ -63,7 +72,7 @@ export class AccountFreezeManager {
    * @param {string} credentialId - 触发冻结的 Passkey 凭证 ID
    * @returns {{ userId: string, credentialId: string, frozenAt: string, freezeUntil: string }}
    */
-  freezeAccount(userId, credentialId) {
+  async freezeAccount(userId, credentialId) {
     if (!userId) throw new Error('userId is required');
     if (!credentialId) throw new Error('credentialId is required');
 
@@ -91,19 +100,23 @@ export class AccountFreezeManager {
     const frozenAtStr = frozenAt.toISOString().slice(0, 19).replace('T', ' ');
     const freezeUntilStr = freezeUntil.toISOString().slice(0, 19).replace('T', ' ');
 
-    if (existing.length > 0) {
-      // 已有记录但状态为 lifted，更新为 frozen
-      this._db.writeQuery(
-        `UPDATE account_freezes SET credential_id = ?, frozen_at = ?, freeze_until = ?, status = 'frozen', lifted_at = NULL WHERE user_id = ?`,
-        [credentialId, frozenAtStr, freezeUntilStr, userId]
-      );
-    } else {
-      // 插入新冻结记录
-      this._db.writeQuery(
-        `INSERT INTO account_freezes (user_id, credential_id, frozen_at, freeze_until, status) VALUES (?, ?, ?, ?, 'frozen')`,
-        [userId, credentialId, frozenAtStr, freezeUntilStr]
-      );
-    }
+    await this._engine.write(async (db) => {
+      const conn = createConnProxy(db);
+      const ts = this._engine.hlc.tick();
+      if (existing.length > 0) {
+        // 已有记录但状态为 lifted，更新为 frozen
+        conn.query(
+          `UPDATE account_freezes SET credential_id = ?, frozen_at = ?, freeze_until = ?, status = 'frozen', lifted_at = NULL, _hlc = ? WHERE user_id = ?`,
+          [credentialId, frozenAtStr, freezeUntilStr, ts, userId]
+        );
+      } else {
+        // 插入新冻结记录
+        conn.query(
+          `INSERT INTO account_freezes (user_id, credential_id, frozen_at, freeze_until, status, _hlc) VALUES (?, ?, ?, ?, 'frozen', ?)`,
+          [userId, credentialId, frozenAtStr, freezeUntilStr, ts]
+        );
+      }
+    }, userId);
 
     console.log(`[AccountFreeze] freezeAccount: userId=${userId} frozen until ${freezeUntilStr} (${freezeDurationSeconds}s), credentialId=${credentialId}`);
 
@@ -179,7 +192,7 @@ export class AccountFreezeManager {
    * @param {string} newCredentialId - 新的 Passkey 凭证 ID
    * @returns {{ reset: boolean, userId: string, credentialId: string, frozenAt: string, freezeUntil: string }}
    */
-  resetFreeze(userId, newCredentialId) {
+  async resetFreeze(userId, newCredentialId) {
     if (!userId) throw new Error('userId is required');
     if (!newCredentialId) throw new Error('newCredentialId is required');
 
@@ -200,10 +213,13 @@ export class AccountFreezeManager {
     const frozenAtStr = frozenAt.toISOString().slice(0, 19).replace('T', ' ');
     const freezeUntilStr = freezeUntil.toISOString().slice(0, 19).replace('T', ' ');
 
-    this._db.writeQuery(
-      `UPDATE account_freezes SET credential_id = ?, frozen_at = ?, freeze_until = ?, lifted_at = NULL WHERE user_id = ? AND status = 'frozen'`,
-      [newCredentialId, frozenAtStr, freezeUntilStr, userId]
-    );
+    await this._engine.write(async (db) => {
+      const conn = createConnProxy(db);
+      conn.query(
+        `UPDATE account_freezes SET credential_id = ?, frozen_at = ?, freeze_until = ?, lifted_at = NULL, _hlc = ? WHERE user_id = ? AND status = 'frozen'`,
+        [newCredentialId, frozenAtStr, freezeUntilStr, this._engine.hlc.tick(), userId]
+      );
+    }, userId);
 
     console.log(`[AccountFreeze] resetFreeze: userId=${userId} freeze reset until ${freezeUntilStr} (${freezeDurationSeconds}s), newCredentialId=${newCredentialId}`);
 
@@ -224,15 +240,20 @@ export class AccountFreezeManager {
    * @param {string} userId - 用户 ID
    * @returns {{ cleared: boolean, userId: string }}
    */
-  clearFreeze(userId) {
+  async clearFreeze(userId) {
     if (!userId) throw new Error('userId is required');
 
-    const result = this._db.writeQuery(
-      `DELETE FROM account_freezes WHERE user_id = ?`,
-      [userId]
-    );
+    let changes = 0;
+    await this._engine.write(async (db) => {
+      const conn = createConnProxy(db);
+      const result = conn.query(
+        `DELETE FROM account_freezes WHERE user_id = ?`,
+        [userId]
+      );
+      changes = result?.changes || 0;
+    }, userId);
 
-    if (result.changes > 0) {
+    if (changes > 0) {
       console.log(`[AccountFreeze] clearFreeze: userId=${userId} freeze record cleared (owner recovery)`);
       return { cleared: true, userId };
     }
@@ -247,17 +268,22 @@ export class AccountFreezeManager {
    * @param {string} userId - 用户 ID
    * @returns {{ lifted: boolean, userId: string }}
    */
-  liftFreeze(userId) {
+  async liftFreeze(userId) {
     if (!userId) throw new Error('userId is required');
 
     const now = getMonotonicSqliteNow();
 
-    const result = this._db.writeQuery(
-      `UPDATE account_freezes SET status = 'lifted', lifted_at = ? WHERE user_id = ? AND status = 'frozen'`,
-      [now, userId]
-    );
+    let changes = 0;
+    await this._engine.write(async (db) => {
+      const conn = createConnProxy(db);
+      const result = conn.query(
+        `UPDATE account_freezes SET status = 'lifted', lifted_at = ?, _hlc = ? WHERE user_id = ? AND status = 'frozen'`,
+        [now, this._engine.hlc.tick(), userId]
+      );
+      changes = result?.changes || 0;
+    }, userId);
 
-    if (result.changes > 0) {
+    if (changes > 0) {
       console.log(`[AccountFreeze] liftFreeze: userId=${userId} freeze lifted at ${now}`);
       return { lifted: true, userId };
     }

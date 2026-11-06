@@ -135,7 +135,7 @@ export class ChallengeHandler {
       // register：userId 可选，不需要 Passkey 归属验证
       const userId = req.userId || `user-${uuidv4()}`;
 
-      const { challenge, expiresAt } = this._challenge.createChallenge(userId, purpose);
+      const { challenge, expiresAt } = await this._challenge.createChallenge(userId, purpose);
 
       console.log(`[Challenge] handleChallenge: success, purpose=${purpose}, userId=${userId}`);
 
@@ -157,7 +157,7 @@ export class ChallengeHandler {
       }
 
       // 6. 生成纯随机挑战值（不绑定业务意图）
-      const { challenge, expiresAt } = this._challenge.createChallenge(
+      const { challenge, expiresAt } = await this._challenge.createChallenge(
         req.userId,
         purpose,
         req.credentialId

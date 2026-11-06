@@ -373,7 +373,7 @@ function wrap(fn, accountFreezeManager, syncManager, getPath, options = {}) {
           const payload = JSON.parse(req.body.payload);
           const { userId } = _extractFreezeCheckFields(payload);
           if (userId) {
-            accountFreezeManager.liftFreeze(userId);
+            await accountFreezeManager.liftFreeze(userId);
             console.log(`[FreezeCheck] Account unfrozen after successful passkey-signed request: userId=${userId}`);
           }
         } catch (parseErr) {

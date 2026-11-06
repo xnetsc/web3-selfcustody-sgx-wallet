@@ -339,18 +339,23 @@ export function dropAllTables(db) {
 
 /**
  * 清理过期的导入会话
- * @param {import('./connection-manager.js').default} connectionManager
- * @returns {number} 删除的记录数
+ * 统一走 SyncEngine 的 engine.write（统一事务 + 跨节点同步），不直接写库。
+ * @param {import('@xnetx/raft-hlc-sync').SyncEngine} engine
+ * @returns {Promise<number>} 删除的记录数
  */
-export function cleanExpiredSessions(connectionManager) {
-    const result = connectionManager.writeQuery(
-        "DELETE FROM import_sessions WHERE expires_at < ?",
-        [getMonotonicSqliteNow()]
-    );
-    if (result.changes > 0) {
-        console.log(`Cleaned ${result.changes} expired import sessions.`);
+export async function cleanExpiredSessions(engine) {
+    let changes = 0;
+    await engine.write(async (db) => {
+        const result = db.run(
+            "DELETE FROM import_sessions WHERE expires_at < ?",
+            [getMonotonicSqliteNow()]
+        );
+        changes = result?.changes || 0;
+    });
+    if (changes > 0) {
+        console.log(`Cleaned ${changes} expired import sessions.`);
     }
-    return result.changes;
+    return changes;
 }
 
 /**
@@ -359,32 +364,42 @@ export function cleanExpiredSessions(connectionManager) {
  * 钱包删除只在 confirmExport（客户端主动确认已收到加密数据）时执行。
  * TTL 过期只清理会话记录，避免因 HTTP 响应未到达客户端而导致私钥/助记词丢失。
  *
- * @param {import('./connection-manager.js').default} connectionManager
- * @returns {number} 删除的会话数
+ * 统一走 SyncEngine 的 engine.write（统一事务 + 跨节点同步），不直接写库。
+ * @param {import('@xnetx/raft-hlc-sync').SyncEngine} engine
+ * @returns {Promise<number>} 删除的会话数
  */
-export function cleanExpiredExportSessions(connectionManager) {
-    const result = connectionManager.writeQuery(
-        "DELETE FROM export_sessions WHERE expires_at < ?",
-        [getMonotonicSqliteNow()]
-    );
-    if (result.changes > 0) {
-        console.log(`Cleaned ${result.changes} expired export sessions (wallets preserved).`);
+export async function cleanExpiredExportSessions(engine) {
+    let changes = 0;
+    await engine.write(async (db) => {
+        const result = db.run(
+            "DELETE FROM export_sessions WHERE expires_at < ?",
+            [getMonotonicSqliteNow()]
+        );
+        changes = result?.changes || 0;
+    });
+    if (changes > 0) {
+        console.log(`Cleaned ${changes} expired export sessions (wallets preserved).`);
     }
-    return result.changes;
+    return changes;
 }
 
 /**
  * 清理过期的 WebAuthn 挑战值
- * @param {import('./connection-manager.js').default} connectionManager
- * @returns {number} 删除的记录数
+ * 统一走 SyncEngine 的 engine.write（统一事务 + 跨节点同步），不直接写库。
+ * @param {import('@xnetx/raft-hlc-sync').SyncEngine} engine
+ * @returns {Promise<number>} 删除的记录数
  */
-export function cleanExpiredWebAuthnChallenges(connectionManager) {
-    const result = connectionManager.writeQuery(
-        "DELETE FROM webauthn_challenges WHERE expires_at < ?",
-        [getMonotonicSqliteNow()]
-    );
-    if (result.changes > 0) {
-        console.log(`[Schema] Cleaned ${result.changes} expired webauthn challenges.`);
+export async function cleanExpiredWebAuthnChallenges(engine) {
+    let changes = 0;
+    await engine.write(async (db) => {
+        const result = db.run(
+            "DELETE FROM webauthn_challenges WHERE expires_at < ?",
+            [getMonotonicSqliteNow()]
+        );
+        changes = result?.changes || 0;
+    });
+    if (changes > 0) {
+        console.log(`[Schema] Cleaned ${changes} expired webauthn challenges.`);
     }
-    return result.changes;
+    return changes;
 }

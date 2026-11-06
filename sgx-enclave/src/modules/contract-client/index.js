@@ -212,7 +212,7 @@ export class ContractClient {
     //    例外：从未配置合约且无 pin 记录时（首次裸启动），允许从 env RUNTIME_PARAMS 启动，
     //    但必须包含必须参数，否则报错退出。
     if (contractData) {
-      this._applyContractData(contractData);
+      await this._applyContractData(contractData);
     } else if (!this._pinned && !this._rpcUrl && !this._chainId && !this._contractAddress) {
       // 无合约配置且无 pin → 首次裸启动，从 env RUNTIME_PARAMS 加载
       this._loadFromEnv();
@@ -248,7 +248,7 @@ export class ContractClient {
     if (!this._contract) return;
     const contractData = await this._readContractData();
     this._contractAvailable = true;
-    this._applyContractData(contractData);
+    await this._applyContractData(contractData);
   }
 
   /**
@@ -308,9 +308,9 @@ export class ContractClient {
    * 仅在成功读到合约数据时调用（contractData 非空）。
    * @param {Object} contractData - 从合约读取的数据
    */
-  _applyContractData(contractData) {
+  async _applyContractData(contractData) {
     this._buildCache(contractData, true);
-    this._savePin(contractData);
+    await this._savePin(contractData);
 
     // 合约迁移：当前合约声明了迁移目标（rpcUrl + contractAddress + chainId）
     if (contractData.migration) {
@@ -494,12 +494,12 @@ export class ContractClient {
    * 身份一旦钉住不可更改（由 ContractPinStore 保证）。
    * @param {Object} contractData - 成功读到的合约数据（作为最后已知快照）
    */
-  _savePin(contractData) {
+  async _savePin(contractData) {
     if (!this._pinStore) return;
     try {
       const allowNonRaTls = !!(contractData.runtimeParams?.attestation?.allowNonRaTls);
       const rpcTlsCaCert = contractData.rpcTlsCaCert || this._rpcTlsCaCert || '';
-      this._pinStore.save({
+      await this._pinStore.save({
         rpcUrl: this._rpcUrl,
         chainId: this._chainId,
         contractAddress: this._contractAddress,
@@ -976,7 +976,7 @@ export class ContractClient {
       try {
         const allowNonRaTls = !!(newData.runtimeParams?.attestation?.allowNonRaTls);
         const rpcTlsCaCert = newData.rpcTlsCaCert || migration.rpcTlsCaCert || '';
-        this._pinStore.updateIdentity({
+        await this._pinStore.updateIdentity({
           rpcUrl: migration.rpcUrl,
           chainId: migration.chainId,
           contractAddress: migration.contractAddress,
