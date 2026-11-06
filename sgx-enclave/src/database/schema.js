@@ -1,9 +1,12 @@
 /**
  * 数据库 Schema 定义和初始化（SQLite 版本）
- * 8 张业务表 + 2 张同步表
- * accounts, passkeys, wallets, authorization_states, authorization_token_states,
- * authorization_records, import_sessions, export_sessions,
- * _sync_log, _sync_peers
+ * 只定义业务表：accounts, passkeys, wallets, authorization_states,
+ * authorization_token_states, authorization_records, authorization_revocations,
+ * import_sessions, export_sessions, tx_sign_nonces, webauthn_challenges,
+ * account_freezes, pinned_contract。
+ * 同步基础设施表（_sync_log、_sync_peers、_tombstones、_full_sync_*）
+ * 由 SyncEngine 在启动时统一创建，app 侧不预建，避免预建形状与引擎
+ * 现行 DDL 不一致时被 IF NOT EXISTS 抢先占位。
  */
 
 import { DB_PATH } from './constants.js';
@@ -251,38 +254,7 @@ CREATE TABLE IF NOT EXISTS pinned_contract (
     _hlc TEXT NOT NULL DEFAULT '0'
 )`;
 
-// ========== 同步表 ==========
-
-export const CREATE_SYNC_LOG_SQL = `
-CREATE TABLE IF NOT EXISTS _sync_log (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    table_name TEXT NOT NULL,
-    operation TEXT NOT NULL CHECK (operation IN ('INSERT', 'UPDATE', 'DELETE')),
-    row_key TEXT NOT NULL,
-    row_data TEXT,
-    _hlc TEXT NOT NULL,
-    created_at TEXT NOT NULL DEFAULT (datetime('now'))
-)`;
-
-export const CREATE_SYNC_LOG_INDEXES_SQL = [
-    `CREATE INDEX IF NOT EXISTS idx_sync_log_id ON _sync_log (id)`,
-];
-
-export const CREATE_SYNC_PEERS_SQL = `
-CREATE TABLE IF NOT EXISTS _sync_peers (
-    peer_url TEXT NOT NULL,
-    last_sync_id INTEGER NOT NULL DEFAULT 0,
-    last_sync_at TEXT,
-    PRIMARY KEY (peer_url)
-)`;
-
-export const CREATE_TOMBSTONES_SQL = `
-CREATE TABLE IF NOT EXISTS _tombstones (
-    table_name TEXT NOT NULL,
-    row_key TEXT NOT NULL,
-    _hlc TEXT NOT NULL,
-    PRIMARY KEY (table_name, row_key)
-)`;
+// 同步基础设施表不在此定义：统一由 SyncEngine 的 initSchema 按其方言 DDL 创建。
 
 // 所有建表 SQL 按创建顺序排列
 export const ALL_TABLE_SQLS = [
@@ -299,9 +271,6 @@ export const ALL_TABLE_SQLS = [
     { name: 'webauthn_challenges', sql: CREATE_WEBAUTHN_CHALLENGES_SQL, indexes: CREATE_WEBAUTHN_CHALLENGES_INDEXES_SQL },
     { name: 'account_freezes', sql: CREATE_ACCOUNT_FREEZES_SQL, indexes: CREATE_ACCOUNT_FREEZES_INDEXES_SQL },
     { name: 'pinned_contract', sql: CREATE_PINNED_CONTRACT_SQL, indexes: [] },
-    { name: '_sync_log', sql: CREATE_SYNC_LOG_SQL, indexes: CREATE_SYNC_LOG_INDEXES_SQL },
-    { name: '_sync_peers', sql: CREATE_SYNC_PEERS_SQL, indexes: [] },
-    { name: '_tombstones', sql: CREATE_TOMBSTONES_SQL, indexes: [] },
 ];
 
 /**
@@ -326,7 +295,7 @@ export function initializeSchema(db) {
 }
 
 /**
- * 删除所有表（测试用）
+ * 删除所有业务表（测试用；同步基础设施表归 SyncEngine 管理，不在此列）
  * @param {import('better-sqlite3').Database} db - better-sqlite3 数据库实例
  */
 export function dropAllTables(db) {
