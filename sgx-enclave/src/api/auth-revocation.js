@@ -167,7 +167,9 @@ export class AuthRevocationHandler {
     // 5. 确定授权原文记录（到期时间与哈希的可信来源）
     const authorizationRecord = await this._resolveAuthorizationRecord(payload, { userId, authorizationId, grantee });
 
-    // 6. 落库（source=platform），并同步授权状态
+    // 6. 落库（source=platform），并同步授权状态；无已存授权原文时，
+    //    授权原文与撤销记录在同一个事务内写入（同事务前置回调），不存在只成功一半
+    const toSave = authorizationRecord.authorizationToSave;
     const stored = await this._state.recordRevocation({
       userId,
       authorizationId,
@@ -175,7 +177,9 @@ export class AuthRevocationHandler {
       source: 'platform',
       authorizationExpiresAt: authorizationRecord.authorizationJson?.timePolicy?.deadline || null,
       authorizationHash: authorizationRecord.authorizationHash,
-    });
+    }, toSave
+      ? (conn) => this._state._saveAuthorizationRecordInTransaction(conn, userId, authorizationId, toSave.grantee, toSave.authorizationJson, authorizationRecord.authorizationHash)
+      : null);
 
     console.log(`[AuthRevocation] handleRevoke: recorded platform revocation for userId=${userId}, authorizationId=${authorizationId}`);
 
@@ -309,7 +313,7 @@ export class AuthRevocationHandler {
    * 解析可信的授权原文记录：
    *   - SGX 已存记录优先；请求另附 authorizationJson 时必须与已存记录哈希一致；
    *   - 无已存记录时，必须随附 authorizationJson + 原授权的 WebAuthn 签名，
-   *     验签通过后存入 authorization_records 再使用。
+   *     验签通过后经 authorizationToSave 交由调用方与撤销记录同事务落库。
    * 同时校验授权原文的 grantee 包含本次撤销的 grantee。
    *
    * @param {Object} payload
@@ -377,15 +381,17 @@ export class AuthRevocationHandler {
       throw new Error(`Authorization signature verification failed: ${sigResult.reason}`);
     }
 
-    // 验签通过，存入授权原文记录（与签名流程保存的记录同构）
+    // 验签通过。授权原文不在此处单独落库：由 handleRevoke 把它与撤销记录
+    // 放进同一个事务写入（见 authorizationToSave），避免只成功一半
+    // （授权存了、撤销没记上，或反过来）
     const granteeList = Array.isArray(auth.grantee) ? auth.grantee : [auth.grantee];
-    await this._state.saveAuthorizationRecord(userId, authorizationId, granteeList, authForValidation, authorizationHash);
 
     return {
       grantee: granteeList,
       authorizationJson: authForValidation,
       authorizationHash,
       createdAt: null,
+      authorizationToSave: { grantee: granteeList, authorizationJson: authForValidation },
     };
   }
 

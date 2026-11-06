@@ -659,9 +659,12 @@ export class StateManager {
    * @param {string} [record.revokedAt] - 撤销发生时间（ISO），缺省为当前单调时间
    * @param {string} [record.authorizationExpiresAt] - 被撤销授权的到期时间（ISO）
    * @param {string} [record.authorizationHash] - 授权原文哈希
+   * @param {Function} [beforeRecordInTx] - 可选的同事务前置写入回调 (conn) => void：
+   *   在同一个 engine.write 事务内、写撤销记录之前执行，任一步失败整体回滚。
+   *   用于把授权原文落库与撤销落库放进一个事务，避免只成功一半。
    * @returns {Promise<Object>} 落库后的撤销记录
    */
-  async recordRevocation(record) {
+  async recordRevocation(record, beforeRecordInTx = null) {
     const { userId, authorizationId, source } = record || {};
     if (!userId || !authorizationId) {
       throw new Error('userId and authorizationId are required');
@@ -676,6 +679,7 @@ export class StateManager {
 
     await this._engine.write(async (db) => {
       const conn = createConnProxy(db);
+      if (beforeRecordInTx) beforeRecordInTx(conn);
       const ts = this._engine.hlc.tick();
       const now = getMonotonicSqliteNow();
 
@@ -754,12 +758,20 @@ export class StateManager {
    * @returns {Promise<boolean>} 是否实际删除
    */
   async deleteRevocation(userId, authorizationId, options = {}) {
-    const existing = await this.getRevocation(userId, authorizationId);
-    if (!existing) return false;
-    if (options.expectedSource && existing.source !== options.expectedSource) return false;
+    let deletedRow = null;
 
     await this._engine.write(async (db) => {
       const conn = createConnProxy(db);
+      const rows = conn.query(
+        'SELECT * FROM authorization_revocations WHERE user_id = ? AND authorization_id = ?',
+        [userId, authorizationId]
+      );
+      if (rows.length === 0) return;
+      const existing = rows[0];
+      // 来源校验必须在事务内做：事务外预读与删除之间，记录可能刚被升级
+      // （contract → platform），按旧来源误删会把平台撤销记录删掉
+      if (options.expectedSource && existing.source !== options.expectedSource) return;
+
       conn.query(
         'DELETE FROM authorization_revocations WHERE user_id = ? AND authorization_id = ?',
         [userId, authorizationId]
@@ -772,9 +784,11 @@ export class StateManager {
           [getMonotonicSqliteNow(), ts, userId, authorizationId]
         );
       }
+      deletedRow = existing;
     }, userId);
 
-    console.log(`[AuthorizationRevocation] local revocation record deleted: userId=${userId}, authorizationId=${authorizationId}, source=${existing.source}, revokedAt=${existing.revokedAt}, reason=${options.reason || 'unspecified'}`);
+    if (!deletedRow) return false;
+    console.log(`[AuthorizationRevocation] local revocation record deleted: userId=${userId}, authorizationId=${authorizationId}, source=${deletedRow.source}, revokedAt=${deletedRow.revoked_at}, reason=${options.reason || 'unspecified'}`);
     return true;
   }
 
