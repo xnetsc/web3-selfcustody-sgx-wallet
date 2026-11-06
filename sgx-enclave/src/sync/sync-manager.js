@@ -32,6 +32,7 @@ const DEFAULT_RECONNECT_MAX_MS = 300000;
 const RECONNECT_CHECK_MS = 1000;
 const PULL_INTERVAL_MS = 10000;
 const CLEANUP_INTERVAL_MS = 3600000;
+const PEER_WATERMARK_RETENTION_MS = 7 * 24 * 3600 * 1000; // peer 水位保留期：节点超过 7 天未再出现即清理其 _sync_peers 水位行
 const HEARTBEAT_INTERVAL_MS = 15000;
 const HEARTBEAT_TIMEOUT_MS = 45000;
 const DEFAULT_LISTEN_PORT = 3307;
@@ -131,6 +132,9 @@ export class SyncManager {
         // P2P 节点发现：已知节点列表（配置 + 动态发现）
         // Map<nodeId, url> - nodeId 是稳定身份标识，url 用于连接
         this._knownPeers = new Map();
+        // Map<nodeId, ms> - 最近一次见到该节点的时刻（收到其 handshake 时更新），
+        // 供 pruneStalePeerWatermarks 判断水位行是否过期
+        this._peerLastSeenAt = new Map();
         // 配置的节点暂时不加入（nodeId 未知，连接后从 handshake 获取）
         this._peersBroadcastTimer = null; // 定时广播节点列表
 
@@ -525,6 +529,7 @@ export class SyncManager {
                 // 跳过自己（意外的自连接场景）
                 if (this._isSelf(msg.nodeId)) return;
                 this._peerIdToNodeId.set(peerId, msg.nodeId);
+                this._peerLastSeenAt.set(msg.nodeId, Date.now());
                 // 更新 _knownPeers：只在没有记录、或已有记录不可连接（inbound://）
                 // 且新的 peerId 是可连接 URL 时更新
                 const existing = this._knownPeers.get(msg.nodeId);
@@ -534,6 +539,37 @@ export class SyncManager {
                 }
             }
         } catch (_) {}
+    }
+
+    /**
+     * 清理长期未再出现节点的同步水位行（_sync_peers）。
+     *
+     * 删除条件：节点超过保留期（7 天）未再出现，且当前未连接。
+     * “未再出现”按最近一次见到该节点的时刻算（handshake 更新
+     * _peerLastSeenAt），不按水位更新时间算——节点连着但长期没有新条目
+     * 交换时水位不推进，不应因此被删。进程重启后内存记录丢失，此时以
+     * 水位行自带的 last_sync_at 作为见到时刻的下界近似。
+     * 水位行是节点本地状态，删除只影响本节点：该节点日后重连时靠握手
+     * 交换最大序号与全量同步兜底追赶，不依赖旧水位。
+     * @param {number} [nowMs] - 当前时刻（毫秒），测试可注入
+     * @returns {Promise<number>} 删除的行数
+     */
+    async pruneStalePeerWatermarks(nowMs = Date.now()) {
+        const db = this.engine?.db;
+        if (!db) return 0;
+        const rows = db.all('SELECT peer_key, last_sync_at FROM _sync_peers', []);
+        const activeNodeIds = new Set(this._peerIdToNodeId.values());
+        const staleKeys = selectStalePeerKeys(rows, {
+            nowMs,
+            retentionMs: PEER_WATERMARK_RETENTION_MS,
+            activeNodeIds,
+            lastSeenAtByNodeId: this._peerLastSeenAt,
+        });
+        for (const key of staleKeys) {
+            db.run('DELETE FROM _sync_peers WHERE peer_key = ?', [key]);
+            console.log(`[SyncManager] stale peer watermark pruned: peer=${key} (not seen for over 7 days)`);
+        }
+        return staleKeys.length;
     }
 
     // ========== Pin-Check 握手 ==========
@@ -1022,4 +1058,27 @@ export class SyncManager {
             req.end();
         });
     }
+}
+
+/**
+ * 选出应删除的 peer 水位行（纯函数，供 pruneStalePeerWatermarks 与测试使用）。
+ * lastSeen 取两个来源的较晚者：内存中记录的最近见到时刻，与水位行自带的
+ * last_sync_at（进程重启后内存记录丢失时的下界近似）。
+ * @param {Array<{peer_key: string, last_sync_at: string|null}>} rows
+ * @param {{nowMs: number, retentionMs: number, activeNodeIds: Set<string>, lastSeenAtByNodeId: Map<string, number>}} opts
+ * @returns {string[]} 应删除的 peer_key 列表
+ */
+export function selectStalePeerKeys(rows, { nowMs, retentionMs, activeNodeIds, lastSeenAtByNodeId }) {
+    const stale = [];
+    for (const row of rows || []) {
+        const key = row.peer_key;
+        if (activeNodeIds && activeNodeIds.has(key)) continue;
+        let lastSeen = 0;
+        const remembered = lastSeenAtByNodeId ? lastSeenAtByNodeId.get(key) : undefined;
+        if (typeof remembered === 'number') lastSeen = Math.max(lastSeen, remembered);
+        const watermarkAt = row.last_sync_at ? Date.parse(row.last_sync_at) : NaN;
+        if (!Number.isNaN(watermarkAt)) lastSeen = Math.max(lastSeen, watermarkAt);
+        if (nowMs - lastSeen > retentionMs) stale.push(key);
+    }
+    return stale;
 }

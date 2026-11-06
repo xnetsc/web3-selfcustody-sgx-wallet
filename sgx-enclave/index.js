@@ -434,6 +434,8 @@ async function main() {
       await stateManager.cleanInvalidatedStates();
       // 清理过期的 WebAuthn 挑战值
       await challengeManager.cleanExpiredChallenges();
+      // 清理长期未再出现节点的同步水位行（_sync_peers 中超过 7 天未见到的节点）
+      if (syncManager) await syncManager.pruneStalePeerWatermarks();
       // 检查合约 NTP 配置是否变更，变更则重新校正单调时钟
       const latestParams = contractClient.getRuntimeParams() || {};
       const latestNtp = latestParams.security?.ntpServers;
