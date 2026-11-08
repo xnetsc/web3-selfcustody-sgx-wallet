@@ -6,7 +6,7 @@
  * 大数处理：使用 JavaScript 原生 BigInt（Wei 精度）
  */
 
-import { createConnProxy, shouldExecuteInternalWrite } from '../../sync/sync-adapter.js';
+import { createConnProxy, shouldExecuteInternalWrite, withLocalFallback } from '../../sync/sync-adapter.js';
 import { getMonotonicDate, getMonotonicSqliteNow } from '../../utils/monotonic-clock.js';
 
 /**
@@ -933,10 +933,11 @@ export class StateManager {
           } catch { /* 授权原文不可解析时不补全 */ }
         }
         const before = await this.getRevocation(userId, rec.authorizationId);
-        // 逐条隔离：单条写失败（如 2PC prepare 被并发写占用而 abort）只跳过本条，
-        // 不中断整轮同步；未落地的记录下一轮全量对账会重新补齐
+        // 逐条隔离：单条写失败只跳过本条，不中断整轮同步；未落地的记录
+        // 下一轮全量对账会重新补齐。协调未完成（如写到一半网络断开）时
+        // withLocalFallback 按无 leader 的同一规则回落本地提交，先落地再传播
         try {
-          await this.recordRevocation({
+          await withLocalFallback(this._engine, () => this.recordRevocation({
             userId,
             authorizationId: rec.authorizationId,
             grantee: rec.grantee,
@@ -944,7 +945,7 @@ export class StateManager {
             revokedAt: rec.revokedAt,
             authorizationExpiresAt,
             authorizationHash,
-          });
+          }));
           if (!before) synced++;
         } catch (err) {
           failed++;
@@ -959,13 +960,13 @@ export class StateManager {
       );
       for (const row of localContractRows) {
         if (!chainIds.has(row.authorization_id)) {
-          // 与写入同一口径逐条隔离：单条删除失败不中断整轮，下一轮对账重试
+          // 与写入同一口径逐条隔离 + 协调未完成回落本地提交（见上）
           try {
-            const removed = await this.deleteRevocation(userId, row.authorization_id, {
+            const removed = await withLocalFallback(this._engine, () => this.deleteRevocation(userId, row.authorization_id, {
               expectedSource: 'contract',
               reason: 'contract sync: no revocation record on contract',
               restoreState: true,
-            });
+            }));
             if (removed) deleted++;
           } catch (err) {
             failed++;

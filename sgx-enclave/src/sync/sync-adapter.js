@@ -7,6 +7,8 @@
  * 本文件是 sync-lib 与 sgx-wallet 项目之间的唯一桥接点。
  */
 
+import { randomUUID } from 'node:crypto';
+
 // ═══════════════════════════════════════════════════
 //  DatabaseAdapter（better-sqlite3 → sync-lib 接口）
 // ═══════════════════════════════════════════════════
@@ -54,10 +56,18 @@ export function createSQLiteAdapter(sqliteDb) {
  * 由外层事务持有者统一收集条目并完成 prepare/commit，与手动模式的
  * 设计一致；不存在时原样委托 engine.write 走独立 2PC。
  *
+ * 门面另提供 withLocalFallback(fn) 给进程内部写专用（HTTP 路径不用）：
+ * 在其作用域内，engine.write 若协调未完成而失败（如写到一半网络断开、
+ * prepare 被中止），按「无 leader 时本地兜底」同一规则回落 —— 用手动
+ * 事务在本地重新执行 fn 并直接提交，变更经触发器留在 _sync_log，
+ * 待后续靠提交广播与 HLC 拉/推传播到其它节点。fn 自身的业务错误在
+ * 本地重试时会原样再抛，不会被回落吞掉（最终仍抛回最初的协调错误）。
+ *
  * @param {object} engine SyncEngine 实例
- * @returns {object} 与 engine 同接口的门面（write 行为见上）
+ * @returns {object} 与 engine 同接口的门面（write 行为见上，另加 withLocalFallback）
  */
 export function createEngineFacade(engine) {
+    let fallbackDepth = 0;
     return new Proxy(engine, {
         get(target, prop) {
             if (prop === 'write') {
@@ -65,13 +75,55 @@ export function createEngineFacade(engine) {
                     if (target.hasActiveManualTransaction()) {
                         return await fn(target.db);
                     }
-                    return target.write(fn, shardKey);
+                    try {
+                        return await target.write(fn, shardKey);
+                    } catch (err) {
+                        if (fallbackDepth === 0) throw err;
+                        // 协调未完成 → 回落本地兜底：手动事务本地提交，
+                        // 条目留在 _sync_log，后续 leader 出现后靠同步传播
+                        const writeId = 'local-fallback-' + randomUUID();
+                        try {
+                            target.beginManualTransaction(writeId);
+                            const result = await fn(target.db);
+                            target.commitManualTransaction(writeId);
+                            try { target.broadcastCommit(writeId); } catch (_) {}
+                            console.warn(`[SyncEngineFacade] coordinated write incomplete (${err.message}); fell back to local commit`);
+                            return result;
+                        } catch (_) {
+                            try { target.rollbackManualTransaction(writeId); } catch (_) {}
+                            throw err;
+                        }
+                    }
+                };
+            }
+            if (prop === 'withLocalFallback') {
+                return async (fn) => {
+                    fallbackDepth++;
+                    try {
+                        return await fn();
+                    } finally {
+                        fallbackDepth--;
+                    }
                 };
             }
             const value = Reflect.get(target, prop);
             return typeof value === 'function' ? value.bind(target) : value;
         },
     });
+}
+
+/**
+ * 在内部写作用域内启用 facade 的本地回落（见 createEngineFacade）。
+ * engine 不是 facade（如单元测试桩）时原样执行 fn，不改变行为。
+ *
+ * @param {object} engine SyncEngine 实例或其 facade
+ * @param {function} fn 内部写逻辑
+ */
+export async function withLocalFallback(engine, fn) {
+    if (engine && typeof engine.withLocalFallback === 'function') {
+        return engine.withLocalFallback(fn);
+    }
+    return fn();
 }
 
 // ═══════════════════════════════════════════════════

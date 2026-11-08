@@ -30,7 +30,7 @@ import { CertificateVerifier } from '@xnetx/sgx-ra-tls-verify';
 import { createContractClientFromEnv } from './src/modules/contract-client/index.js';
 import { ContractPinStore } from './src/modules/contract-client/contract-pin-store.js';
 import { SyncManager } from './src/sync/sync-manager.js';
-import { createEngineFacade, shouldExecuteInternalWrite } from './src/sync/sync-adapter.js';
+import { createEngineFacade, shouldExecuteInternalWrite, withLocalFallback } from './src/sync/sync-adapter.js';
 import { HLC } from '@xnetx/raft-hlc-sync';
 
 import { WhitelistVerifier } from './src/modules/whitelist/whitelist-verifier.js';
@@ -437,15 +437,18 @@ async function main() {
       // 暂无 leader 时本地兜底执行，删除条目经 _sync_log 在 leader 出现后传播。
       const isGcCoordinator = shouldExecuteInternalWrite(engine, null);
       if (isGcCoordinator) {
-        await cleanExpiredSessions(engine);
-        await cleanExpiredExportSessions(engine);
-        // 清理已过期的授权撤销记录（被撤销授权到期后撤销记录失去意义，删除打日志）
-        await stateManager.cleanExpiredRevocations();
-        // 清理已失效的授权缓存（revoked / expired / exceeded）
-        // （须在撤销同步之后：同步删除错误缓存时可能把状态恢复 active，不应当作失效缓存清理）
-        await stateManager.cleanInvalidatedStates();
-        // 清理过期的 WebAuthn 挑战值
-        await challengeManager.cleanExpiredChallenges();
+        // 协调未完成（如写到一半网络断开）时回落本地提交，先清掉再靠同步传播
+        await withLocalFallback(engine, async () => {
+          await cleanExpiredSessions(engine);
+          await cleanExpiredExportSessions(engine);
+          // 清理已过期的授权撤销记录（被撤销授权到期后撤销记录失去意义，删除打日志）
+          await stateManager.cleanExpiredRevocations();
+          // 清理已失效的授权缓存（revoked / expired / exceeded）
+          // （须在撤销同步之后：同步删除错误缓存时可能把状态恢复 active，不应当作失效缓存清理）
+          await stateManager.cleanInvalidatedStates();
+          // 清理过期的 WebAuthn 挑战值
+          await challengeManager.cleanExpiredChallenges();
+        });
       }
       // 清理长期未再出现节点的同步水位行（_sync_peers 中超过 7 天未见到的节点）
       if (syncManager) await syncManager.pruneStalePeerWatermarks();

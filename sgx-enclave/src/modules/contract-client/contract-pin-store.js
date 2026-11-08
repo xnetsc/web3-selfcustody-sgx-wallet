@@ -21,7 +21,7 @@
 const PIN_ROW_ID = 1;
 
 import { getMonotonicSqliteNow } from '../../utils/monotonic-clock.js';
-import { createConnProxy, shouldExecuteInternalWrite } from '../../sync/sync-adapter.js';
+import { createConnProxy, shouldExecuteInternalWrite, withLocalFallback } from '../../sync/sync-adapter.js';
 
 export class ContractPinStore {
   /**
@@ -128,7 +128,8 @@ export class ContractPinStore {
     const caCert = rpcTlsCaCert || '';
 
     let firstPin = false;
-    await this._engine.write(async (db) => {
+    // 协调未完成时回落本地提交（withLocalFallback），先钉住再靠同步传播
+    await withLocalFallback(this._engine, () => this._engine.write(async (db) => {
       const conn = createConnProxy(db);
       const ts = this._engine.hlc.tick();
       const existing = conn.query(
@@ -151,7 +152,7 @@ export class ContractPinStore {
           [snapshotJson, getMonotonicSqliteNow(), ts, PIN_ROW_ID]
         );
       }
-    });
+    }));
 
     if (firstPin) {
       console.log(
@@ -199,7 +200,7 @@ export class ContractPinStore {
     const allowNonRaTlsVal = allowNonRaTls ? 1 : 0;
     const caCert = rpcTlsCaCert || '';
 
-    await this._engine.write(async (db) => {
+    await withLocalFallback(this._engine, () => this._engine.write(async (db) => {
       const conn = createConnProxy(db);
       conn.query(
         `INSERT INTO pinned_contract (id, rpc_url, chain_id, contract_address, allow_non_ra_tls, rpc_tls_ca_cert, snapshot_json, pinned_at, updated_at, _hlc)
@@ -215,7 +216,7 @@ export class ContractPinStore {
            _hlc = excluded._hlc`,
         [PIN_ROW_ID, rpcUrl, Number(chainId), contractAddress, allowNonRaTlsVal, caCert, snapshotJson, getMonotonicSqliteNow(), getMonotonicSqliteNow(), this._engine.hlc.tick()]
       );
-    });
+    }));
     console.log(
       `[ContractPinStore] contract identity migrated to: rpcUrl=${rpcUrl}, chainId=${Number(chainId)}, address=${contractAddress}, allowNonRaTls=${!!allowNonRaTlsVal}, hasCaCert=${!!caCert}`
     );
