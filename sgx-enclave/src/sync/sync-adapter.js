@@ -71,6 +71,49 @@ export function createSQLiteAdapter(sqliteDb) {
  * @returns {object} 与 engine 同接口的门面（write 行为见上，另加 withLocalFallback）
  */
 /**
+ * 把协调层错误分类为结构化原因，供调用者准确处理（重试、等待、放弃、
+ * 是否回落），不必解析消息文本。
+ *
+ * refusal=true 表示系统已主动表态拒绝：
+ *   - prepare_rejected：某 follower 明确拒绝 prepare，reason 为其原话
+ *     （'busy' 事务槽被占 / 'stale term' 任期落后 / 'invalid message' /
+ *     应用条目时的错误信息）；
+ *   - term_changed：prepare 期间发生新选举，任期已变。
+ * refusal=false 为未表态的失败（联系不上类）：
+ *   - prepare_timeout / no_connected_peers / no_leader /
+ *     leader_unavailable / proxy_timeout。
+ * 非协调错误（业务错误等）返回 null。
+ *
+ * @param {Error} err
+ * @returns {{ code: string, reason: string, refusal: boolean } | null}
+ */
+export function classifyCoordinationError(err) {
+    const msg = (err && err.message) || '';
+    if (msg.startsWith('2PC prepare rejected: term changed during prepare')) {
+        return { code: 'term_changed', reason: msg.slice('2PC prepare rejected: '.length), refusal: true };
+    }
+    if (msg.startsWith('2PC prepare rejected: ')) {
+        return { code: 'prepare_rejected', reason: msg.slice('2PC prepare rejected: '.length), refusal: true };
+    }
+    if (msg.startsWith('2PC prepare timeout')) {
+        return { code: 'prepare_timeout', reason: msg, refusal: false };
+    }
+    if (msg.startsWith('2PC: no connected peers')) {
+        return { code: 'no_connected_peers', reason: msg, refusal: false };
+    }
+    if (/^shard \d+: no leader/.test(msg)) {
+        return { code: 'no_leader', reason: msg, refusal: false };
+    }
+    if (/^shard \d+: leader peer not available/.test(msg)) {
+        return { code: 'leader_unavailable', reason: msg, refusal: false };
+    }
+    if (msg === 'proxy request timed out') {
+        return { code: 'proxy_timeout', reason: msg, refusal: false };
+    }
+    return null;
+}
+
+/**
  * 判定一笔协调写的失败是否允许回落本地（见 createEngineFacade）。
  * 允许的只有「联系不上」：prepare 超时（窗口内无人明确拒绝、只是没等到
  * quorum 应答）与无已连接 peer。引擎的报错形态保证两者可区分：任一
@@ -80,8 +123,9 @@ export function createSQLiteAdapter(sqliteDb) {
  * @returns {boolean}
  */
 export function isLocalFallbackAllowedError(err) {
-    const msg = (err && err.message) || '';
-    return msg.startsWith('2PC prepare timeout') || msg.startsWith('2PC: no connected peers');
+    const info = classifyCoordinationError(err);
+    return !!info && !info.refusal &&
+        (info.code === 'prepare_timeout' || info.code === 'no_connected_peers');
 }
 
 export function createEngineFacade(engine) {
@@ -96,6 +140,14 @@ export function createEngineFacade(engine) {
                     try {
                         return await target.write(fn, shardKey);
                     } catch (err) {
+                        // 协调错误附结构化原因（code / reason / refusal），
+                        // 调用者据此准确处理，不必解析消息文本
+                        const info = classifyCoordinationError(err);
+                        if (info) {
+                            err.code = info.code;
+                            err.reason = info.reason;
+                            err.refusal = info.refusal;
+                        }
                         if (fallbackDepth === 0) throw err;
                         // 回落前提：只有协调对象「联系不上」才回落本地；
                         // 主动拒绝（prepare 被明确拒绝 / term 已变更）与
@@ -410,7 +462,10 @@ export async function ensureEntriesAppliedLocally({ engine, peerId, entries, ver
         try { engine.receiveMessage(peerId, JSON.stringify({ type: 'sync', entries })); } catch (_) {}
         if (entriesVisibleLocally(vdb, entries)) return;
         if (Date.now() >= deadline) {
-            throw new Error('proxied write committed on leader but its sync entries are not readable locally within ' + deadlineMs + 'ms');
+            const err = new Error('proxied write committed on leader but its sync entries are not readable locally within ' + deadlineMs + 'ms');
+            err.code = 'local_apply_timeout';
+            err.refusal = false;
+            throw err;
         }
         await sleep(pollMs);
     }

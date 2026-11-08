@@ -50,6 +50,7 @@
 import express from 'express';
 import crypto from 'crypto';
 import { getAttestationQuote } from './modules/remote-attestation/index.js';
+import { classifyCoordinationError } from './sync/sync-adapter.js';
 
 /**
  * 写操作路由集合（这些路径需要路由到分片 Leader 执行，且需要 2PC 同步复制）
@@ -113,7 +114,11 @@ function createWriteProxyMiddleware(syncManager) {
     if (syncManager.isLeaderForUser(userId)) {
       const shardId = syncManager.getShardForUser(userId);
       if (syncManager.isShardWarming(shardId)) {
-        return res.status(503).json({ error: 'Leader warming up: shard ' + shardId + ' is catching up with connected peers' });
+        return res.status(503).json({
+          error: 'Leader warming up: shard ' + shardId + ' is catching up with connected peers',
+          code: 'leader_warming_up',
+          shardId,
+        });
       }
       return next();
     }
@@ -128,7 +133,14 @@ function createWriteProxyMiddleware(syncManager) {
       });
       return res.status(result.status).json(result.body);
     } catch (err) {
-      return res.status(503).json({ error: 'No leader available: ' + err.message });
+      // 附结构化原因码，调用者据此区分无 leader / leader 不可达 /
+      // 代理超时 / 本机补齐超时等情形，准确决定重试策略
+      const info = classifyCoordinationError(err);
+      const code = err.code || (info && info.code) || 'proxy_failed';
+      const error = (code === 'no_leader' || code === 'leader_unavailable')
+        ? 'No leader available: ' + err.message
+        : err.message;
+      return res.status(503).json({ error, code });
     }
   };
 }
@@ -404,10 +416,17 @@ function wrap(fn, accountFreezeManager, syncManager, getPath, options = {}) {
       if (proxiedSyncEntries) envelope.syncEntries = proxiedSyncEntries;
       return res.json(envelope);
     } catch (err) {
-      // 只返回 message，不暴露 stack trace 或内部细节
+      // 只返回 message，不暴露 stack trace 或内部细节；
+      // 协调类错误另附结构化原因（code + 拒绝方原话 reason）
       const msg = err.message || 'Internal server error';
       const status = classifyError(msg);
-      return res.status(status).json({ error: msg });
+      const body = { error: msg };
+      const info = classifyCoordinationError(err);
+      if (info) {
+        body.code = info.code;
+        body.reason = info.reason;
+      }
+      return res.status(status).json(body);
     }
   };
 }
