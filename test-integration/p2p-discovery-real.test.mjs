@@ -85,8 +85,9 @@ async function main() {
     console.log('[验证1] B known peers:', [...bKnown.entries()]);
     assert(bKnown.has('nodeA'), 'B should learn nodeA via pin-check self-advertisement');
     assert(bKnown.has('nodeC'), 'B should learn nodeC via pin-check self-advertisement');
-    assert.equal(bKnown.get('nodeA'), 'ws://127.0.0.1:3311');
-    assert.equal(bKnown.get('nodeC'), 'ws://127.0.0.1:3313');
+    // 地址簿为多地址候选集（nodeId → urls 数组），自报地址在首位
+    assert.deepEqual(bKnown.get('nodeA'), ['ws://127.0.0.1:3311']);
+    assert.deepEqual(bKnown.get('nodeC'), ['ws://127.0.0.1:3313']);
     console.log('✓ 验证 1 通过：入站方通过 pin-check 自报学到可连接地址\n');
 
     // 验证 2：手动触发 B 广播 peers-list，A 和 C 应互相发现并连接

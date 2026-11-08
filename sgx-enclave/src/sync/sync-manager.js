@@ -42,6 +42,7 @@ const PROXY_TIMEOUT_MS = 10000;
 const PREPARE_TIMEOUT_MS = 5000;
 const FOLLOWER_TXN_TIMEOUT_MS = 6000; // follower 暂存事务超时：2026-11-08 由 15s 压到 6s，commit 广播丢失时更快回滚并转入 pull 追赶；取值须大于 PREPARE_TIMEOUT_MS(5s)——协调者最迟在 prepare 预算耗尽时才发 commit，定得比它小会误杀慢 quorum 的正常提交
 const PEERS_BROADCAST_INTERVAL_MS = 60000; // 每 60 秒广播一次已知节点列表
+const MAX_URLS_PER_PEER = 8; // 单个节点在地址簿中保留的候选地址上限（防 gossip 膨胀）
 
 // ========== 工具函数 ==========
 
@@ -132,9 +133,21 @@ export class SyncManager {
         // 等待对端 pin-check 的 Promise resolve 队列
         this._pinCheckWaiters = new Map(); // peerId → { resolve, reject }
 
-        // P2P 节点发现：已知节点列表（配置 + 动态发现）
-        // Map<nodeId, url> - nodeId 是稳定身份标识，url 用于连接
+        // P2P 节点发现：已知节点地址簿（配置 + 动态发现）
+        // Map<nodeId, string[]> - nodeId 是稳定身份标识；同一节点的多个候选
+        // 连接地址去重保序排列：对端自报地址优先，其余按学到顺序补充
         this._knownPeers = new Map();
+        // 本节点经入站连接 Host 头学到的自身可达地址（规范化后）。
+        // Host 是已通过 pin-check 的对端实际拨通本节点时用的名字——实测可达，
+        // 作为自报地址的补充对外通告（见 _learnOwnUrlFromInbound）
+        this._hostLearnedOwnUrls = [];
+        // Map<peerId, string> - 入站连接的 Host 头原文；对端通过 pin-check
+        // 之前不使用，防止未验证连接影响本节点地址通告
+        this._inboundHostByPeerId = new Map();
+        // 本节点监听协议（'wss' | 'ws'），_startServer 时确定。
+        // 生产形态必为 wss（RA-TLS）；Host 学习拼 URL 时据此定 scheme，
+        // 没带端口的 Host 由 normalizeSyncUrl 按 scheme 补默认端口
+        this._listenScheme = null;
         // Map<nodeId, ms> - 最近一次见到该节点的时刻（收到其 handshake 时更新），
         // 供 pruneStalePeerWatermarks 判断水位行是否过期
         this._peerLastSeenAt = new Map();
@@ -270,6 +283,7 @@ export class SyncManager {
         this._peerIdToNodeId.clear();
         this._pinCheckedPeers.clear();
         this._pinCheckWaiters.clear();
+        this._inboundHostByPeerId.clear();
 
         if (this.wss) { this.wss.close(); this.wss = null; }
         if (this._httpsServer) { this._httpsServer.close(); this._httpsServer = null; }
@@ -429,7 +443,8 @@ export class SyncManager {
         if (syncEntries && Array.isArray(syncEntries.entries) && syncEntries.entries.length > 0) {
             delete result.body.syncEntries;
             const leaderNodeId = this.engine.getLeaderForKey(shardKey);
-            const peerId = (leaderNodeId && this._knownPeers.get(leaderNodeId)) || leaderNodeId || 'leader';
+            const leaderUrls = leaderNodeId ? this._knownPeers.get(leaderNodeId) : null;
+            const peerId = (leaderUrls && leaderUrls[0]) || leaderNodeId || 'leader';
             await ensureEntriesAppliedLocally({ engine: this.engine, peerId, entries: syncEntries.entries, verifyDb: this._readDbAdapter });
         }
         return result;
@@ -480,6 +495,7 @@ export class SyncManager {
     _startServer() {
         return new Promise((resolve, reject) => {
             const useRaTls = !!(this._cert && this._key);
+            this._listenScheme = useRaTls ? 'wss' : 'ws';
 
             if (useRaTls) {
                 const httpsOptions = {
@@ -518,6 +534,11 @@ export class SyncManager {
 
             this.wss.on('connection', (ws, req) => {
                 const peerId = 'inbound://' + req.socket.remoteAddress + ':' + req.socket.remotePort;
+                // 记下拨号方实际使用的 Host（host[:port]）：待其通过 pin-check 后，
+                // 据此学习本节点的一个实测可达地址（见 _learnOwnUrlFromInbound）
+                if (req && req.headers && typeof req.headers.host === 'string') {
+                    this._inboundHostByPeerId.set(peerId, req.headers.host);
+                }
                 this._registerWs(peerId, ws);
                 this.engine.peerConnected(peerId, { direction: 'inbound' });
 
@@ -537,6 +558,7 @@ export class SyncManager {
                     this._peerIdToNodeId.delete(peerId);
                     this._pinCheckedPeers.delete(peerId);
                     this._pinCheckWaiters.delete(peerId);
+                    this._inboundHostByPeerId.delete(peerId);
                 });
                 ws.on('error', (err) => {
                     console.error('[SyncManager] Inbound error:', err.message);
@@ -659,12 +681,10 @@ export class SyncManager {
                 this._peerIdToNodeId.set(peerId, msg.nodeId);
                 this._peerLastSeenAt.set(msg.nodeId, Date.now());
                 if (typeof msg.lastSeq === 'number') this._notePeerProgress(msg.nodeId, msg.lastSeq);
-                // 更新 _knownPeers：只在没有记录、或已有记录不可连接（inbound://）
-                // 且新的 peerId 是可连接 URL 时更新
-                const existing = this._knownPeers.get(msg.nodeId);
-                const isConnectable = !peerId.startsWith('inbound://');
-                if (!existing || (existing.startsWith('inbound://') && isConnectable)) {
-                    this._knownPeers.set(msg.nodeId, peerId);
+                // 更新地址簿：出站连接用的 URL 是刚实测拨通的地址，并入该
+                // 节点的候选集（自报地址到达时仍会前置，优先级更高）
+                if (!peerId.startsWith('inbound://')) {
+                    this._addKnownPeerUrls(msg.nodeId, [peerId]);
                 }
                 return;
             }
@@ -744,9 +764,9 @@ export class SyncManager {
 
     /**
      * 发送本节点的 pinned 合约身份给对端。
-     * 消息格式: JSON { type: 'pin-check', rpcTlsCaCert, contractAddress, chainId, allowNonRaTls, nodeId, listenUrl }
+     * 消息格式: JSON { type: 'pin-check', rpcTlsCaCert, contractAddress, chainId, allowNonRaTls, nodeId, listenUrl, listenUrls }
      * 比较 rpcTlsCaCert 而非 rpcUrl（证书是身份的真正锚点）。
-     * nodeId + listenUrl 用于 P2P 发现自报地址（入站连接方也能学到本节点的可连接地址）。
+     * nodeId + listenUrl/listenUrls 用于 P2P 发现自报地址（入站连接方也能学到本节点的全部可连接地址）。
      * 如果没有 contractClient 或尚未 pin，发送 type='pin-check' 且身份字段为 null。
      */
     _sendPinCheck(peerId, ws) {
@@ -759,6 +779,7 @@ export class SyncManager {
             allowNonRaTls: identity?.allowNonRaTls ?? null,
             nodeId: this.engine.nodeId,
             listenUrl: this._getAdvertisedUrl(),
+            listenUrls: this._getAdvertisedUrls(),
         });
         try {
             if (ws.readyState === WebSocket.OPEN) {
@@ -811,8 +832,8 @@ export class SyncManager {
 
         // 已通过 pin-check 的 peer 不需要重复验证
         if (this._pinCheckedPeers.has(peerId)) {
-            // 更新自报地址（对端可能重发 pin-check）
-            this._recordPeerAdvertisedUrl(peerId, msg);
+            // 更新自报地址（对端可能重发 pin-check）；顺带处理本节点 Host 学习
+            this._onPinCheckPassed(peerId, msg);
             // 回复 ack（对端可能还在等）
             this._sendPinCheckAck(ws, true);
             return true;
@@ -851,7 +872,7 @@ export class SyncManager {
                 // 双方都未 pin，允许通信（首次部署场景）
                 console.log('[SyncManager] pin-check: both nodes unpinned — allowing (first deployment)');
                 this._pinCheckedPeers.add(peerId);
-                this._recordPeerAdvertisedUrl(peerId, peerPin);
+                this._onPinCheckPassed(peerId, peerPin);
                 this._sendPinCheckAck(ws, true);
                 this._resolvePinCheckWaiter(peerId, true);
                 return;
@@ -868,7 +889,7 @@ export class SyncManager {
         if (match) {
             console.log('[SyncManager] pin-check: identity matches with ' + peerId);
             this._pinCheckedPeers.add(peerId);
-            this._recordPeerAdvertisedUrl(peerId, peerPin);
+            this._onPinCheckPassed(peerId, peerPin);
             this._sendPinCheckAck(ws, true);
             this._resolvePinCheckWaiter(peerId, true);
             return;
@@ -891,7 +912,7 @@ export class SyncManager {
         if (match2) {
             console.log('[SyncManager] pin-check: identity matches after refresh with ' + peerId);
             this._pinCheckedPeers.add(peerId);
-            this._recordPeerAdvertisedUrl(peerId, peerPin);
+            this._onPinCheckPassed(peerId, peerPin);
             this._sendPinCheckAck(ws, true);
             this._resolvePinCheckWaiter(peerId, true);
             return;
@@ -904,27 +925,86 @@ export class SyncManager {
     }
 
     /**
-     * 记录对端在 pin-check 中自报的 nodeId + 监听地址。
-     * 只在 pin-check 通过后调用（防止未验证节点污染节点列表）。
+     * pin-check 通过后的统一收尾：记录对端自报地址 + 学习本节点地址。
+     * 只在验证通过的路径上调用——防止未验证节点污染地址簿，
+     * 也防止未验证连接影响本节点的地址通告。
+     */
+    _onPinCheckPassed(peerId, peerPin) {
+        this._recordPeerAdvertisedUrl(peerId, peerPin);
+        this._learnOwnUrlFromInbound(peerId);
+    }
+
+    /**
+     * 记录对端在 pin-check 中自报的 nodeId + 监听地址（listenUrl 为主地址，
+     * listenUrls 为其全部候选）。自报地址优先级最高，前置进该节点的
+     * 候选集；其余来源（拨通的地址、gossip 学到的）只作补充，不覆盖。
      * 解决入站连接方无法得知对端可连接地址的问题。
      */
     _recordPeerAdvertisedUrl(peerId, peerPin) {
-        const { nodeId, listenUrl } = peerPin || {};
+        const { nodeId, listenUrl, listenUrls } = peerPin || {};
         if (typeof nodeId !== 'string' || !nodeId) return;
         // 只通过 nodeId 判断是否自己
         if (this._isSelf(nodeId)) return;
 
         this._peerIdToNodeId.set(peerId, nodeId);
 
-        if (typeof listenUrl !== 'string') return;
-        if (!listenUrl.startsWith('ws://') && !listenUrl.startsWith('wss://')) return;
-
-        const existing = this._knownPeers.get(nodeId);
-        // 自报地址优先级最高：覆盖 inbound:// 记录和旧地址
-        if (existing !== listenUrl) {
-            this._knownPeers.set(nodeId, listenUrl);
-            console.log('[SyncManager] Recorded advertised url for peer: nodeId=' + nodeId + ', url=' + listenUrl);
+        const incoming = [];
+        if (Array.isArray(listenUrls)) incoming.push(...listenUrls);
+        if (typeof listenUrl === 'string') incoming.push(listenUrl);
+        const added = this._addKnownPeerUrls(nodeId, incoming, { front: true });
+        if (added > 0) {
+            console.log('[SyncManager] Recorded advertised urls for peer: nodeId=' + nodeId +
+                ', urls=' + JSON.stringify(this._knownPeers.get(nodeId)));
         }
+    }
+
+    /**
+     * 把地址并入某节点的候选集（规范化、去重、保序、上限截断）。
+     * front=true 时新地址排到最前（自报语义）。返回实际新增的地址数。
+     */
+    _addKnownPeerUrls(nodeId, urls, { front = false } = {}) {
+        if (!nodeId || this._isSelf(nodeId)) return 0;
+        const before = this._knownPeers.get(nodeId) || [];
+        const merged = mergePeerUrls(before, urls, { front });
+        if (merged.length === 0) return 0;
+        this._knownPeers.set(nodeId, merged);
+        return merged.filter((u) => !before.includes(u)).length;
+    }
+
+    /**
+     * 从一条已通过 pin-check 的入站连接学习本节点的可达地址：
+     * 拨号方在 WS 升级请求里写下的 Host，就是它实际拨通本节点所用的
+     * host[:port]（带端口用该端口，没带说明是协议默认端口，拼接时补齐）。
+     * 该地址已被实测连通（至少从该对端的网络位置），作为配置/推断出的
+     * 自报地址的补充；学到新地址后立即向已验证的对端重发 pin-check，
+     * 让新地址随自报与 gossip 扩散。
+     */
+    _learnOwnUrlFromInbound(peerId) {
+        if (!peerId.startsWith('inbound://')) return;
+        const host = this._inboundHostByPeerId.get(peerId);
+        if (!host) return;
+        const url = urlFromHostHeader(host, this._listenScheme || 'wss');
+        if (!url) return;
+        if (this._getAdvertisedUrls().includes(url)) return;
+        this._hostLearnedOwnUrls.push(url);
+        console.log('[SyncManager] Learned own reachable url from inbound Host: ' + url);
+        // 把新地址告诉已建连且已验证的对端（它们会前置记录并继续 gossip）
+        for (const pid of this._pinCheckedPeers) {
+            const ws = this._peerWsMap.get(pid);
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                this._sendPinCheck(pid, ws);
+            }
+        }
+    }
+
+    /**
+     * 本节点对外通告的全部候选地址：自报地址（配置优先、其次网卡推断）
+     * 在前，Host 学到的实测地址在后，去重保序。
+     */
+    _getAdvertisedUrls() {
+        const primary = this._getAdvertisedUrl();
+        const all = primary ? [primary, ...this._hostLearnedOwnUrls] : [...this._hostLearnedOwnUrls];
+        return mergePeerUrls([], all);
     }
 
     /**
@@ -1096,12 +1176,12 @@ export class SyncManager {
             return;
         }
 
-        // 构造 peers-list: [{ nodeId, url }, ...]
+        // 构造 peers-list: [{ nodeId, urls }, ...]（urls 为该节点的候选地址集）
         const peersList = [];
-        for (const [nodeId, url] of this._knownPeers) {
+        for (const [nodeId, urls] of this._knownPeers) {
             // 跳过自己，只广播已知 nodeId 的可连接地址
-            if (nodeId && !this._isSelf(nodeId) && !url.startsWith('inbound://')) {
-                peersList.push({ nodeId, url });
+            if (nodeId && !this._isSelf(nodeId) && urls.length > 0) {
+                peersList.push({ nodeId, urls: [...urls] });
             }
         }
 
@@ -1133,26 +1213,28 @@ export class SyncManager {
             return;
         }
 
-        let newPeersCount = 0;
+        let changed = 0;
         for (const peer of peers) {
             if (!peer || typeof peer !== 'object') continue;
-            const { nodeId, url } = peer;
-            if (typeof nodeId !== 'string' || typeof url !== 'string') continue;
-            // 只接受可连接地址
-            if (!url.startsWith('ws://') && !url.startsWith('wss://')) continue;
-
+            const { nodeId, url, urls } = peer;
+            if (typeof nodeId !== 'string') continue;
             // 跳过自己（只通过 nodeId）
             if (this._isSelf(nodeId)) continue;
-            // 跳过已知节点（只通过 nodeId 去重）
-            if (this._knownPeers.has(nodeId)) continue;
-
-            this._knownPeers.set(nodeId, url);
-            newPeersCount++;
-            console.log('[SyncManager] Discovered new peer via P2P: nodeId=' + nodeId + ', url=' + url);
+            // 兼容两种格式：新版 urls 数组、旧版单个 url。
+            // 已知节点也可借 gossip 补充新候选地址（合并去重，不覆盖）
+            const incoming = [];
+            if (Array.isArray(urls)) incoming.push(...urls);
+            if (typeof url === 'string') incoming.push(url);
+            const added = this._addKnownPeerUrls(nodeId, incoming);
+            if (added > 0) {
+                changed++;
+                console.log('[SyncManager] Learned peer urls via P2P: nodeId=' + nodeId +
+                    ', urls=' + JSON.stringify(this._knownPeers.get(nodeId)));
+            }
         }
 
-        if (newPeersCount > 0) {
-            console.log('[SyncManager] Added ' + newPeersCount + ' new peers from ' + peerId + ', total known: ' + this._knownPeers.size);
+        if (changed > 0) {
+            console.log('[SyncManager] Updated ' + changed + ' peers from ' + peerId + ', total known: ' + this._knownPeers.size);
             // 尝试连接新发现的节点
             this._tryConnectToNewPeers();
         }
@@ -1165,17 +1247,18 @@ export class SyncManager {
         // 已连接节点的 nodeId 集合（去重只通过 nodeId）
         const connectedNodeIds = new Set(this._peerIdToNodeId.values());
 
-        for (const [nodeId, url] of this._knownPeers) {
-            // 跳过不可连接地址
-            if (!url.startsWith('ws://') && !url.startsWith('wss://')) continue;
+        for (const [nodeId, urls] of this._knownPeers) {
             // 跳过自己（只通过 nodeId）
             if (this._isSelf(nodeId)) continue;
             // 跳过已连接的节点（只通过 nodeId 去重）
             if (connectedNodeIds.has(nodeId)) continue;
-            // 跳过已在 pending 队列的节点
-            if (this.pendingConnections.has(url)) continue;
-
-            this._connectToPeer(url);
+            // 候选地址逐个尝试：某个地址不通不影响其余候选
+            for (const url of urls) {
+                if (this._peerWsMap.has(url)) continue;
+                // 跳过已在 pending 队列的地址
+                if (this.pendingConnections.has(url)) continue;
+                this._connectToPeer(url);
+            }
         }
     }
 
@@ -1211,6 +1294,58 @@ export class SyncManager {
             req.end();
         });
     }
+}
+
+/**
+ * 把一个 ws/wss 地址规范化为可去重的 canonical 形式：scheme://host:port。
+ * 端口缺省时按协议补默认端口（ws 80 / wss 443）——故 wss://a.com 与
+ * wss://a.com:443 规范化后相同，去重时只保留一份。路径/query 一律丢弃
+ * （同步地址只有 origin）。非法或非 ws/wss 输入返回 null。
+ * （纯函数，供地址簿逻辑与测试使用。）
+ */
+export function normalizeSyncUrl(raw) {
+    if (typeof raw !== 'string') return null;
+    let parsed;
+    try { parsed = new URL(raw.trim()); } catch (_) { return null; }
+    if (parsed.protocol !== 'ws:' && parsed.protocol !== 'wss:') return null;
+    if (!parsed.hostname) return null;
+    const port = parsed.port || (parsed.protocol === 'wss:' ? '443' : '80');
+    return parsed.protocol + '//' + parsed.hostname + ':' + port;
+}
+
+/**
+ * 由入站连接的 Host 头还原“拨号方实际用来连到本节点的地址”。
+ * Host 带端口就用该端口；没带端口说明拨号方用的是协议默认端口，
+ * 由 normalizeSyncUrl 按 scheme 补齐（wss → 443）。
+ * （纯函数，供 Host 学习与测试使用。）
+ */
+export function urlFromHostHeader(hostHeader, scheme) {
+    if (typeof hostHeader !== 'string' || !hostHeader.trim()) return null;
+    return normalizeSyncUrl(scheme + '://' + hostHeader.trim());
+}
+
+/**
+ * 把 incoming 地址合并进 existing 候选集：规范化去重、保序。
+ * front=true 时 incoming 排在前面（对端自报的地址优先级最高）；
+ * 结果截断到 MAX_URLS_PER_PEER（截断丢弃排在后面的低优先级地址）。
+ * （纯函数，供地址簿逻辑与测试使用。）
+ * @returns {string[]} 新的候选地址数组（不修改入参）
+ */
+export function mergePeerUrls(existing, incoming, { front = false } = {}) {
+    const norm = (list) => {
+        const out = [];
+        for (const u of list || []) {
+            const n = normalizeSyncUrl(u);
+            if (n && !out.includes(n)) out.push(n);
+        }
+        return out;
+    };
+    const inc = norm(incoming);
+    const old = norm(existing);
+    const merged = front
+        ? [...inc, ...old.filter((u) => !inc.includes(u))]
+        : [...old, ...inc.filter((u) => !old.includes(u))];
+    return merged.slice(0, MAX_URLS_PER_PEER);
 }
 
 /**
