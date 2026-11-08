@@ -58,15 +58,32 @@ export function createSQLiteAdapter(sqliteDb) {
  * 设计一致；不存在时原样委托 engine.write 走独立 2PC。
  *
  * 门面另提供 withLocalFallback(fn) 给进程内部写专用（HTTP 路径不用）：
- * 在其作用域内，engine.write 若协调未完成而失败（如写到一半网络断开、
- * prepare 被中止），按「无 leader 时本地兜底」同一规则回落 —— 用手动
- * 事务在本地重新执行 fn 并直接提交，变更经触发器留在 _sync_log，
- * 待后续靠提交广播与 HLC 拉/推传播到其它节点。fn 自身的业务错误在
- * 本地重试时会原样再抛，不会被回落吞掉（最终仍抛回最初的协调错误）。
+ * 在其作用域内，engine.write 协调失败时是否回落本地有严格前提——
+ * 只有「联系不上」才回落：prepare 超时无人应答、或根本没有已连接的
+ * peer。这类失败里没有任何节点表过态，本地兜底提交、变更经触发器
+ * 留在 _sync_log，待后续靠提交广播与 HLC 拉/推传播到其它节点。
+ * 「主动拒绝」绝不回落：任一 follower 明确拒绝 prepare（引擎以
+ * '2PC prepare rejected:' 报错并广播 abort），或 prepare 期间 term
+ * 变更（新 leader 已产生，同为该前缀）——系统已经表态，本地再写就是
+ * 绕过裁决。fn 自身的业务错误同样不回落，原样上抛。
  *
  * @param {object} engine SyncEngine 实例
  * @returns {object} 与 engine 同接口的门面（write 行为见上，另加 withLocalFallback）
  */
+/**
+ * 判定一笔协调写的失败是否允许回落本地（见 createEngineFacade）。
+ * 允许的只有「联系不上」：prepare 超时（窗口内无人明确拒绝、只是没等到
+ * quorum 应答）与无已连接 peer。引擎的报错形态保证两者可区分：任一
+ * follower 明确拒绝时，waitForPrepareAck 立即以 '2PC prepare rejected:'
+ * 拒绝并清掉超时，永远不会退化成超时错误；term 变更同为该前缀。
+ * @param {Error} err engine.write 抛出的错误
+ * @returns {boolean}
+ */
+export function isLocalFallbackAllowedError(err) {
+    const msg = (err && err.message) || '';
+    return msg.startsWith('2PC prepare timeout') || msg.startsWith('2PC: no connected peers');
+}
+
 export function createEngineFacade(engine) {
     let fallbackDepth = 0;
     return new Proxy(engine, {
@@ -80,7 +97,11 @@ export function createEngineFacade(engine) {
                         return await target.write(fn, shardKey);
                     } catch (err) {
                         if (fallbackDepth === 0) throw err;
-                        // 协调未完成 → 回落本地兜底：手动事务本地提交，
+                        // 回落前提：只有协调对象「联系不上」才回落本地；
+                        // 主动拒绝（prepare 被明确拒绝 / term 已变更）与
+                        // 业务错误一律原样上抛，不绕过系统的裁决。
+                        if (!isLocalFallbackAllowedError(err)) throw err;
+                        // 回落本地兜底：手动事务本地提交，
                         // 条目留在 _sync_log，后续 leader 出现后靠同步传播
                         const writeId = 'local-fallback-' + randomUUID();
                         try {

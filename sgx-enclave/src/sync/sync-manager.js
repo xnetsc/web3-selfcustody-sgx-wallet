@@ -138,6 +138,13 @@ export class SyncManager {
         // Map<nodeId, ms> - 最近一次见到该节点的时刻（收到其 handshake 时更新），
         // 供 pruneStalePeerWatermarks 判断水位行是否过期
         this._peerLastSeenAt = new Map();
+        // Map<nodeId, seq> - 从对端消息中观测到的其 _sync_log 最大序号
+        //（handshake 的 lastSeq、sync/prepare 的条目 seq、ack 的 lastSeq），
+        // 供新 leader 暖机闸判定需要追平的目标水位
+        this._peerObservedMaxSeq = new Map();
+        // Map<shardId, {startedAt, warned}> - 本机刚当选 leader、尚未追平
+        // 已连接 peer 水位的分片；处于此集合的分片不接受写（暖机闸）
+        this._shardWarmup = new Map();
         // 配置的节点暂时不加入（nodeId 未知，连接后从 handshake 获取）
         this._peersBroadcastTimer = null; // 定时广播节点列表
 
@@ -188,6 +195,10 @@ export class SyncManager {
             onLeaderChanged: (shardId, leaderNodeId, isLocal) => {
                 console.log('[SyncManager] shard=' + shardId + ' leader=' + (leaderNodeId || 'none') +
                     (isLocal ? ' (local)' : ''));
+                // 暖机闸：本机当选新 leader 时先进入暖机，追平已连接 peer
+                // 的水位后才接受该分片的写；失去 leader 时暖机作废
+                if (isLocal) this._beginShardWarmup(shardId);
+                else this._shardWarmup.delete(shardId);
             },
 
             onWriteCompleted: () => {
@@ -287,6 +298,100 @@ export class SyncManager {
     /** 根据 userId 返回所属分片 ID */
     getShardForUser(userId) {
         return userId ? shardForUserId(userId, this._numShards) : 0;
+    }
+
+    // ═══════════════════════════════════════════════════
+    //  新 leader 暖机闸
+    //
+    //  本库的选举不带日志完整性约束（投票只看 term 与基于 RTT 的
+    //  priority），数据落后的节点同样可以当选。若新 leader 立刻接受
+    //  写，冻结这类「拒绝型」状态在本机尚不可见时就会误放——该拒的
+    //  没拒，比该放的晚放严重。因此本机当选任一分片的 leader 后，
+    //  必须先追平「当前已连接 peer」的水位才接受该分片的写：能投出
+    //  这一票的 peer 都连着，其水位就是本机上岗前必须达到的下限。
+    //  追平判定用系统自身的记账：目标水位取观测到的对端最大序号与
+    //  引擎握手保留值（peer.remoteMaxSeq）的较大者，本机进度取
+    //  _sync_peers 的已应用水位；无水位行时按库的缺失水位语义，
+    //  对端不比本机日志新即视为无可追赶。无已连接 peer 时 vacuously
+    //  成立（单节点部署不会被卡住）。暖机不设超时自动放行：宁可该
+    //  分片持续 503，也不带着落后状态接受写；超过 20 秒打 error 日志。
+    // ═══════════════════════════════════════════════════
+
+    /** 该分片是否处于暖机中（本机是 leader 但尚未追平，不接受写） */
+    isShardWarming(shardId) {
+        return this._shardWarmup.has(shardId);
+    }
+
+    _beginShardWarmup(shardId) {
+        if (this._shardWarmup.has(shardId)) return;
+        const state = { startedAt: Date.now(), warned: false };
+        this._shardWarmup.set(shardId, state);
+        this._runShardWarmup(shardId, state).catch(() => {});
+    }
+
+    async _runShardWarmup(shardId, state) {
+        for (;;) {
+            await new Promise(r => setTimeout(r, 200));
+            try {
+                if (this._shardWarmup.get(shardId) !== state) return;
+                if (!this.engine.isLeaderForShard(shardId)) {
+                    this._shardWarmup.delete(shardId);
+                    return;
+                }
+                if (this._isCaughtUpWithConnectedPeers()) {
+                    this._shardWarmup.delete(shardId);
+                    console.log('[SyncManager] shard=' + shardId + ' warm-up complete in ' +
+                        (Date.now() - state.startedAt) + 'ms; accepting writes');
+                    return;
+                }
+                if (!state.warned && Date.now() - state.startedAt > 20000) {
+                    state.warned = true;
+                    console.error('[SyncManager] shard=' + shardId + ' warm-up exceeds 20s; writes stay gated until caught up with connected peers');
+                }
+                // 主动催一轮拉取，缩短暖机时长（引擎自身的拉取逻辑）
+                try { this.engine._tickPull(); } catch (_) {}
+            } catch (_) {
+                // 引擎停止等场景下静默退出
+                this._shardWarmup.delete(shardId);
+                return;
+            }
+        }
+    }
+
+    /** 本机已应用水位是否追平所有「当前已连接且已握手」peer 的目标水位 */
+    _isCaughtUpWithConnectedPeers() {
+        const connectedNodeIds = new Set();
+        for (const peerId of this._peerWsMap.keys()) {
+            const nodeId = this._peerIdToNodeId.get(peerId);
+            if (nodeId && !this._isSelf(nodeId)) connectedNodeIds.add(nodeId);
+        }
+        if (connectedNodeIds.size === 0) return true;
+
+        const rows = this.engine.db.all('SELECT peer_key, last_sync_id FROM _sync_peers', []);
+        const applied = new Map();
+        for (const r of rows) applied.set(r.peer_key, r.last_sync_id);
+
+        let localMaxSeq = null;
+        for (const nodeId of connectedNodeIds) {
+            let target = this._peerObservedMaxSeq.get(nodeId) || 0;
+            for (const peer of this.engine._peers.values()) {
+                if (peer.nodeId === nodeId && typeof peer.remoteMaxSeq === 'number') {
+                    if (peer.remoteMaxSeq > target) target = peer.remoteMaxSeq;
+                }
+            }
+            if (target === 0) continue;
+            const wm = applied.get(nodeId);
+            if (wm != null) {
+                if (wm < target) return false;
+            } else {
+                if (localMaxSeq === null) {
+                    const row = this.engine.db.get('SELECT MAX(id) AS m FROM _sync_log', []);
+                    localMaxSeq = (row && row.m) || 0;
+                }
+                if (target > localMaxSeq) return false;
+            }
+        }
+        return true;
     }
 
     /** 获取分片的选举实例（server.js 读 term 用） */
@@ -539,11 +644,13 @@ export class SyncManager {
     _extractNodeIdFromHandshake(peerId, msgStr) {
         try {
             const msg = JSON.parse(msgStr);
-            if (msg && msg.type === 'handshake' && msg.nodeId) {
+            if (!msg || typeof msg !== 'object') return;
+            if (msg.type === 'handshake' && msg.nodeId) {
                 // 跳过自己（意外的自连接场景）
                 if (this._isSelf(msg.nodeId)) return;
                 this._peerIdToNodeId.set(peerId, msg.nodeId);
                 this._peerLastSeenAt.set(msg.nodeId, Date.now());
+                if (typeof msg.lastSeq === 'number') this._notePeerProgress(msg.nodeId, msg.lastSeq);
                 // 更新 _knownPeers：只在没有记录、或已有记录不可连接（inbound://）
                 // 且新的 peerId 是可连接 URL 时更新
                 const existing = this._knownPeers.get(msg.nodeId);
@@ -551,8 +658,29 @@ export class SyncManager {
                 if (!existing || (existing.startsWith('inbound://') && isConnectable)) {
                     this._knownPeers.set(msg.nodeId, peerId);
                 }
+                return;
+            }
+            // 非握手消息同样携带对端日志进度：sync/prepare 的条目序号、
+            // ack 的 lastSeq。观测值供暖机闸判定目标水位。
+            const nodeId = this._peerIdToNodeId.get(peerId);
+            if (!nodeId) return;
+            if ((msg.type === 'sync' || msg.type === 'prepare') && Array.isArray(msg.entries)) {
+                let maxSeq = 0;
+                for (const e of msg.entries) {
+                    if (typeof e.seq === 'number' && e.seq > maxSeq) maxSeq = e.seq;
+                }
+                if (maxSeq > 0) this._notePeerProgress(nodeId, maxSeq);
+            } else if (msg.type === 'ack' && typeof msg.lastSeq === 'number') {
+                this._notePeerProgress(nodeId, msg.lastSeq);
             }
         } catch (_) {}
+    }
+
+    /** 记录观测到的对端 _sync_log 最大序号（单调递增） */
+    _notePeerProgress(nodeId, seq) {
+        if (!nodeId || this._isSelf(nodeId)) return;
+        const cur = this._peerObservedMaxSeq.get(nodeId) || 0;
+        if (seq > cur) this._peerObservedMaxSeq.set(nodeId, seq);
     }
 
     /**

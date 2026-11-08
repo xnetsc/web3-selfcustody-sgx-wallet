@@ -107,8 +107,16 @@ function createWriteProxyMiddleware(syncManager) {
 
     const userId = _extractUserIdForRouting(req.body);
 
-    // 本节点是该用户分片的 Leader，直接本地处理
-    if (syncManager.isLeaderForUser(userId)) return next();
+    // 本节点是该用户分片的 Leader，直接本地处理；
+    // 但刚当选尚在暖机（未追平已连接 peer 的水位）时不接受写——
+    // 带着落后状态执行会让冻结等拒绝型检查读到旧数据而误放
+    if (syncManager.isLeaderForUser(userId)) {
+      const shardId = syncManager.getShardForUser(userId);
+      if (syncManager.isShardWarming(shardId)) {
+        return res.status(503).json({ error: 'Leader warming up: shard ' + shardId + ' is catching up with connected peers' });
+      }
+      return next();
+    }
 
     // 本节点是 Follower，代理给对应 Leader
     try {
