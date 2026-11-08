@@ -309,6 +309,7 @@ function wrap(fn, accountFreezeManager, syncManager, getPath, options = {}) {
       const needs2PC = syncManager && WRITE_PATHS.has(path) && syncManager.isMultiNodeDeployment();
 
       let result;
+      let proxiedSyncEntries = null;
 
       if (needs2PC) {
         // ===== 2PC 模式 =====
@@ -351,6 +352,12 @@ function wrap(fn, accountFreezeManager, syncManager, getPath, options = {}) {
               console.error('[2PC] broadcastCommit failed (data committed locally, followers will sync via pull):', bcErr.message);
             }
           }
+
+          // 7. 代理请求：把本次写的 sync log 条目捎带进响应，
+          //    接收节点据此在本机补齐后再返回客户端（读己之写）
+          if (newEntries && newEntries.length > 0 && req.headers && req.headers['x-sgx-proxied-write'] === '1') {
+            proxiedSyncEntries = { writeId, entries: newEntries };
+          }
         } catch (err) {
           // 回滚事务（如果已 COMMIT 则 rollback 无效，安全忽略）
           if (!committed) {
@@ -385,7 +392,9 @@ function wrap(fn, accountFreezeManager, syncManager, getPath, options = {}) {
       const data = JSON.stringify(result);
       // 对 data 计算 SHA256 → 注入 user_report_data → 获取 SGX quote
       const attestationQuote = getAttestationQuote(data);
-      return res.json({ attestationQuote, data });
+      const envelope = { attestationQuote, data };
+      if (proxiedSyncEntries) envelope.syncEntries = proxiedSyncEntries;
+      return res.json(envelope);
     } catch (err) {
       // 只返回 message，不暴露 stack trace 或内部细节
       const msg = err.message || 'Internal server error';

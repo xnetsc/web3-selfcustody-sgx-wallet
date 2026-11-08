@@ -260,6 +260,7 @@ async function main() {
 
   syncManager = new SyncManager({
     db: connectionManager.getDatabase(),
+    readDb: connectionManager.getReadDatabase(),
     hlc,
     peerUrls: syncNodes,
     listenPort,

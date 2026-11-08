@@ -15,7 +15,7 @@
 import { WebSocketServer, WebSocket } from 'ws';
 import { createRequire } from 'module';
 import { SyncEngine } from '@xnetx/raft-hlc-sync';
-import { createSQLiteAdapter, registerBusinessTables } from './sync-adapter.js';
+import { createSQLiteAdapter, registerBusinessTables, ensureEntriesAppliedLocally } from './sync-adapter.js';
 import { getMonotonicNow, getMonotonicMs } from '../utils/monotonic-clock.js';
 
 const require_fn = createRequire(import.meta.url);
@@ -119,6 +119,9 @@ export class SyncManager {
 
         // ===== 创建 SyncEngine（核心算法引擎）=====
         const dbAdapter = createSQLiteAdapter(options.db);
+        // 独立只读连接的适配器：供代理写补齐时校验"已提交可读"
+        //（写连接会看到 follower 暂存事务的未提交数据，不能用作校验）
+        this._readDbAdapter = options.readDb ? createSQLiteAdapter(options.readDb) : null;
 
         // peerId → ws 映射
         this._peerWsMap = new Map();
@@ -302,9 +305,20 @@ export class SyncManager {
         const result = await this.engine.proxyRequest(shardKey, {
             method: reqInfo.method,
             path: reqInfo.path,
-            headers: reqInfo.headers,
+            // 标记为代理写：leader 在响应中捎带本次写的 sync log 条目
+            headers: { ...(reqInfo.headers || {}), 'x-sgx-proxied-write': '1' },
             body: reqInfo.body,
         });
+        // 读己之写：leader 捎回的条目先在本机补齐（经引擎既有 sync 入口
+        // 事务化应用），确认本机可读后才把响应返回给调用方；
+        // syncEntries 是节点间字段，剥离后再向客户端返回。
+        const syncEntries = result && result.body ? result.body.syncEntries : null;
+        if (syncEntries && Array.isArray(syncEntries.entries) && syncEntries.entries.length > 0) {
+            delete result.body.syncEntries;
+            const leaderNodeId = this.engine.getLeaderForKey(shardKey);
+            const peerId = (leaderNodeId && this._knownPeers.get(leaderNodeId)) || leaderNodeId || 'leader';
+            await ensureEntriesAppliedLocally({ engine: this.engine, peerId, entries: syncEntries.entries, verifyDb: this._readDbAdapter });
+        }
         return result;
     }
 

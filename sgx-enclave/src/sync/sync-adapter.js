@@ -8,6 +8,7 @@
  */
 
 import { randomUUID } from 'node:crypto';
+import { HLC } from '@xnetx/raft-hlc-sync';
 
 // ═══════════════════════════════════════════════════
 //  DatabaseAdapter（better-sqlite3 → sync-lib 接口）
@@ -322,4 +323,74 @@ export function createConnProxy(db) {
             }
         },
     };
+}
+
+// ═══════════════════════════════════════════════════
+//  代理写的读己之写（接收节点本机补齐）
+// ═══════════════════════════════════════════════════
+
+/**
+ * 只读校验：一批 sync log 条目的效果是否已在本机业务表可读。
+ * INSERT/UPDATE：对应行存在且 _hlc 不旧于条目（相等=已应用，更大=已被更新的写覆盖）；
+ * DELETE：对应行已不存在，或已被更新的写重新创建。
+ * @param {object} db - engine 的 DatabaseAdapter（只用 get）
+ * @param {Array<object>} entries - _sync_log 条目（readSyncLog 形状）
+ * @returns {boolean}
+ */
+export function entriesVisibleLocally(db, entries) {
+    for (const entry of entries) {
+        const def = BUSINESS_TABLES[entry.table_name];
+        if (!def) continue;
+        let key;
+        try { key = JSON.parse(entry.row_key); } catch { return false; }
+        const where = def.keyColumns.map(c => `"${c}" = ?`).join(' AND ');
+        const params = def.keyColumns.map(c => key[c]);
+        const row = db.get(`SELECT _hlc FROM "${entry.table_name}" WHERE ${where}`, params);
+        if (!row) {
+            if (entry.operation !== 'DELETE') return false;
+            continue;
+        }
+        const cmp = HLC.compare(row._hlc, entry._hlc);
+        if (entry.operation === 'DELETE') {
+            if (cmp === 0) return false;
+        } else if (cmp < 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/**
+ * 把 leader 随代理响应捎回的 sync log 条目补齐到本机，直到可读为止。
+ *
+ * 入库只走引擎既有接口：以既有 'sync' 消息经 receiveMessage 注入，
+ * 由引擎内部 applyEntries 在单个事务内整批应用（全有或全无）；
+ * 本函数只负责注入与只读校验，不直接写任何业务表。
+ * 注入可能暂时失败（如本机正暂存着该写的 prepare 事务、连接被占用），
+ * 轮询重试直到条目可读；超过 deadlineMs 仍不可读则抛错——写已在
+ * leader 提交成功，此时报错好过把"返回即可读"的保证静默打破。
+ *
+ * @param {{ engine: object, peerId: string, entries: Array<object>,
+ *           verifyDb?: object, deadlineMs?: number, pollMs?: number }} opts
+ *   engine 为本机 SyncEngine（用 receiveMessage 注入）；
+ *   peerId 为 leader 在本机引擎中的对端标识（水位/ack 记账用）；
+ *   verifyDb 为校验用 DatabaseAdapter——必须是独立只读连接（只见已提交
+ *   快照）：引擎写连接在 follower 暂存事务打开时能看到未提交的暂存数据，
+ *   拿它校验会把"暂存可见"误判为"已可读"，而暂存可能被回滚。
+ *   未传时退回 engine.db（仅单机/测试场景）。
+ */
+export async function ensureEntriesAppliedLocally({ engine, peerId, entries, verifyDb, deadlineMs = 10000, pollMs = 25 }) {
+    if (!entries || entries.length === 0) return;
+    const vdb = verifyDb || engine.db;
+    const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+    const deadline = Date.now() + deadlineMs;
+    for (;;) {
+        if (entriesVisibleLocally(vdb, entries)) return;
+        try { engine.receiveMessage(peerId, JSON.stringify({ type: 'sync', entries })); } catch (_) {}
+        if (entriesVisibleLocally(vdb, entries)) return;
+        if (Date.now() >= deadline) {
+            throw new Error('proxied write committed on leader but its sync entries are not readable locally within ' + deadlineMs + 'ms');
+        }
+        await sleep(pollMs);
+    }
 }

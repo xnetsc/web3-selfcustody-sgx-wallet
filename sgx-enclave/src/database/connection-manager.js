@@ -187,6 +187,15 @@ class ConnectionManager {
     }
 
     /**
+     * 获取独立只读连接的原始 better-sqlite3 实例（WAL 下只见已提交快照）。
+     * 与 getDatabase() 同样只能用于构造适配器，不能直接执行 SQL。
+     */
+    getReadDatabase() {
+        this._ensureInitialized();
+        return this._readDb;
+    }
+
+    /**
      * 给原始 better-sqlite3 Database 实例（主连接 + 只读连接）装探针。
      *
      * 设计：统一引擎（SyncEngine 适配器）与本类需要的原始函数都已在初始化时
