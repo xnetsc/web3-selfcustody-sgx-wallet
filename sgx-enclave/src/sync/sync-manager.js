@@ -40,7 +40,7 @@ const DEFAULT_NUM_SHARDS = 16;
 const PROXY_WAIT_MS = 6000;
 const PROXY_TIMEOUT_MS = 10000;
 const PREPARE_TIMEOUT_MS = 5000;
-const FOLLOWER_TXN_TIMEOUT_MS = 15000;
+const FOLLOWER_TXN_TIMEOUT_MS = 6000; // follower 暂存事务超时：2026-11-08 由 15s 压到 6s，commit 广播丢失时更快回滚并转入 pull 追赶；取值须大于 PREPARE_TIMEOUT_MS(5s)——协调者最迟在 prepare 预算耗尽时才发 commit，定得比它小会误杀慢 quorum 的正常提交
 const PEERS_BROADCAST_INTERVAL_MS = 60000; // 每 60 秒广播一次已知节点列表
 
 // ========== 工具函数 ==========
