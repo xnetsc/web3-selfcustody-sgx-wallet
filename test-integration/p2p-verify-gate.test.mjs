@@ -1,13 +1,14 @@
 /**
- * RA-TLS 发送门端到端测试 —— 真实 SyncManager（WSS）+ 桩验证器
+ * RA-TLS 注册延迟端到端测试 —— 真实 SyncManager（WSS）+ 桩验证器
  *
- * 强制验证模式（本节点有 RA-TLS 身份且 allowNonRaTls=false）下：
- *   场景 1：验证耗时 500ms 且通过 —— 验证完成前客户端收不到任何字节
- *           （引擎 handshake / pin-check 全部排队），通过后排队消息补发
- *   场景 2：验证不通过 —— 客户端零字节，连接被销毁
+ * 强制验证模式（本节点有 RA-TLS 身份且 allowNonRaTls=false）下，
+ * 验证出结果前业务逻辑层不知道连接存在（不注册、事件不触发）：
+ *   场景 1：验证耗时 500ms 且通过 —— 验证完成前客户端收不到任何字节，
+ *           通过后连接才注册，handshake / pin-check 随之发出
+ *   场景 2：验证不通过 —— 客户端零字节，连接被销毁（从未注册）
  *   场景 3：客户端不提供证书 —— 同样零字节并被销毁
  *   场景 4：非强制模式（allowNonRaTls=true）+ 同样耗时的验证器 ——
- *           不设门，handshake 立即到达（证明门只由配置决定）
+ *           不延迟注册，handshake 立即到达（证明延迟只由配置决定）
  *
  * 证书由 @xnetx/sgx-ra-tls-verify 的 generateRaTlsCertificate 生成
  * （非 SGX 环境无 quote，验证判定由注入的桩验证器给出——验证器正是
@@ -83,7 +84,7 @@ function connectClient(port, { certPem, keyPem }, observeMs) {
 }
 
 async function main() {
-    console.log('=== RA-TLS 发送门端到端测试 ===\n');
+    console.log('=== RA-TLS 注册延迟端到端测试 ===\n');
 
     // 非 SGX 环境：produceQuote 返回 null → 生成无 quote 的自签证书
     // （与 launcher 在非 SGX 环境的行为一致）；验证判定由桩验证器给出
@@ -111,12 +112,12 @@ async function main() {
         await mgr.start();
         const { received } = await connectClient(3341, { certPem, keyPem }, 1600);
         console.log('[场景1] arrivals:', received.map((r) => r.at + 'ms'));
-        assert(received.length > 0, 'queued messages should be flushed after verification');
+        assert(received.length > 0, 'messages should be sent once registration completes after verification');
         assert(received[0].at >= VERIFY_DELAY_MS - 100,
             'no bytes may leave before verification completes, first arrived at ' + received[0].at + 'ms');
         assert(received.some((r) => r.data.includes('"handshake"')),
-            'engine handshake should be among the flushed messages');
-        console.log('✓ 场景 1 通过：验证前零字节，通过后排队消息补发\n');
+            'engine handshake should be sent right after registration');
+        console.log('✓ 场景 1 通过：验证前零字节，通过后注册并发出 handshake\n');
         mgr.stop(); db.close();
     }
 
@@ -148,7 +149,7 @@ async function main() {
         mgr.stop(); db.close();
     }
 
-    // ---- 场景 4：非强制模式 → 不设门，消息立即到达 ----
+    // ---- 场景 4：非强制模式 → 不延迟注册，消息立即到达 ----
     {
         const { mgr, db } = createServer({
             port: 3344, allowNonRaTls: true, verifier: delayedOkVerifier, certPath, keyPem,
@@ -160,7 +161,7 @@ async function main() {
         assert(received.length > 0, 'non-mandatory mode should deliver messages');
         assert(received[0].at < VERIFY_DELAY_MS - 100,
             'non-mandatory mode must not gate on verification, first arrived at ' + received[0].at + 'ms');
-        console.log('✓ 场景 4 通过：配置不强制时不设门\n');
+        console.log('✓ 场景 4 通过：配置不强制时不延迟注册\n');
         mgr.stop(); db.close();
     }
 

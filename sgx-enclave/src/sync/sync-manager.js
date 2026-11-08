@@ -120,12 +120,10 @@ export class SyncManager {
 
         // RA-TLS 强制验证模式：本节点有 RA-TLS 身份且配置不允许非 RA-TLS
         // 对端（allowNonRaTls=false）。此模式下入站、出站一视同仁：对端
-        // 证书验证通过之前，本地数据一个字节都不许发出——待发消息先排队，
-        // 验证通过后补发，验证失败丢弃队列（连接随后按原逻辑销毁）。
+        // 证书验证通过之前不完成连接注册——本地逻辑不认识这条连接，
+        // 自然无从向它发送、它发来的数据也无处投递。
         this._ratlsMandatory = !!(this._cert && this._key &&
             this.raTlsOptions && !this.raTlsOptions.allowNonRaTls);
-        // Map<ws, {status, queue, ws}> - 验证中连接的发送门（见 _sendGated）
-        this._verifyGates = new Map();
 
         // ===== 创建 SyncEngine（核心算法引擎）=====
         const dbAdapter = createSQLiteAdapter(options.db);
@@ -195,7 +193,9 @@ export class SyncManager {
 
             onSendToPeer: (peerId, message) => {
                 const ws = this._peerWsMap.get(peerId);
-                if (ws) this._sendGated(ws, message);
+                if (ws && ws.readyState === WebSocket.OPEN) {
+                    ws.send(message);
+                }
             },
 
             onClosePeer: (peerId) => {
@@ -284,7 +284,6 @@ export class SyncManager {
         this._peerIdToNodeId.clear();
         this._pinCheckedPeers.clear();
         this._pinCheckWaiters.clear();
-        this._verifyGates.clear();
 
         if (this.wss) { this.wss.close(); this.wss = null; }
         if (this._httpsServer) { this._httpsServer.close(); this._httpsServer = null; }
@@ -506,27 +505,13 @@ export class SyncManager {
                 };
                 this._httpsServer = https.createServer(httpsOptions);
                 this._httpsServer.on('secureConnection', (tlsSocket) => {
-                    // 强制验证模式：先给这条连接上发送门（wss connection 事件
-                    // 随后把它挂到 ws 上）；验证通过开门补发排队消息，
-                    // 验证失败丢弃队列并按原逻辑销毁套接字
-                    const gate = this._ratlsMandatory
-                        ? { status: 'verifying', queue: [], ws: null }
-                        : null;
-                    if (gate) tlsSocket._ratlsGate = gate;
-                    this._verifyPeerCert(tlsSocket, 'client').then(() => {
-                        if (!gate) return;
-                        gate.status = 'verified';
-                        if (gate.ws) {
-                            // 先执行被延迟的注册（peerConnected 等），再开门：
-                            // 注册那一刻发出的 handshake / pin-check 正好放行
-                            if (gate.onVerified) gate.onVerified();
-                            this._flushVerifyGate(gate.ws);
-                        }
-                    }).catch((err) => {
-                        if (gate) {
-                            gate.status = 'failed';
-                            if (gate.ws) this._dropVerifyGate(gate.ws);
-                        }
+                    const verifyPromise = this._verifyPeerCert(tlsSocket, 'client');
+                    if (this._ratlsMandatory) {
+                        // 强制验证模式：把验证 Promise 留给 wss connection
+                        // 阶段——入站注册等它通过后才执行（见 connection 处理）
+                        tlsSocket._ratlsVerifyPromise = verifyPromise;
+                    }
+                    verifyPromise.catch((err) => {
                         console.error('[SyncManager] Inbound RA-TLS verification failed:', err.message);
                         tlsSocket.destroy();
                     });
@@ -554,21 +539,13 @@ export class SyncManager {
 
             this.wss.on('connection', (ws, req) => {
                 const peerId = 'inbound://' + req.socket.remoteAddress + ':' + req.socket.remotePort;
-                // 接过 secureConnection 阶段建好的发送门（强制验证模式才有）
-                const inGate = req.socket && req.socket._ratlsGate;
-                if (inGate) {
-                    inGate.ws = ws;
-                    this._verifyGates.set(ws, inGate);
-                    if (inGate.status === 'verified') this._flushVerifyGate(ws);
-                    else if (inGate.status === 'failed') this._dropVerifyGate(ws);
-                }
 
                 // 注册是本地一切逻辑认识这条连接的起点：_registerWs 之后
                 // 管理器才可能向它发送，peerConnected 之后引擎才把它当
                 // 推送目标并发出 handshake。强制验证模式把注册延迟到
                 // RA-TLS 验证通过后才执行——未注册期间这条连接在本地
                 // 不存在：推不出（无目标）、发不出（无登记）、收到的数据
-                // 也无处投递（引擎未注册即丢弃，管理器处理在注册后才挂）
+                // 也无处投递（未注册即不处理）
                 let registered = false;
                 const doRegister = () => {
                     if (registered || ws.readyState !== WebSocket.OPEN) return;
@@ -578,16 +555,17 @@ export class SyncManager {
                     // 先刷新合约缓存（可能合约有迁移），再发送 pin-check 握手
                     this._refreshAndSendPinCheck(peerId, ws);
                 };
-                if (inGate && inGate.status === 'verifying') {
-                    inGate.onVerified = doRegister;
-                } else if (!inGate || inGate.status === 'verified') {
+                const verifyPromise = req.socket && req.socket._ratlsVerifyPromise;
+                if (verifyPromise) {
+                    // 验证失败不注册：套接字已由 secureConnection 路径销毁
+                    verifyPromise.then(() => doRegister(), () => {});
+                } else {
                     doRegister();
                 }
-                // 验证失败（failed）不注册：套接字已由验证路径销毁
 
                 ws.on('message', (data) => {
-                    // RA-TLS 验证通过前收到的数据直接丢弃（强制验证模式）
-                    if (this._isVerifyGated(ws)) return;
+                    // 未注册（RA-TLS 验证未通过）期间收到的数据不处理
+                    if (!registered) return;
                     const msgStr = data.toString();
                     if (this._handlePinCheckMessage(peerId, ws, msgStr)) return;
                     // 拦截 handshake 消息以提取 nodeId
@@ -600,7 +578,6 @@ export class SyncManager {
                     this._peerIdToNodeId.delete(peerId);
                     this._pinCheckedPeers.delete(peerId);
                     this._pinCheckWaiters.delete(peerId);
-                    this._verifyGates.delete(ws);
                 });
                 ws.on('error', (err) => {
                     console.error('[SyncManager] Inbound error:', err.message);
@@ -645,12 +622,6 @@ export class SyncManager {
             }
             const ws = new WebSocket(url, wsOptions);
 
-            // 强制验证模式：连接一建立就上发送门（与入站对称），
-            // 验证通过前本地数据一个字节都不许出去
-            if (this._ratlsMandatory) {
-                this._verifyGates.set(ws, { status: 'verifying', queue: [], ws });
-            }
-
             ws.on('open', () => {
                 console.log('[SyncManager] Connected to peer: ' + url);
 
@@ -658,10 +629,8 @@ export class SyncManager {
                     const rawSocket = ws._socket;
                     if (rawSocket && typeof rawSocket.getPeerCertificate === 'function') {
                         this._verifyPeerCert(rawSocket, 'server').then(() => {
-                            this._flushVerifyGate(ws);
                             this._finishOutboundConnect(url, ws);
                         }).catch((err) => {
-                            this._dropVerifyGate(ws);
                             console.error('[SyncManager] Outbound RA-TLS failed for ' + url + ':', err.message);
                             ws.close();
                         });
@@ -669,8 +638,7 @@ export class SyncManager {
                     }
                 }
                 if (this._ratlsMandatory) {
-                    // 强制验证模式下拿不到对端证书 = 无法验证，绝不放行
-                    this._dropVerifyGate(ws);
+                    // 强制验证模式下拿不到对端证书 = 无法验证，绝不完成注册
                     console.error('[SyncManager] Outbound RA-TLS verification required but peer certificate unavailable: ' + url);
                     ws.close();
                     return;
@@ -679,8 +647,9 @@ export class SyncManager {
             });
 
             ws.on('message', (data) => {
-                // RA-TLS 验证通过前收到的数据直接丢弃（强制验证模式）
-                if (this._isVerifyGated(ws)) return;
+                // 强制验证模式：注册完成（验证通过）前收到的数据不处理；
+                // 注册前引擎也不认识这条连接（peerConnected 在注册时才调）
+                if (this._ratlsMandatory && !ws._finishedConnect) return;
                 const msgStr = data.toString();
                 if (this._handlePinCheckMessage(url, ws, msgStr)) return;
                 // 拦截 handshake 消息以提取 nodeId
@@ -695,7 +664,6 @@ export class SyncManager {
                 this._peerIdToNodeId.delete(url);
                 this._pinCheckedPeers.delete(url);
                 this._pinCheckWaiters.delete(url);
-                this._verifyGates.delete(ws);
                 if (this._started && !ws._dedupClosed) {
                     this._addToPending(url);
                 }
@@ -717,6 +685,7 @@ export class SyncManager {
     }
 
     _finishOutboundConnect(url, ws) {
+        ws._finishedConnect = true;
         this.pendingConnections.delete(url);
         this._registerWs(url, ws);
         this.engine.peerConnected(url, { direction: 'outbound' });
@@ -726,50 +695,6 @@ export class SyncManager {
 
     _registerWs(peerId, ws) {
         this._peerWsMap.set(peerId, ws);
-    }
-
-    /**
-     * 统一发送出口（仅强制验证模式有门）：连接处于 RA-TLS 验证中时，
-     * 消息只入队不发出；无门或验证已通过时才真正 ws.send。
-     * 引擎与管理器自身的所有发送都必须走这里，保证强制验证模式下
-     * 验证通过前本地数据零字节外发。
-     */
-    _sendGated(ws, raw) {
-        const gate = this._verifyGates.get(ws);
-        if (gate && gate.status === 'verifying') {
-            gate.queue.push(raw);
-            return;
-        }
-        if (ws.readyState === WebSocket.OPEN) {
-            ws.send(raw);
-        }
-    }
-
-    /** 该连接是否处于 RA-TLS 验证中：此时收到的数据直接丢弃 */
-    _isVerifyGated(ws) {
-        const gate = this._verifyGates.get(ws);
-        return !!gate && gate.status === 'verifying';
-    }
-
-    /** 验证通过：开门，排队消息按原序补发 */
-    _flushVerifyGate(ws) {
-        const gate = this._verifyGates.get(ws);
-        if (!gate) return;
-        this._verifyGates.delete(ws);
-        if (ws.readyState === WebSocket.OPEN) {
-            for (const raw of gate.queue) {
-                try { ws.send(raw); } catch (_) {}
-            }
-        }
-        gate.queue.length = 0;
-    }
-
-    /** 验证失败：关门并丢弃排队消息（连接由调用方按原逻辑销毁） */
-    _dropVerifyGate(ws) {
-        const gate = this._verifyGates.get(ws);
-        if (!gate) return;
-        this._verifyGates.delete(ws);
-        gate.queue.length = 0;
     }
 
     /**
@@ -886,7 +811,9 @@ export class SyncManager {
             listenUrls: this._getAdvertisedUrls(),
         });
         try {
-            this._sendGated(ws, msg);
+            if (ws.readyState === WebSocket.OPEN) {
+                ws.send(msg);
+            }
         } catch (err) {
             console.error('[SyncManager] _sendPinCheck failed for ' + peerId + ':', err.message);
         }
@@ -1094,7 +1021,9 @@ export class SyncManager {
     _sendPinCheckAck(ws, ok) {
         const msg = JSON.stringify({ type: 'pin-check-ack', ok });
         try {
-            this._sendGated(ws, msg);
+            if (ws.readyState === WebSocket.OPEN) {
+                ws.send(msg);
+            }
         } catch (_) {}
     }
 
@@ -1256,7 +1185,7 @@ export class SyncManager {
         for (const peerId of trustedPeers) {
             const ws = this._peerWsMap.get(peerId);
             try {
-                this._sendGated(ws, msg);
+                ws.send(msg);
             } catch (err) {
                 console.error('[SyncManager] Failed to broadcast peers-list to ' + peerId + ':', err.message);
             }
