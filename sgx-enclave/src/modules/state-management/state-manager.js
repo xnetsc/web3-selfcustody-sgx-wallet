@@ -887,6 +887,7 @@ export class StateManager {
     let synced = 0;
     let deleted = 0;
     let skippedUsers = 0;
+    let failed = 0;
 
     for (const { user_id: userId } of userRows) {
       let chainRecords;
@@ -914,16 +915,23 @@ export class StateManager {
           } catch { /* 授权原文不可解析时不补全 */ }
         }
         const before = await this.getRevocation(userId, rec.authorizationId);
-        await this.recordRevocation({
-          userId,
-          authorizationId: rec.authorizationId,
-          grantee: rec.grantee,
-          source: 'contract',
-          revokedAt: rec.revokedAt,
-          authorizationExpiresAt,
-          authorizationHash,
-        });
-        if (!before) synced++;
+        // 逐条隔离：单条写失败（如 2PC prepare 被并发写占用而 abort）只跳过本条，
+        // 不中断整轮同步；未落地的记录下一轮全量对账会重新补齐
+        try {
+          await this.recordRevocation({
+            userId,
+            authorizationId: rec.authorizationId,
+            grantee: rec.grantee,
+            source: 'contract',
+            revokedAt: rec.revokedAt,
+            authorizationExpiresAt,
+            authorizationHash,
+          });
+          if (!before) synced++;
+        } catch (err) {
+          failed++;
+          console.warn(`[AuthorizationRevocation] contract sync record failed for userId=${userId}, authorizationId=${rec.authorizationId}: ${err.message}`);
+        }
       }
 
       // 同一次同步内做删除对账：本地 contract 缓存中链上已不存在的记录删除
@@ -933,20 +941,26 @@ export class StateManager {
       );
       for (const row of localContractRows) {
         if (!chainIds.has(row.authorization_id)) {
-          const removed = await this.deleteRevocation(userId, row.authorization_id, {
-            expectedSource: 'contract',
-            reason: 'contract sync: no revocation record on contract',
-            restoreState: true,
-          });
-          if (removed) deleted++;
+          // 与写入同一口径逐条隔离：单条删除失败不中断整轮，下一轮对账重试
+          try {
+            const removed = await this.deleteRevocation(userId, row.authorization_id, {
+              expectedSource: 'contract',
+              reason: 'contract sync: no revocation record on contract',
+              restoreState: true,
+            });
+            if (removed) deleted++;
+          } catch (err) {
+            failed++;
+            console.warn(`[AuthorizationRevocation] contract sync delete failed for userId=${userId}, authorizationId=${row.authorization_id}: ${err.message}`);
+          }
         }
       }
     }
 
-    if (synced > 0 || deleted > 0 || skippedUsers > 0) {
-      console.log(`[AuthorizationRevocation] contract sync: users=${userRows.length}, synced=${synced}, deleted=${deleted}, skippedUsers=${skippedUsers}`);
+    if (synced > 0 || deleted > 0 || skippedUsers > 0 || failed > 0) {
+      console.log(`[AuthorizationRevocation] contract sync: users=${userRows.length}, synced=${synced}, deleted=${deleted}, skippedUsers=${skippedUsers}, failed=${failed}`);
     }
-    return { users: userRows.length, synced, deleted, skippedUsers };
+    return { users: userRows.length, synced, deleted, skippedUsers, failed };
   }
 
   // ========== 签名防重放（GUID nonce） ==========
