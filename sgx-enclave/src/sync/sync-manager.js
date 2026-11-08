@@ -367,9 +367,17 @@ export class SyncManager {
         }
         if (connectedNodeIds.size === 0) return true;
 
-        const rows = this.engine.db.all('SELECT peer_key, last_sync_id FROM _sync_peers', []);
+        // 本机对各 peer 日志的消费进度（pull 偏移，与 target 同为对方序号
+        // 空间，可直接比对）。引擎旧版本没有 _sync_pull_offsets 表时退回
+        // _sync_peers 读法，保持依赖升级前的闸门行为；升级后自动走精确偏移。
+        let rows;
+        try {
+            rows = this.engine.db.all('SELECT peer_key, last_pulled_seq AS progress FROM _sync_pull_offsets', []);
+        } catch (_) {
+            rows = this.engine.db.all('SELECT peer_key, last_sync_id AS progress FROM _sync_peers', []);
+        }
         const applied = new Map();
-        for (const r of rows) applied.set(r.peer_key, r.last_sync_id);
+        for (const r of rows) applied.set(r.peer_key, r.progress);
 
         let localMaxSeq = null;
         for (const nodeId of connectedNodeIds) {
@@ -710,6 +718,8 @@ export class SyncManager {
         });
         for (const key of staleKeys) {
             db.run('DELETE FROM _sync_peers WHERE peer_key = ?', [key]);
+            // pull 偏移表与水位行同生命周期（引擎旧版本无此表时忽略）
+            try { db.run('DELETE FROM _sync_pull_offsets WHERE peer_key = ?', [key]); } catch (_) {}
             console.log(`[SyncManager] stale peer watermark pruned: peer=${key} (not seen for over 7 days)`);
         }
         return staleKeys.length;
