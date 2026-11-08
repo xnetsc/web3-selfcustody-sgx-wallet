@@ -6,7 +6,7 @@
  * 大数处理：使用 JavaScript 原生 BigInt（Wei 精度）
  */
 
-import { createConnProxy } from '../../sync/sync-adapter.js';
+import { createConnProxy, shouldExecuteInternalWrite } from '../../sync/sync-adapter.js';
 import { getMonotonicDate, getMonotonicSqliteNow } from '../../utils/monotonic-clock.js';
 
 /**
@@ -250,13 +250,15 @@ export class StateManager {
    * @param {number} chainId
    * @param {string} tokenAddress
    */
-  async incrementUsage(authorizationId, amount, chainId, tokenAddress) {
+  async incrementUsage(authorizationId, amount, chainId, tokenAddress, userId = null) {
     if (!authorizationId || amount === undefined || amount === null) {
       throw new Error('authorizationId and amount are required');
     }
 
     console.log(`[StateManager] incrementUsage: authorizationId=${authorizationId}, amount=${amount}, chainId=${chainId}, token=${tokenAddress}`);
 
+    // 分片键必须用 userId（与请求路由分片一致），此前误用 authorizationId，
+    // 2PC 的 term 守卫落在错误的分片上；缺省时回退旧行为仅为兼容未知调用方
     await this._engine.write(async (db) => {
       const conn = createConnProxy(db);
       const ts = this._engine.hlc.tick();
@@ -296,7 +298,7 @@ export class StateManager {
          WHERE authorization_id = ? AND chain_id = ? AND token_address = ?`,
         [newTokenTotal, ts, authorizationId, chainId, tokenAddress]
       );
-    }, authorizationId);
+    }, userId ?? authorizationId);
   }
 
   /**
@@ -315,13 +317,21 @@ export class StateManager {
 
     console.log(`[StateManager] updateStatus: authorizationId=${authorizationId}, newStatus=${newStatus}`);
 
+    // 分片键必须用该授权所属 userId（与请求路由分片一致）：先读出归属再写，
+    // 此前误用 authorizationId，2PC 的 term 守卫落在错误的分片上
+    const ownerRows = await this._db.readQuery(
+      'SELECT user_id FROM authorization_states WHERE authorization_id = ?',
+      [authorizationId]
+    );
+    const ownerUserId = ownerRows && ownerRows.length > 0 ? ownerRows[0].user_id : null;
+
     const result = await this._engine.write(async (db) => {
       const ts = this._engine.hlc.tick();
       return db.run(
         `UPDATE authorization_states SET status = ?, updated_at = ?, _hlc = ? WHERE authorization_id = ? AND status = ?`,
         [newStatus, getMonotonicSqliteNow(), ts, authorizationId, 'active']
       );
-    }, authorizationId);
+    }, ownerUserId ?? authorizationId);
 
     console.log(`[StateManager] updateStatus: affectedRows=${result.changes}`);
     return result.changes > 0;
@@ -888,8 +898,16 @@ export class StateManager {
     let deleted = 0;
     let skippedUsers = 0;
     let failed = 0;
+    let leaderSkipped = 0;
 
     for (const { user_id: userId } of userRows) {
+      // leader 纪律与 HTTP 写请求一致（见 sync-adapter shouldExecuteInternalWrite）：
+      // 该用户分片 leader 是其它节点时本节点不执行，由 leader 节点上的同一轮
+      // 同步完成；无 leader 时本地兜底落地，后续靠同步传播，不会写坏。
+      if (!shouldExecuteInternalWrite(this._engine, userId)) {
+        leaderSkipped++;
+        continue;
+      }
       let chainRecords;
       try {
         chainRecords = await contractClient.getRevokedAuthorizations(userId);
@@ -957,10 +975,10 @@ export class StateManager {
       }
     }
 
-    if (synced > 0 || deleted > 0 || skippedUsers > 0 || failed > 0) {
-      console.log(`[AuthorizationRevocation] contract sync: users=${userRows.length}, synced=${synced}, deleted=${deleted}, skippedUsers=${skippedUsers}, failed=${failed}`);
+    if (synced > 0 || deleted > 0 || skippedUsers > 0 || failed > 0 || leaderSkipped > 0) {
+      console.log(`[AuthorizationRevocation] contract sync: users=${userRows.length}, synced=${synced}, deleted=${deleted}, skippedUsers=${skippedUsers}, failed=${failed}, leaderSkipped=${leaderSkipped}`);
     }
-    return { users: userRows.length, synced, deleted, skippedUsers, failed };
+    return { users: userRows.length, synced, deleted, skippedUsers, failed, leaderSkipped };
   }
 
   // ========== 签名防重放（GUID nonce） ==========

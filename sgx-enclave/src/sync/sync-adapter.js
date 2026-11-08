@@ -75,6 +75,33 @@ export function createEngineFacade(engine) {
 }
 
 // ═══════════════════════════════════════════════════
+//  内部写的 leader 路由判定
+// ═══════════════════════════════════════════════════
+
+/**
+ * 进程内部发起的写（定时同步、定时清理、钉住落库等不经 HTTP 写框架的写）
+ * 与 HTTP 写请求共用同一条 leader 纪律，不另设内部通道：
+ *
+ *   - 该分片 leader 是本节点 → 本地执行，与 HTTP 写请求落到 leader 上
+ *     执行完全一致；
+ *   - 该分片暂无 leader → 本地兜底执行。变更由触发器记入 _sync_log：
+ *     有 peer 连接时 engine.write 照常走 2PC 广播，无 peer 时本地提交，
+ *     待 leader 出现后靠提交广播与 HLC 拉/推传播到其它节点。这类写入
+ *     内容均为幂等、可对账的数据（链上导出 / 状态过期判定），不会写坏；
+ *   - 该分片 leader 是其它节点 → 不在本地执行。周期性内部逻辑每个节点
+ *     都在跑，该分片的工作由 leader 节点上的同一份逻辑完成，分工结果
+ *     与 HTTP 转发到 leader 执行等效。
+ *
+ * @param {object} engine SyncEngine 实例（或其 facade）
+ * @param {string|null} shardKey 分片键（如 userId）；null 表示 shard 0
+ * @returns {boolean} 本节点是否应执行这笔内部写
+ */
+export function shouldExecuteInternalWrite(engine, shardKey) {
+    const leader = shardKey ? engine.getLeaderForKey(shardKey) : engine.getLeaderForShard(0);
+    return leader == null || leader === engine.nodeId;
+}
+
+// ═══════════════════════════════════════════════════
 //  业务表定义 + validators + deserializers
 // ═══════════════════════════════════════════════════
 

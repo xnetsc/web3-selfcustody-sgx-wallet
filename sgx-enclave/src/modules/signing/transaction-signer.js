@@ -664,7 +664,8 @@ export class TransactionSigner {
         authorizationId,
         txParams.value,
         txParams.chainId,
-        tokenAddress
+        tokenAddress,
+        userId
       );
 
       console.log(`[TransactionSigner] signAndUpdate: mode=txParams complete, txHash=${result.txHash}`);
@@ -759,7 +760,8 @@ export class TransactionSigner {
             authorizationId,
             token.amount,
             effectiveChainId,
-            token.tokenAddress
+            token.tokenAddress,
+            userId
           );
         }
       } else {
@@ -778,7 +780,8 @@ export class TransactionSigner {
         authorizationId,
         effectiveAmount,
         effectiveChainId,
-        effectiveTokenAddress
+        effectiveTokenAddress,
+        userId
       );
     }
 

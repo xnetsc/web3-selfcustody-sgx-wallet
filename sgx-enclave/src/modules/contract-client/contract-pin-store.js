@@ -21,7 +21,7 @@
 const PIN_ROW_ID = 1;
 
 import { getMonotonicSqliteNow } from '../../utils/monotonic-clock.js';
-import { createConnProxy } from '../../sync/sync-adapter.js';
+import { createConnProxy, shouldExecuteInternalWrite } from '../../sync/sync-adapter.js';
 
 export class ContractPinStore {
   /**
@@ -115,6 +115,13 @@ export class ContractPinStore {
    * @param {Object} record
    */
   async _writeSave(record) {
+    // leader 纪律（shouldExecuteInternalWrite）：pinned_contract 属 shard 0，
+    // leader 是其它节点时不本地落库，由 leader 节点钉住同一份数据后同步过来；
+    // 无 leader 时本地兜底落库，后续靠同步传播。
+    if (!shouldExecuteInternalWrite(this._engine, null)) {
+      console.log('[ContractPinStore] skip pin save: shard 0 leader is another node');
+      return;
+    }
     const { rpcUrl, chainId, contractAddress, allowNonRaTls, rpcTlsCaCert } = record;
     const snapshotJson = record.snapshot ? JSON.stringify(record.snapshot) : null;
     const allowNonRaTlsVal = allowNonRaTls ? 1 : 0;
@@ -182,6 +189,11 @@ export class ContractPinStore {
    * @param {Object} record
    */
   async _writeIdentity(record) {
+    // 同 _writeSave 的 leader 纪律：leader 是其它节点时跳过本地落库
+    if (!shouldExecuteInternalWrite(this._engine, null)) {
+      console.log('[ContractPinStore] skip pin identity write: shard 0 leader is another node');
+      return;
+    }
     const { rpcUrl, chainId, contractAddress, allowNonRaTls, rpcTlsCaCert } = record;
     const snapshotJson = record.snapshot ? JSON.stringify(record.snapshot) : null;
     const allowNonRaTlsVal = allowNonRaTls ? 1 : 0;

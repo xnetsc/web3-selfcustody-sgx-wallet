@@ -30,7 +30,7 @@ import { CertificateVerifier } from '@xnetx/sgx-ra-tls-verify';
 import { createContractClientFromEnv } from './src/modules/contract-client/index.js';
 import { ContractPinStore } from './src/modules/contract-client/contract-pin-store.js';
 import { SyncManager } from './src/sync/sync-manager.js';
-import { createEngineFacade } from './src/sync/sync-adapter.js';
+import { createEngineFacade, shouldExecuteInternalWrite } from './src/sync/sync-adapter.js';
 import { HLC } from '@xnetx/raft-hlc-sync';
 
 import { WhitelistVerifier } from './src/modules/whitelist/whitelist-verifier.js';
@@ -431,11 +431,11 @@ async function main() {
       // 此项每节点独立执行、不走 leader 守卫：撤销缓存是本地优先的资金安全兜底，
       // 孤立节点也必须能自行从链上落地撤销记录。
       await stateManager.syncRevocationsFromContract(contractClient);
-      // 纯 GC 类清理只在 shard 0 leader 上执行：删除经 engine.write 的 2PC 由单一
-      // 协调者发出并复制到各节点，避免每个节点各自协调一轮、互撞 follower 的
-      // prepared 事务槽并挤掉正常写请求。leader 缺位时本轮跳过，下轮再清。
-      // （单节点部署时 syncManager 为空或本节点即 leader，照常执行。）
-      const isGcCoordinator = !syncManager || syncManager.isLeaderForUser(null);
+      // 纯 GC 类清理与 HTTP 写请求共用同一条 leader 纪律（shouldExecuteInternalWrite）：
+      // shard 0 leader 是本节点才执行，避免每个节点各自协调一轮、互撞 follower 的
+      // prepared 事务槽并挤掉正常写请求；leader 是其它节点时由那个节点执行；
+      // 暂无 leader 时本地兜底执行，删除条目经 _sync_log 在 leader 出现后传播。
+      const isGcCoordinator = shouldExecuteInternalWrite(engine, null);
       if (isGcCoordinator) {
         await cleanExpiredSessions(engine);
         await cleanExpiredExportSessions(engine);
