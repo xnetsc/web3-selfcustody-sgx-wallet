@@ -676,11 +676,12 @@ export class SyncManager {
         } catch (_) {}
     }
 
-    /** 记录观测到的对端 _sync_log 最大序号（单调递增） */
+    /** 记录观测到的对端 _sync_log 最大序号（单调递增；序号 0 也要落键，
+     *  否则“已握手但尚无数据”的 peer 在观测表里缺席） */
     _notePeerProgress(nodeId, seq) {
         if (!nodeId || this._isSelf(nodeId)) return;
-        const cur = this._peerObservedMaxSeq.get(nodeId) || 0;
-        if (seq > cur) this._peerObservedMaxSeq.set(nodeId, seq);
+        const cur = this._peerObservedMaxSeq.get(nodeId);
+        if (cur === undefined || seq > cur) this._peerObservedMaxSeq.set(nodeId, seq);
     }
 
     /**
