@@ -30,6 +30,7 @@ import { CertificateVerifier } from '@xnetx/sgx-ra-tls-verify';
 import { createContractClientFromEnv } from './src/modules/contract-client/index.js';
 import { ContractPinStore } from './src/modules/contract-client/contract-pin-store.js';
 import { SyncManager } from './src/sync/sync-manager.js';
+import { createEngineFacade } from './src/sync/sync-adapter.js';
 import { HLC } from '@xnetx/raft-hlc-sync';
 
 import { WhitelistVerifier } from './src/modules/whitelist/whitelist-verifier.js';
@@ -291,7 +292,10 @@ async function main() {
   });
 
   // 8. 创建模块实例
-  const engine = syncManager.engine;
+  // 业务模块统一经 facade 注入：请求框架的手动事务开启期间，manager 的
+  // engine.write 并入外层事务（见 sync-adapter.js createEngineFacade）。
+  // syncManager 内部与 server 写框架仍直接使用原始 engine。
+  const engine = createEngineFacade(syncManager.engine);
   // 钉住存储改走统一通道：注入引擎，并补写启动早期暂存的首次钉住
   await pinStore.setEngine(engine);
   const whitelistVerifier = new WhitelistVerifier(contractClient);

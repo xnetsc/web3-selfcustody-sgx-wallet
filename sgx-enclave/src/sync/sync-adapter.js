@@ -37,6 +37,44 @@ export function createSQLiteAdapter(sqliteDb) {
 }
 
 // ═══════════════════════════════════════════════════
+//  Engine facade（业务层注入用）
+// ═══════════════════════════════════════════════════
+
+/**
+ * 给业务模块注入的 SyncEngine 门面：只改写 write()，其余成员原样透传。
+ *
+ * sync-lib 的两种写模式各自语义完整、互不组合：手动事务模式
+ * （beginManualTransaction → 直接写库 → 收集触发器条目 → prepare/commit，
+ * server 请求框架在用）与 engine.write 独立 2PC 模式（各业务 manager 在用）。
+ * 请求处理链上两者会嵌套：外层请求框架已开启手动事务时，manager 再调
+ * engine.write 会被库拒绝（Already has active manual transaction）。
+ *
+ * 本门面是钱包侧的组合约定，不改变库的任何行为：存在活动手动事务时，
+ * write(fn) 直接在该事务内执行 fn —— 变更由触发器记入 _sync_log，
+ * 由外层事务持有者统一收集条目并完成 prepare/commit，与手动模式的
+ * 设计一致；不存在时原样委托 engine.write 走独立 2PC。
+ *
+ * @param {object} engine SyncEngine 实例
+ * @returns {object} 与 engine 同接口的门面（write 行为见上）
+ */
+export function createEngineFacade(engine) {
+    return new Proxy(engine, {
+        get(target, prop) {
+            if (prop === 'write') {
+                return async (fn, shardKey) => {
+                    if (target.hasActiveManualTransaction()) {
+                        return await fn(target.db);
+                    }
+                    return target.write(fn, shardKey);
+                };
+            }
+            const value = Reflect.get(target, prop);
+            return typeof value === 'function' ? value.bind(target) : value;
+        },
+    });
+}
+
+// ═══════════════════════════════════════════════════
 //  业务表定义 + validators + deserializers
 // ═══════════════════════════════════════════════════
 
