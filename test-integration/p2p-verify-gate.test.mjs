@@ -131,7 +131,7 @@ async function main() {
         console.log('[场景2] arrivals:', received.length, ', closed by server:', closed);
         assert.equal(received.length, 0, 'failed verification must not let any byte out');
         assert.equal(closed, true, 'connection should be destroyed after failed verification');
-        console.log('✓ 场景 2 通过：验证失败零字节，队列丢弃，连接销毁\n');
+        console.log('✓ 场景 2 通过：验证失败零字节，连接销毁（从未注册）\n');
         mgr.stop(); db.close();
     }
 
@@ -162,6 +162,31 @@ async function main() {
         assert(received[0].at < VERIFY_DELAY_MS - 100,
             'non-mandatory mode must not gate on verification, first arrived at ' + received[0].at + 'ms');
         console.log('✓ 场景 4 通过：配置不强制时不延迟注册\n');
+        mgr.stop(); db.close();
+    }
+
+    // ---- 场景 5：验证等待期间到达的消息 → 注册后按原序补触发 ----
+    {
+        const { mgr, db } = createServer({
+            port: 3345, allowNonRaTls: false, verifier: delayedOkVerifier, certPath, keyPem,
+        });
+        await mgr.start();
+        const probeSeen = () => [...mgr._peerIdToNodeId.values()].includes('node-replay-probe');
+        const ws = new WebSocket('wss://127.0.0.1:3345', {
+            rejectUnauthorized: false, cert: certPem, key: keyPem,
+        });
+        ws.on('error', () => {});
+        await new Promise((resolve) => ws.on('open', resolve));
+        // 连接刚建立（验证尚需 ~500ms）就立刻发出 handshake
+        ws.send(JSON.stringify({ type: 'handshake', nodeId: 'node-replay-probe', lastSeq: 0 }));
+        await sleep(250);
+        assert.equal(probeSeen(), false,
+            'message arriving during verification must not be processed before registration');
+        await sleep(1400);
+        assert.equal(probeSeen(), true,
+            'message buffered during verification must be replayed after registration');
+        console.log('✓ 场景 5 通过：验证期间消息只缓冲不处理，注册后补触发\n');
+        try { ws.close(); } catch (_) {}
         mgr.stop(); db.close();
     }
 

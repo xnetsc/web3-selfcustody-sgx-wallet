@@ -543,10 +543,20 @@ export class SyncManager {
                 // 注册是本地一切逻辑认识这条连接的起点：_registerWs 之后
                 // 管理器才可能向它发送，peerConnected 之后引擎才把它当
                 // 推送目标并发出 handshake。强制验证模式把注册延迟到
-                // RA-TLS 验证通过后才执行——未注册期间这条连接在本地
-                // 不存在：推不出（无目标）、发不出（无登记）、收到的数据
-                // 也无处投递（未注册即不处理）
+                // RA-TLS 验证通过后才执行——验证出结果前业务层不知道
+                // 这个 ws、它上面的事件也不触发；通过后注册连同等待期间
+                // 到达的消息按原序补触发，业务语义与连接在验证通过那一
+                // 刻才建立完全一致。等待期间的消息只在连接闭包内缓冲，
+                // 不经过任何业务代码；验证失败则随连接销毁一并丢弃
                 let registered = false;
+                const earlyMessages = [];
+                const handleMessage = (data) => {
+                    const msgStr = data.toString();
+                    if (this._handlePinCheckMessage(peerId, ws, msgStr)) return;
+                    // 拦截 handshake 消息以提取 nodeId
+                    this._extractNodeIdFromHandshake(peerId, msgStr);
+                    this.engine.receiveMessage(peerId, msgStr);
+                };
                 const doRegister = () => {
                     if (registered || ws.readyState !== WebSocket.OPEN) return;
                     registered = true;
@@ -554,6 +564,9 @@ export class SyncManager {
                     this.engine.peerConnected(peerId, { direction: 'inbound' });
                     // 先刷新合约缓存（可能合约有迁移），再发送 pin-check 握手
                     this._refreshAndSendPinCheck(peerId, ws);
+                    // 补触发：等待验证期间到达的消息按原序走原有处理路径
+                    for (const data of earlyMessages) handleMessage(data);
+                    earlyMessages.length = 0;
                 };
                 const verifyPromise = req.socket && req.socket._ratlsVerifyPromise;
                 if (verifyPromise) {
@@ -564,15 +577,16 @@ export class SyncManager {
                 }
 
                 ws.on('message', (data) => {
-                    // 未注册（RA-TLS 验证未通过）期间收到的数据不处理
-                    if (!registered) return;
-                    const msgStr = data.toString();
-                    if (this._handlePinCheckMessage(peerId, ws, msgStr)) return;
-                    // 拦截 handshake 消息以提取 nodeId
-                    this._extractNodeIdFromHandshake(peerId, msgStr);
-                    this.engine.receiveMessage(peerId, msgStr);
+                    if (!registered) {
+                        // 未注册：只缓冲不处理（上限防未验证对端灌满内存）
+                        if (earlyMessages.length < 1024) earlyMessages.push(data);
+                        return;
+                    }
+                    handleMessage(data);
                 });
                 ws.on('close', () => {
+                    // 从未注册的连接在业务层没有可清理的状态
+                    if (!registered) return;
                     this.engine.peerDisconnected(peerId);
                     this._peerWsMap.delete(peerId);
                     this._peerIdToNodeId.delete(peerId);
@@ -622,6 +636,22 @@ export class SyncManager {
             }
             const ws = new WebSocket(url, wsOptions);
 
+            // 注册完成（_finishOutboundConnect）前到达的消息只在闭包内
+            // 缓冲：注册等待的正是 RA-TLS 验证结果，验证出结果前业务层
+            // 不知道这个 ws、事件不触发；注册完成后按原序补触发
+            const earlyMessages = [];
+            const handleMessage = (data) => {
+                const msgStr = data.toString();
+                if (this._handlePinCheckMessage(url, ws, msgStr)) return;
+                // 拦截 handshake 消息以提取 nodeId
+                this._extractNodeIdFromHandshake(url, msgStr);
+                this.engine.receiveMessage(url, msgStr);
+            };
+            const flushEarlyMessages = () => {
+                for (const data of earlyMessages) handleMessage(data);
+                earlyMessages.length = 0;
+            };
+
             ws.on('open', () => {
                 console.log('[SyncManager] Connected to peer: ' + url);
 
@@ -630,6 +660,7 @@ export class SyncManager {
                     if (rawSocket && typeof rawSocket.getPeerCertificate === 'function') {
                         this._verifyPeerCert(rawSocket, 'server').then(() => {
                             this._finishOutboundConnect(url, ws);
+                            flushEarlyMessages();
                         }).catch((err) => {
                             console.error('[SyncManager] Outbound RA-TLS failed for ' + url + ':', err.message);
                             ws.close();
@@ -647,19 +678,17 @@ export class SyncManager {
             });
 
             ws.on('message', (data) => {
-                // 强制验证模式：注册完成（验证通过）前收到的数据不处理；
-                // 注册前引擎也不认识这条连接（peerConnected 在注册时才调）
-                if (this._ratlsMandatory && !ws._finishedConnect) return;
-                const msgStr = data.toString();
-                if (this._handlePinCheckMessage(url, ws, msgStr)) return;
-                // 拦截 handshake 消息以提取 nodeId
-                this._extractNodeIdFromHandshake(url, msgStr);
-                this.engine.receiveMessage(url, msgStr);
+                if (!ws._finishedConnect) {
+                    if (earlyMessages.length < 1024) earlyMessages.push(data);
+                    return;
+                }
+                handleMessage(data);
             });
 
             ws.on('close', () => {
                 console.log('[SyncManager] Disconnected from peer: ' + url);
-                this.engine.peerDisconnected(url);
+                // 从未完成注册的连接不触发引擎断开事件
+                if (ws._finishedConnect) this.engine.peerDisconnected(url);
                 this._peerWsMap.delete(url);
                 this._peerIdToNodeId.delete(url);
                 this._pinCheckedPeers.delete(url);
@@ -671,7 +700,7 @@ export class SyncManager {
 
             ws.on('error', (err) => {
                 console.log('[SyncManager] Connection to ' + url + ' failed: ' + err.message);
-                this.engine.peerDisconnected(url);
+                if (ws._finishedConnect) this.engine.peerDisconnected(url);
                 this._peerWsMap.delete(url);
                 this._peerIdToNodeId.delete(url);
                 if (this._started) {
