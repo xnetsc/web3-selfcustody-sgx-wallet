@@ -516,7 +516,12 @@ export class SyncManager {
                     this._verifyPeerCert(tlsSocket, 'client').then(() => {
                         if (!gate) return;
                         gate.status = 'verified';
-                        if (gate.ws) this._flushVerifyGate(gate.ws);
+                        if (gate.ws) {
+                            // 先执行被延迟的注册（peerConnected 等），再开门：
+                            // 注册那一刻发出的 handshake / pin-check 正好放行
+                            if (gate.onVerified) gate.onVerified();
+                            this._flushVerifyGate(gate.ws);
+                        }
                     }).catch((err) => {
                         if (gate) {
                             gate.status = 'failed';
@@ -557,11 +562,28 @@ export class SyncManager {
                     if (inGate.status === 'verified') this._flushVerifyGate(ws);
                     else if (inGate.status === 'failed') this._dropVerifyGate(ws);
                 }
-                this._registerWs(peerId, ws);
-                this.engine.peerConnected(peerId, { direction: 'inbound' });
 
-                // 先刷新合约缓存（可能合约有迁移），再发送 pin-check 握手
-                this._refreshAndSendPinCheck(peerId, ws);
+                // 注册是本地一切逻辑认识这条连接的起点：_registerWs 之后
+                // 管理器才可能向它发送，peerConnected 之后引擎才把它当
+                // 推送目标并发出 handshake。强制验证模式把注册延迟到
+                // RA-TLS 验证通过后才执行——未注册期间这条连接在本地
+                // 不存在：推不出（无目标）、发不出（无登记）、收到的数据
+                // 也无处投递（引擎未注册即丢弃，管理器处理在注册后才挂）
+                let registered = false;
+                const doRegister = () => {
+                    if (registered || ws.readyState !== WebSocket.OPEN) return;
+                    registered = true;
+                    this._registerWs(peerId, ws);
+                    this.engine.peerConnected(peerId, { direction: 'inbound' });
+                    // 先刷新合约缓存（可能合约有迁移），再发送 pin-check 握手
+                    this._refreshAndSendPinCheck(peerId, ws);
+                };
+                if (inGate && inGate.status === 'verifying') {
+                    inGate.onVerified = doRegister;
+                } else if (!inGate || inGate.status === 'verified') {
+                    doRegister();
+                }
+                // 验证失败（failed）不注册：套接字已由验证路径销毁
 
                 ws.on('message', (data) => {
                     // RA-TLS 验证通过前收到的数据直接丢弃（强制验证模式）
