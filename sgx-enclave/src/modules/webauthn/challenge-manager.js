@@ -155,12 +155,14 @@ export class WebAuthnChallengeManager {
    * 按 ID 消费（删除）挑战值
    * 与 findChallenge 配合使用
    * @param {number} id - 挑战值记录 ID
+   * @param {string} [userId] - 挑战所属用户 ID，用作 engine.write 的分片键：
+   *   2PC 的 term 校验必须落在该用户分片上，而不是默认的 shard 0
    */
-  async consumeChallengeById(id) {
+  async consumeChallengeById(id, userId = null) {
     await this._engine.write(async (db) => {
       const conn = createConnProxy(db);
       conn.query(`DELETE FROM webauthn_challenges WHERE id = ?`, [id]);
-    });
+    }, userId);
     console.log(`[WebAuthnChallengeManager] Challenge consumed by id=${id}`);
   }
 

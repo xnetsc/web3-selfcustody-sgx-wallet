@@ -341,7 +341,7 @@ export class PasskeyRegisterHandler {
         console.log(`[PasskeyRegister] handleComplete: contract recovery entry found, uuid=${recoveryEntry.uuid}, proceeding with OWNER force recovery (overrides frozenReplacement=${isFrozenReplacement}, scenarioB=${!hasNoPasskeys && !isPotentialRecovery})`);
         // 若本次提交走的是场景B的 challenge（register_passkey），在此消费掉，避免残留
         if (challenge1DbId) {
-          await this._challenge.consumeChallengeById(challenge1DbId);
+          await this._challenge.consumeChallengeById(challenge1DbId, finalUserId);
           challenge1DbId = null;
         }
       }
@@ -386,7 +386,7 @@ export class PasskeyRegisterHandler {
       console.log(`[PasskeyRegister] handleComplete: existing Passkey signature verified, new Passkey binding confirmed`);
 
       // 消费 challenge1（从 DB 删除）
-      await this._challenge.consumeChallengeById(challenge1DbId);
+      await this._challenge.consumeChallengeById(challenge1DbId, finalUserId);
     }
 
     // 8. 注册/替换 Passkey（存储 COSE 格式公钥）

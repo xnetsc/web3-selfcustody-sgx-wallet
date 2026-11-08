@@ -422,18 +422,27 @@ async function main() {
   const cleanupIntervalMs = (sessionConfig.cleanupIntervalSeconds || 3600) * 1000;
   const cleanupTimer = setInterval(async () => {
     try {
-      await cleanExpiredSessions(engine);
-      await cleanExpiredExportSessions(engine);
       // 合约撤销同步：把链上撤销记录全量同步进本地库（source='contract'），
-      // 同一次同步中删除链上已不存在的 contract 缓存（platform 来源记录不参与删除）
+      // 同一次同步中删除链上已不存在的 contract 缓存（platform 来源记录不参与删除）。
+      // 此项每节点独立执行、不走 leader 守卫：撤销缓存是本地优先的资金安全兜底，
+      // 孤立节点也必须能自行从链上落地撤销记录。
       await stateManager.syncRevocationsFromContract(contractClient);
-      // 清理已过期的授权撤销记录（被撤销授权到期后撤销记录失去意义，删除打日志）
-      await stateManager.cleanExpiredRevocations();
-      // 清理已失效的授权缓存（revoked / expired / exceeded）
-      // （须在撤销同步之后：同步删除错误缓存时可能把状态恢复 active，不应当作失效缓存清理）
-      await stateManager.cleanInvalidatedStates();
-      // 清理过期的 WebAuthn 挑战值
-      await challengeManager.cleanExpiredChallenges();
+      // 纯 GC 类清理只在 shard 0 leader 上执行：删除经 engine.write 的 2PC 由单一
+      // 协调者发出并复制到各节点，避免每个节点各自协调一轮、互撞 follower 的
+      // prepared 事务槽并挤掉正常写请求。leader 缺位时本轮跳过，下轮再清。
+      // （单节点部署时 syncManager 为空或本节点即 leader，照常执行。）
+      const isGcCoordinator = !syncManager || syncManager.isLeaderForUser(null);
+      if (isGcCoordinator) {
+        await cleanExpiredSessions(engine);
+        await cleanExpiredExportSessions(engine);
+        // 清理已过期的授权撤销记录（被撤销授权到期后撤销记录失去意义，删除打日志）
+        await stateManager.cleanExpiredRevocations();
+        // 清理已失效的授权缓存（revoked / expired / exceeded）
+        // （须在撤销同步之后：同步删除错误缓存时可能把状态恢复 active，不应当作失效缓存清理）
+        await stateManager.cleanInvalidatedStates();
+        // 清理过期的 WebAuthn 挑战值
+        await challengeManager.cleanExpiredChallenges();
+      }
       // 清理长期未再出现节点的同步水位行（_sync_peers 中超过 7 天未见到的节点）
       if (syncManager) await syncManager.pruneStalePeerWatermarks();
       // 检查合约 NTP 配置是否变更，变更则重新校正单调时钟
