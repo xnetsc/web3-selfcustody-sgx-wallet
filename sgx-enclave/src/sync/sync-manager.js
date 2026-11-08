@@ -144,19 +144,13 @@ export class SyncManager {
 
         // P2P 节点发现：已知节点地址簿（配置 + 动态发现）
         // Map<nodeId, string[]> - nodeId 是稳定身份标识；同一节点的多个候选
-        // 连接地址去重保序排列：对端自报地址优先，其余按学到顺序补充
+        // 连接地址去重保序排列：对端自报地址优先，其余按学到顺序补充。
+        // 地址只从配置来：每个节点通告的地址集就是它自己配置的那组，
+        // 协议只负责分发（自报 / gossip），不运行时合成新地址
         this._knownPeers = new Map();
-        // 本节点经入站连接 Host 头学到的自身可达地址（规范化后）。
-        // Host 是已通过 pin-check 的对端实际拨通本节点时用的名字——实测可达，
-        // 作为自报地址的补充对外通告（见 _learnOwnUrlFromInbound）
-        this._hostLearnedOwnUrls = [];
-        // Map<peerId, string> - 入站连接的 Host 头原文；对端通过 pin-check
-        // 之前不使用，防止未验证连接影响本节点地址通告
-        this._inboundHostByPeerId = new Map();
-        // 本节点监听协议（'wss' | 'ws'），_startServer 时确定。
-        // 生产形态必为 wss（RA-TLS）；Host 学习拼 URL 时据此定 scheme，
-        // 没带端口的 Host 由 normalizeSyncUrl 按 scheme 补默认端口
-        this._listenScheme = null;
+        // 本节点配置的通告地址集：advertisedUrl 的解析结果，兼容单个
+        // 字符串、JSON 数组字符串与字符串数组；配置了几个就有几个
+        this._advertisedUrls = parseAdvertisedUrls(options.advertisedUrl);
         // Map<nodeId, ms> - 最近一次见到该节点的时刻（收到其 handshake 时更新），
         // 供 pruneStalePeerWatermarks 判断水位行是否过期
         this._peerLastSeenAt = new Map();
@@ -290,7 +284,6 @@ export class SyncManager {
         this._peerIdToNodeId.clear();
         this._pinCheckedPeers.clear();
         this._pinCheckWaiters.clear();
-        this._inboundHostByPeerId.clear();
         this._verifyGates.clear();
 
         if (this.wss) { this.wss.close(); this.wss = null; }
@@ -503,7 +496,6 @@ export class SyncManager {
     _startServer() {
         return new Promise((resolve, reject) => {
             const useRaTls = !!(this._cert && this._key);
-            this._listenScheme = useRaTls ? 'wss' : 'ws';
 
             if (useRaTls) {
                 const httpsOptions = {
@@ -557,11 +549,6 @@ export class SyncManager {
 
             this.wss.on('connection', (ws, req) => {
                 const peerId = 'inbound://' + req.socket.remoteAddress + ':' + req.socket.remotePort;
-                // 记下拨号方实际使用的 Host（host[:port]）：待其通过 pin-check 后，
-                // 据此学习本节点的一个实测可达地址（见 _learnOwnUrlFromInbound）
-                if (req && req.headers && typeof req.headers.host === 'string') {
-                    this._inboundHostByPeerId.set(peerId, req.headers.host);
-                }
                 // 接过 secureConnection 阶段建好的发送门（强制验证模式才有）
                 const inGate = req.socket && req.socket._ratlsGate;
                 if (inGate) {
@@ -591,7 +578,6 @@ export class SyncManager {
                     this._peerIdToNodeId.delete(peerId);
                     this._pinCheckedPeers.delete(peerId);
                     this._pinCheckWaiters.delete(peerId);
-                    this._inboundHostByPeerId.delete(peerId);
                     this._verifyGates.delete(ws);
                 });
                 ws.on('error', (err) => {
@@ -926,8 +912,8 @@ export class SyncManager {
 
         // 已通过 pin-check 的 peer 不需要重复验证
         if (this._pinCheckedPeers.has(peerId)) {
-            // 更新自报地址（对端可能重发 pin-check）；顺带处理本节点 Host 学习
-            this._onPinCheckPassed(peerId, msg);
+            // 更新自报地址（对端可能重发 pin-check）
+            this._recordPeerAdvertisedUrl(peerId, msg);
             // 回复 ack（对端可能还在等）
             this._sendPinCheckAck(ws, true);
             return true;
@@ -966,7 +952,7 @@ export class SyncManager {
                 // 双方都未 pin，允许通信（首次部署场景）
                 console.log('[SyncManager] pin-check: both nodes unpinned — allowing (first deployment)');
                 this._pinCheckedPeers.add(peerId);
-                this._onPinCheckPassed(peerId, peerPin);
+                this._recordPeerAdvertisedUrl(peerId, peerPin);
                 this._sendPinCheckAck(ws, true);
                 this._resolvePinCheckWaiter(peerId, true);
                 return;
@@ -983,7 +969,7 @@ export class SyncManager {
         if (match) {
             console.log('[SyncManager] pin-check: identity matches with ' + peerId);
             this._pinCheckedPeers.add(peerId);
-            this._onPinCheckPassed(peerId, peerPin);
+            this._recordPeerAdvertisedUrl(peerId, peerPin);
             this._sendPinCheckAck(ws, true);
             this._resolvePinCheckWaiter(peerId, true);
             return;
@@ -1006,7 +992,7 @@ export class SyncManager {
         if (match2) {
             console.log('[SyncManager] pin-check: identity matches after refresh with ' + peerId);
             this._pinCheckedPeers.add(peerId);
-            this._onPinCheckPassed(peerId, peerPin);
+            this._recordPeerAdvertisedUrl(peerId, peerPin);
             this._sendPinCheckAck(ws, true);
             this._resolvePinCheckWaiter(peerId, true);
             return;
@@ -1016,16 +1002,6 @@ export class SyncManager {
         console.warn('[SyncManager] pin-check: identity still mismatched after refresh — rejecting ' + peerId);
         this._sendPinCheckAck(ws, false);
         this._rejectAndClose(peerId, ws, 'pinned identity mismatch after refresh');
-    }
-
-    /**
-     * pin-check 通过后的统一收尾：记录对端自报地址 + 学习本节点地址。
-     * 只在验证通过的路径上调用——防止未验证节点污染地址簿，
-     * 也防止未验证连接影响本节点的地址通告。
-     */
-    _onPinCheckPassed(peerId, peerPin) {
-        this._recordPeerAdvertisedUrl(peerId, peerPin);
-        this._learnOwnUrlFromInbound(peerId);
     }
 
     /**
@@ -1066,39 +1042,13 @@ export class SyncManager {
     }
 
     /**
-     * 从一条已通过 pin-check 的入站连接学习本节点的可达地址：
-     * 拨号方在 WS 升级请求里写下的 Host，就是它实际拨通本节点所用的
-     * host[:port]（带端口用该端口，没带说明是协议默认端口，拼接时补齐）。
-     * 该地址已被实测连通（至少从该对端的网络位置），作为配置/推断出的
-     * 自报地址的补充；学到新地址后立即向已验证的对端重发 pin-check，
-     * 让新地址随自报与 gossip 扩散。
-     */
-    _learnOwnUrlFromInbound(peerId) {
-        if (!peerId.startsWith('inbound://')) return;
-        const host = this._inboundHostByPeerId.get(peerId);
-        if (!host) return;
-        const url = urlFromHostHeader(host, this._listenScheme || 'wss');
-        if (!url) return;
-        if (this._getAdvertisedUrls().includes(url)) return;
-        this._hostLearnedOwnUrls.push(url);
-        console.log('[SyncManager] Learned own reachable url from inbound Host: ' + url);
-        // 把新地址告诉已建连且已验证的对端（它们会前置记录并继续 gossip）
-        for (const pid of this._pinCheckedPeers) {
-            const ws = this._peerWsMap.get(pid);
-            if (ws && ws.readyState === WebSocket.OPEN) {
-                this._sendPinCheck(pid, ws);
-            }
-        }
-    }
-
-    /**
-     * 本节点对外通告的全部候选地址：自报地址（配置优先、其次网卡推断）
-     * 在前，Host 学到的实测地址在后，去重保序。
+     * 本节点对外通告的全部候选地址：就是配置的那组（advertisedUrl，
+     * 单个或 JSON 数组）；未配置时回退到网卡推断的单个地址。
      */
     _getAdvertisedUrls() {
+        if (this._advertisedUrls.length > 0) return [...this._advertisedUrls];
         const primary = this._getAdvertisedUrl();
-        const all = primary ? [primary, ...this._hostLearnedOwnUrls] : [...this._hostLearnedOwnUrls];
-        return mergePeerUrls([], all);
+        return primary ? [primary] : [];
     }
 
     /**
@@ -1212,6 +1162,9 @@ export class SyncManager {
      * 用 URL 判断是否自己（用于连接前 nodeId 未知的场景，如配置的 peerUrls）
      */
     _isSelfUrl(url) {
+        // 配置的通告地址集里的任一地址都是自己
+        const canonical = normalizeSyncUrl(url);
+        if (canonical && this._advertisedUrls.includes(canonical)) return true;
         if (this._localAddresses.has(url)) return true;
         try {
             const parsed = new URL(url);
@@ -1234,7 +1187,7 @@ export class SyncManager {
      * 推断失败返回 null（不通告）。
      */
     _getAdvertisedUrl() {
-        if (this.advertisedUrl) return this.advertisedUrl;
+        if (this._advertisedUrls.length > 0) return this._advertisedUrls[0];
         try {
             const scheme = (this._cert && this._key) ? 'wss' : 'ws';
             const interfaces = os.networkInterfaces();
@@ -1406,14 +1359,34 @@ export function normalizeSyncUrl(raw) {
 }
 
 /**
- * 由入站连接的 Host 头还原“拨号方实际用来连到本节点的地址”。
- * Host 带端口就用该端口；没带端口说明拨号方用的是协议默认端口，
- * 由 normalizeSyncUrl 按 scheme 补齐（wss → 443）。
- * （纯函数，供 Host 学习与测试使用。）
+ * 解析 advertisedUrl 配置为本节点的通告地址集（纯函数，供构造函数与
+ * 测试使用）。地址只从配置来，配置了几个就有几个。兼容三种写法：
+ * 单个 URL 字符串、JSON 数组字符串（环境变量形态）、字符串数组。
+ * 每项规范化（补默认端口等），非法项丢弃，去重保序。
  */
-export function urlFromHostHeader(hostHeader, scheme) {
-    if (typeof hostHeader !== 'string' || !hostHeader.trim()) return null;
-    return normalizeSyncUrl(scheme + '://' + hostHeader.trim());
+export function parseAdvertisedUrls(value) {
+    let items = [];
+    if (Array.isArray(value)) {
+        items = value;
+    } else if (typeof value === 'string' && value.trim()) {
+        const trimmed = value.trim();
+        if (trimmed.startsWith('[')) {
+            try {
+                const parsed = JSON.parse(trimmed);
+                items = Array.isArray(parsed) ? parsed : [trimmed];
+            } catch (_) {
+                items = [trimmed];
+            }
+        } else {
+            items = [trimmed];
+        }
+    }
+    const out = [];
+    for (const item of items) {
+        const n = normalizeSyncUrl(item);
+        if (n && !out.includes(n)) out.push(n);
+    }
+    return out;
 }
 
 /**

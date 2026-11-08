@@ -16,7 +16,8 @@
  *   SGX_HTTP_PORT       — 本地 HTTP 监听端口（默认 3000）
  *   SYNC_NODES          — 同步节点 WSS 地址（逗号分隔，可选）
  *   SYNC_LISTEN_PORT    — 本地 WSS 监听端口（默认 3307）
- *   SYNC_ADVERTISED_URL — 本节点对外通告的监听地址（P2P 发现自报地址，可选）
+ *   SYNC_ADVERTISED_URL — 本节点对外通告的监听地址（P2P 发现自报地址，可选；
+ *                         单个 URL 或 JSON 数组，多个可达地址时用数组）
  *   RATLS_CERT_PATH     — RA-TLS 证书路径（与 allowed_files 绑定）
  *   PROXY_API_KEY       — Intel PCCS API key（敏感，永不上链）
  *

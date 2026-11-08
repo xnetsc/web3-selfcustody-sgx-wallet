@@ -7,7 +7,7 @@
  *   2. urlFromHostHeader：Host 带端口用该端口，没带补协议默认端口
  *   3. mergePeerUrls：去重、保序、自报前置、上限截断
  *   4. SyncManager 地址簿行为：自报前置、gossip 新旧格式合并、已知节点
- *      补充新地址、Host 学习（仅入站 + pin-check 通过后触发）
+ *      补充新地址；通告集恒等于配置集（地址只从配置来）
  *
  * 运行: node p2p-address-book.test.mjs
  */
@@ -17,7 +17,7 @@ import { createRequire } from 'module';
 import {
     SyncManager,
     normalizeSyncUrl,
-    urlFromHostHeader,
+    parseAdvertisedUrls,
     mergePeerUrls,
 } from '../sgx-enclave/src/sync/sync-manager.js';
 import { HLC } from '../sgx-enclave/node_modules/@xnetx/raft-hlc-sync/index.js';
@@ -58,14 +58,26 @@ check('normalizeSyncUrl 拒绝非法输入', () => {
     assert.equal(normalizeSyncUrl(123), null);
 });
 
-// ---------- 2. urlFromHostHeader ----------
+// ---------- 2. parseAdvertisedUrls（地址只从配置来） ----------
 
-check('urlFromHostHeader：带端口用该端口，没带补默认端口', () => {
-    assert.equal(urlFromHostHeader('node.example.com:8443', 'wss'), 'wss://node.example.com:8443');
-    assert.equal(urlFromHostHeader('node.example.com', 'wss'), 'wss://node.example.com:443');
-    assert.equal(urlFromHostHeader('10.0.0.5:3307', 'wss'), 'wss://10.0.0.5:3307');
-    assert.equal(urlFromHostHeader('', 'wss'), null);
-    assert.equal(urlFromHostHeader(null, 'wss'), null);
+check('parseAdvertisedUrls：单个字符串', () => {
+    assert.deepEqual(parseAdvertisedUrls('wss://a.com'), ['wss://a.com:443']);
+    assert.deepEqual(parseAdvertisedUrls('wss://a.com:8443'), ['wss://a.com:8443']);
+});
+
+check('parseAdvertisedUrls：JSON 数组字符串（环境变量形态）', () => {
+    assert.deepEqual(
+        parseAdvertisedUrls('["wss://a.com", "wss://b.com:8443"]'),
+        ['wss://a.com:443', 'wss://b.com:8443']);
+});
+
+check('parseAdvertisedUrls：字符串数组、等价写法去重、非法项丢弃', () => {
+    assert.deepEqual(
+        parseAdvertisedUrls(['wss://a.com', 'wss://a.com:443', 'not a url', 'wss://b.com']),
+        ['wss://a.com:443', 'wss://b.com:443']);
+    assert.deepEqual(parseAdvertisedUrls(''), []);
+    assert.deepEqual(parseAdvertisedUrls(null), []);
+    assert.deepEqual(parseAdvertisedUrls('[]'), []);
 });
 
 // ---------- 3. mergePeerUrls ----------
@@ -159,31 +171,17 @@ check('gossip：未过 pin-check 的发送方被拒绝', () => {
     assert.equal(mgr._knownPeers.has('node-c'), false);
 });
 
-check('Host 学习：入站 Host 拼成自身候选（没带端口补 443），排在配置自报之后', () => {
-    const mgr = createManager('self-5', { advertisedUrl: 'wss://cfg.example.com:9443' });
-    mgr._listenScheme = 'wss';
-    const peerId = 'inbound://203.0.113.7:51000';
-    mgr._inboundHostByPeerId.set(peerId, 'node.example.com');
-    mgr._onPinCheckPassed(peerId, { nodeId: 'node-x' });
-    assert.deepEqual(mgr._getAdvertisedUrls(),
-        ['wss://cfg.example.com:9443', 'wss://node.example.com:443']);
-    // 重复触发不重复添加
-    mgr._onPinCheckPassed(peerId, { nodeId: 'node-x' });
-    assert.equal(mgr._getAdvertisedUrls().length, 2);
+check('通告集就是配置集：JSON 数组配置原样成为通告集（规范化去重）', () => {
+    const mgr = createManager('self-5', {
+        advertisedUrl: '["wss://a.com", "wss://b.com:8443", "wss://a.com:443"]',
+    });
+    assert.deepEqual(mgr._getAdvertisedUrls(), ['wss://a.com:443', 'wss://b.com:8443']);
+    assert.equal(mgr._getAdvertisedUrl(), 'wss://a.com:443');
 });
 
-check('Host 学习：带端口的 Host 用该端口；出站连接不触发学习', () => {
-    const mgr = createManager('self-6', { advertisedUrl: 'wss://cfg.example.com:9443' });
-    mgr._listenScheme = 'wss';
-    const peerId = 'inbound://203.0.113.7:51001';
-    mgr._inboundHostByPeerId.set(peerId, 'node.example.com:8443');
-    mgr._onPinCheckPassed(peerId, { nodeId: 'node-x' });
-    assert.deepEqual(mgr._getAdvertisedUrls(),
-        ['wss://cfg.example.com:9443', 'wss://node.example.com:8443']);
-    // 出站 peerId（URL 形态）即使有记录也不学习
-    mgr._inboundHostByPeerId.set('wss://peer.com:443', 'other.example.com');
-    mgr._onPinCheckPassed('wss://peer.com:443', { nodeId: 'node-y' });
-    assert.equal(mgr._getAdvertisedUrls().length, 2);
+check('通告集就是配置集：单个字符串配置', () => {
+    const mgr = createManager('self-6', { advertisedUrl: 'wss://only.com:9443' });
+    assert.deepEqual(mgr._getAdvertisedUrls(), ['wss://only.com:9443']);
 });
 
 console.log('\n=== 全部通过（' + passed + ' 项）===');
