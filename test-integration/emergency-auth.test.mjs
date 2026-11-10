@@ -33,7 +33,7 @@ import { WalletCrudHandler } from '../sgx-enclave/src/api/wallet-crud.js';
 import { AuthRevocationHandler } from '../sgx-enclave/src/api/auth-revocation.js';
 import { EmergencyLogQueryHandler } from '../sgx-enclave/src/api/emergency-log-query.js';
 import { verifyExecutionLogChain, computeExecutionLogHash, GENESIS_PREV_HASH } from '../sgx-enclave/src/modules/emergency-auth/execution-log.js';
-import { createConnProxy, BUSINESS_TABLES } from '../sgx-enclave/src/sync/sync-adapter.js';
+import { createConnProxy, BUSINESS_TABLES, createSQLiteAdapter, entriesVisibleLocally } from '../sgx-enclave/src/sync/sync-adapter.js';
 import { createApp } from '../sgx-enclave/src/server.js';
 
 // ============ 常量 ============
@@ -850,4 +850,28 @@ test('write-discipline: 应急取证在 leader 本地执行且开启手动事务
   assert.equal(calls.handler, 1);
   assert.equal(calls.manualTx, 1, 'leader must execute emergency evidence inside a manual transaction');
   assert.equal(res.status, 200);
+});
+
+test('execution-log: 读己之写可见性检查覆盖日志表（捎带条目未落库时不可见、落库后可见）', async () => {
+  const w = await makeWorld();
+  const { res } = await createViaEmergency(w);
+  const entryHash = res.executionLog.entryHash;
+  const row = w.db.prepare('SELECT * FROM emergency_execution_logs WHERE entry_hash = ?').get(entryHash);
+  assert.ok(row);
+  const entry = {
+    table_name: 'emergency_execution_logs',
+    operation: 'INSERT',
+    row_key: JSON.stringify({ entry_hash: entryHash }),
+    row_data: JSON.stringify(row),
+    _hlc: row._hlc,
+  };
+  // 另一个空库（模拟刚代理完写、尚未应用捎带条目的 follower）：不可见
+  const db2 = makeDb();
+  const adapter2 = createSQLiteAdapter(db2);
+  assert.equal(entriesVisibleLocally(adapter2, [entry]), false);
+  // 条目落库后（同 _hlc）：可见——ensureEntriesAppliedLocally 的放行条件成立
+  const cols = Object.keys(row);
+  db2.prepare(`INSERT INTO emergency_execution_logs (${cols.join(',')}) VALUES (${cols.map(() => '?').join(',')})`)
+    .run(...cols.map((c) => row[c]));
+  assert.equal(entriesVisibleLocally(adapter2, [entry]), true);
 });
