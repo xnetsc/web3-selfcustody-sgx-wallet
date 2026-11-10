@@ -255,20 +255,21 @@ export const CREATE_EMERGENCY_AUTHORIZATION_USES_INDEXES_SQL = [
     `CREATE INDEX IF NOT EXISTS idx_emg_uses_user_id ON emergency_authorization_uses (user_id)`,
 ];
 
-// ========== 应急授权执行日志表（本地审计，不参与同步） ==========
+// ========== 应急授权执行日志表（同步业务表） ==========
 
-// 每一次经应急授权（合约治理）成功执行的操作在此留痕：
-//  - log_id 为 SQLite AUTOINCREMENT 主键，本库内严格递增、永不复用；
+// 每一次经应急授权（合约治理）成功执行的操作在此留痕，并随业务同步传播
+// 到全网节点，任一节点的公开查询接口都能拉到全部日志：
+//  - 条目身份就是 entry_hash 本身（内容哈希，作主键与同步键）：全网逐字
+//    一致、不可伪造。不设自增 id——节点本地自增号在同步表里没有意义
+//    （同一条目在不同节点会被分到不同号），排序用 created_at + entry_hash；
 //  - 每条带 prev_hash / entry_hash 哈希链，改、删、插任何一条都会断链可检；
 //  - entry 随操作响应返回，响应整体被 wrap 以 SHA256 注入 attestation quote
 //    的 user_report_data——即日志哈希是生成度量值的材料，日志真实性由
 //    度量值背书；公开查询接口同样经 wrap 返回，读者可核 quote + 哈希链 +
 //    auth_hash（对授权 JSON 原文算 SHA256 即得，可与链上记录互证）。
-// 本表不注册到同步业务表：自增 id 与哈希链是单个 enclave 数据库内的审计
-// 结构，跨节点合并会破坏递增与链序；日志记录的是“本 enclave 执行了什么”。
 export const CREATE_EMERGENCY_EXECUTION_LOGS_SQL = `
 CREATE TABLE IF NOT EXISTS emergency_execution_logs (
-    log_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    entry_hash TEXT PRIMARY KEY,
     created_at TEXT NOT NULL,
     authorization_id TEXT NOT NULL,
     auth_hash TEXT NOT NULL,
@@ -282,7 +283,7 @@ CREATE TABLE IF NOT EXISTS emergency_execution_logs (
     result TEXT NOT NULL DEFAULT 'success',
     outcome TEXT NOT NULL DEFAULT '{}',
     prev_hash TEXT NOT NULL,
-    entry_hash TEXT NOT NULL
+    _hlc TEXT NOT NULL DEFAULT '0'
 )`;
 
 export const CREATE_EMERGENCY_EXECUTION_LOGS_INDEXES_SQL = [

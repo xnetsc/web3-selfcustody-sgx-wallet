@@ -1,8 +1,9 @@
 /**
  * 应急授权执行日志查询 API（公开接口，无需任何鉴权）
  *
- * 只读 SGX 本地 emergency_execution_logs 表：任何人可查，与授权撤销的
- * 公开查询同一姿态。返回值经 server 的 wrap 生成 attestationQuote，
+ * 只读 emergency_execution_logs 的本地同步副本（条目经业务同步已传播到
+ * 全网节点，任一节点可查全部）：任何人可查，与授权撤销的公开查询同一
+ * 姿态。返回值经 server 的 wrap 生成 attestationQuote，
  * 且每条日志带 prev_hash/entry_hash 哈希链与 auth_hash（授权 JSON 原文
  * 的 SHA256）：读者可独立核验——重算哈希链检出改删插、用手中的授权
  * JSON 重算 auth_hash 与链上合约记录互证、验 quote 确认出自 enclave。
@@ -10,9 +11,10 @@
  * 过滤与分页：
  *   - 过滤字段（全部等值精确匹配）：authorizationId、userId（目标用户）、
  *     operatorUserId、operation（必须是已知操作名）、platformAddress、
- *     result、logId（整数）、fromCreatedAt / toCreatedAt（ISO 时间范围）
+ *     result、entryHash（条目哈希，即条目身份）、fromCreatedAt / toCreatedAt
+ *     （ISO 时间范围）
  *   - 分页：page 从 1 开始（默认 1），pageSize 默认 10、范围 1–100，
- *     超出范围直接报错；order 为 asc（默认）或 desc（按 logId）
+ *     超出范围直接报错；order 为 asc（默认）或 desc（按 created_at 定序）
  *   - SQL 安全：StateManager 只用固定列名片段拼 WHERE，所有过滤值一律
  *     参数绑定；排序方向只取代码内白名单字面量。注入字符串只会被当作
  *     普通过滤值（匹配不到任何行），不会改变查询语义。
@@ -36,6 +38,7 @@ export class EmergencyLogQueryHandler {
    * 查询执行日志（分页 + 过滤）
    * @param {Object} request - HTTP body（无需 platformSignature）
    * @returns {Promise<Object>} { logs, count, totalPages, page, pageSize, latestEntryHash }
+   *   latestEntryHash 为全网同步副本中的链尾哈希（按 created_at 最新一条）
    */
   async handleQuery(request) {
     let query = request || {};
@@ -67,8 +70,8 @@ export class EmergencyLogQueryHandler {
     if (query.operation !== undefined && !EMERGENCY_OPERATIONS.includes(query.operation)) {
       throw new Error(`unknown operation filter: ${query.operation}`);
     }
-    if (query.logId !== undefined && (!Number.isInteger(query.logId) || query.logId < 1)) {
-      throw new Error('logId must be a positive integer');
+    if (query.entryHash !== undefined && (typeof query.entryHash !== 'string' || query.entryHash.length === 0)) {
+      throw new Error('entryHash must be a non-empty string');
     }
     for (const timeField of ['fromCreatedAt', 'toCreatedAt']) {
       if (query[timeField] !== undefined && Number.isNaN(Date.parse(query[timeField]))) {
@@ -83,7 +86,7 @@ export class EmergencyLogQueryHandler {
       operation: query.operation,
       platformAddress: query.platformAddress,
       result: query.result,
-      logId: query.logId,
+      entryHash: query.entryHash,
       fromCreatedAt: query.fromCreatedAt,
       toCreatedAt: query.toCreatedAt,
     };
@@ -102,7 +105,6 @@ export class EmergencyLogQueryHandler {
       page: resultPage.page,
       pageSize: resultPage.pageSize,
       latestEntryHash: head.logs[0]?.entryHash || null,
-      latestLogId: head.logs[0]?.logId || 0,
     };
   }
 }

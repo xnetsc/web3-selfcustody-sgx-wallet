@@ -33,7 +33,8 @@ import { WalletCrudHandler } from '../sgx-enclave/src/api/wallet-crud.js';
 import { AuthRevocationHandler } from '../sgx-enclave/src/api/auth-revocation.js';
 import { EmergencyLogQueryHandler } from '../sgx-enclave/src/api/emergency-log-query.js';
 import { verifyExecutionLogChain, computeExecutionLogHash, GENESIS_PREV_HASH } from '../sgx-enclave/src/modules/emergency-auth/execution-log.js';
-import { createConnProxy } from '../sgx-enclave/src/sync/sync-adapter.js';
+import { createConnProxy, BUSINESS_TABLES } from '../sgx-enclave/src/sync/sync-adapter.js';
+import { createApp } from '../sgx-enclave/src/server.js';
 
 // ============ 常量 ============
 
@@ -623,7 +624,8 @@ test('execution-log: 应急操作返回当前日志条目，字段可对着授�
 
   const log = res.executionLog;
   assert.ok(log, 'response must carry executionLog');
-  assert.equal(log.logId, 1);
+  assert.equal(log.logId, undefined, 'no node-local autoincrement id: identity is the entry hash');
+  assert.match(log.entryHash, /^0x[0-9a-f]{64}$/);
   assert.equal(log.authorizationId, auth.authorizationId);
   // authHash 必须等于对授权 JSON 原文重算的哈希——用户拿着授权 JSON 即可验证
   assert.equal(log.authHash, computeAuthorizationHash(json));
@@ -648,7 +650,7 @@ test('execution-log: 应急操作返回当前日志条目，字段可对着授�
 
 test('execution-log: 哈希链递增衔接，篡改与删行可检出', async () => {
   const w = await makeWorld();
-  const { auth, json, crud, walletManager } = await createViaEmergency(w);
+  const { auth, json, res: firstRes, crud, walletManager } = await createViaEmergency(w);
 
   // 第二个操作（删除另一个预置钱包）产生第二条日志
   await walletManager.createNativeWallet(ALICE, 'wallet-fixed-1', [{ chainId: 1, coinType: 60 }]);
@@ -658,21 +660,22 @@ test('execution-log: 哈希链递增衔接，篡改与删行可检出', async ()
     emergencyAuthorizationJson: json,
     emergencySignature: GOOD_SIG,
   }));
-  assert.equal(delRes.executionLog.logId, 2);
   assert.equal(delRes.executionLog.operation, 'wallet_delete');
+  assert.equal(delRes.executionLog.prevHash, firstRes.executionLog.entryHash);
 
   const page = await w.stateManager.listExecutionLogs({}, 1, 10, 'asc');
   assert.equal(page.count, 2);
   assert.deepEqual(verifyExecutionLogChain(page.logs), { valid: true });
+  // 校验与条目排列顺序无关：副本节点以任意到达顺序收到条目也能验链
+  assert.deepEqual(verifyExecutionLogChain([...page.logs].reverse()), { valid: true });
   assert.equal(page.logs[1].prevHash, page.logs[0].entryHash);
-  assert.ok(page.logs[1].logId > page.logs[0].logId);
 
   // 篡改第二条的 detail：重算哈希不符，链校验失败
-  w.db.prepare("UPDATE emergency_execution_logs SET detail = ? WHERE log_id = 2").run('{"walletId":"forged"}');
+  w.db.prepare("UPDATE emergency_execution_logs SET detail = ? WHERE entry_hash = ?").run('{"walletId":"forged"}', delRes.executionLog.entryHash);
   const tampered = await w.stateManager.listExecutionLogs({}, 1, 10, 'asc');
   const check = verifyExecutionLogChain(tampered.logs);
   assert.equal(check.valid, false);
-  assert.equal(check.brokenAtLogId, 2);
+  assert.equal(check.brokenAtEntryHash, delRes.executionLog.entryHash);
 });
 
 test('execution-log: 公开查询接口分页、过滤、顺序与链头', async () => {
@@ -683,9 +686,8 @@ test('execution-log: 公开查询接口分页、过滤、顺序与链头', async
   // 无鉴权直查（不带任何签名）
   const all = await handler.handleQuery({});
   assert.equal(all.count, 1);
-  assert.equal(all.logs[0].logId, res.executionLog.logId);
+  assert.equal(all.logs[0].entryHash, res.executionLog.entryHash);
   assert.equal(all.latestEntryHash, res.executionLog.entryHash);
-  assert.equal(all.latestLogId, 1);
 
   // 过滤命中与未命中
   const byOp = await handler.handleQuery({ operation: 'wallet_create' });
@@ -694,8 +696,8 @@ test('execution-log: 公开查询接口分页、过滤、顺序与链头', async
   assert.equal(byAuth.count, 1);
   const byUser = await handler.handleQuery({ userId: ALICE });
   assert.equal(byUser.count, 1);
-  const byLogId = await handler.handleQuery({ logId: 1 });
-  assert.equal(byLogId.count, 1);
+  const byHash = await handler.handleQuery({ entryHash: res.executionLog.entryHash });
+  assert.equal(byHash.count, 1);
   const miss = await handler.handleQuery({ operation: 'wallet_delete' });
   assert.equal(miss.count, 0);
 
@@ -705,7 +707,7 @@ test('execution-log: 公开查询接口分页、过滤、顺序与链头', async
   await assert.rejects(() => handler.handleQuery({ page: 0 }), /page/);
   await assert.rejects(() => handler.handleQuery({ order: 'sideways' }), /order/);
   await assert.rejects(() => handler.handleQuery({ operation: 'nonsense' }), /unknown operation/);
-  await assert.rejects(() => handler.handleQuery({ logId: 1.5 }), /logId/);
+  await assert.rejects(() => handler.handleQuery({ entryHash: 42 }), /entryHash/);
 });
 
 test('execution-log: SQL 注入字符串只当普通过滤值，查不到也不影响表', async () => {
@@ -748,10 +750,104 @@ test('execution-log: executionIndex 随同授权同操作递增，跨操作独�
       emergencySignature: GOOD_SIG,
     }));
     assert.equal(res.executionLog.executionIndex, i);
-    assert.equal(res.executionLog.logId, i);
   }
   const page = await w.stateManager.listExecutionLogs({ authorizationId: auth.authorizationId }, 1, 2, 'desc');
   assert.equal(page.count, 3);
   assert.equal(page.totalPages, 2);
-  assert.equal(page.logs[0].logId, 3);
+  assert.equal(page.logs[0].executionIndex, 3);
+});
+
+test('execution-log: 同步注册以 entry_hash 为键，无自增 id 列', () => {
+  const def = BUSINESS_TABLES.emergency_execution_logs;
+  assert.ok(def, 'table must be registered as a sync business table');
+  assert.deepEqual(def.keyColumns, ['entry_hash']);
+  assert.ok(def.dataColumns.includes('entry_hash'));
+  assert.ok(def.dataColumns.includes('_hlc'));
+  assert.ok(!def.dataColumns.includes('log_id'));
+});
+
+// ============ 写纪律：应急取证按写请求路由到 leader ============
+
+function makeRoutingApp({ isLeader }) {
+  const calls = { handler: 0, proxied: [], manualTx: 0 };
+  const evidenceQueryHandler = {
+    handleGetRecord: async () => { calls.handler++; return { marker: 'local-exec' }; },
+    handleListRecords: async () => { calls.handler++; return { marker: 'local-exec' }; },
+  };
+  const accountFreezeManager = {
+    getFreezeStatus: () => null,
+    checkRequest: async () => ({ allowed: true }),
+    liftFreeze: async () => {},
+  };
+  const syncManager = {
+    isMultiNodeDeployment: () => true,
+    isLeaderForUser: () => isLeader,
+    getShardForUser: () => 0,
+    isShardWarming: () => false,
+    proxyWriteRequest: async (userId, req) => {
+      calls.proxied.push({ userId, path: req.path });
+      return { status: 200, body: { proxiedMarker: true } };
+    },
+    beginManualTransaction: () => { calls.manualTx++; },
+    getManualTransactionEntries: () => [],
+    _shardElections: new Map(),
+    waitForPrepareAck: async () => {},
+    commitManualTransaction: () => {},
+    broadcastCommit: () => {},
+    rollbackManualTransaction: () => {},
+    broadcastAbort: () => {},
+  };
+  const app = createApp({ evidenceQueryHandler }, accountFreezeManager, syncManager);
+  return { app, calls };
+}
+
+async function postJson(app, path, body) {
+  const server = app.listen(0);
+  try {
+    const port = server.address().port;
+    const res = await fetch(`http://127.0.0.1:${port}${path}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    return { status: res.status, body: await res.json().catch(() => null) };
+  } finally {
+    server.close();
+  }
+}
+
+test('write-discipline: 普通取证在 follower 本地执行，不代理', async () => {
+  const { app, calls } = makeRoutingApp({ isLeader: false });
+  const res = await postJson(app, '/api/evidence/get', {
+    payload: JSON.stringify({ userId: ALICE, authorizationId: 'a1' }),
+    platformSignature: 'stub',
+  });
+  assert.equal(calls.proxied.length, 0);
+  assert.equal(calls.handler, 1);
+  assert.equal(res.status, 200);
+});
+
+test('write-discipline: 应急取证在 follower 被代理到 leader，本地不执行', async () => {
+  const { app, calls } = makeRoutingApp({ isLeader: false });
+  const res = await postJson(app, '/api/evidence/get', {
+    payload: JSON.stringify({ userId: ALICE, authorizationId: 'a1', emergencyAuthorizationJson: '{}' }),
+    platformSignature: 'stub',
+  });
+  assert.equal(calls.handler, 0, 'follower must not execute emergency evidence locally');
+  assert.equal(calls.proxied.length, 1);
+  assert.equal(calls.proxied[0].userId, ALICE);
+  assert.equal(calls.proxied[0].path, '/api/evidence/get');
+  assert.equal(res.body.proxiedMarker, true);
+});
+
+test('write-discipline: 应急取证在 leader 本地执行且开启手动事务（计数与日志并入同一事务）', async () => {
+  const { app, calls } = makeRoutingApp({ isLeader: true });
+  const res = await postJson(app, '/api/evidence/list', {
+    payload: JSON.stringify({ userId: ALICE, emergencyAuthorizationJson: '{}' }),
+    platformSignature: 'stub',
+  });
+  assert.equal(calls.proxied.length, 0);
+  assert.equal(calls.handler, 1);
+  assert.equal(calls.manualTx, 1, 'leader must execute emergency evidence inside a manual transaction');
+  assert.equal(res.status, 200);
 });

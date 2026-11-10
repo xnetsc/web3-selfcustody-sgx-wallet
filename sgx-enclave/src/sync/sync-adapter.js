@@ -364,6 +364,12 @@ export const BUSINESS_TABLES = {
         keyColumns: ['authorization_id', 'user_id', 'operation'],
         dataColumns: ['authorization_id', 'user_id', 'operation', 'used_count', 'updated_at', '_hlc'],
     },
+    emergency_execution_logs: {
+        // 条目身份即内容哈希 entry_hash，全网唯一且逐字一致，以它为同步键；
+        // 表内不设自增 id（节点本地自增号在同步表里没有意义）
+        keyColumns: ['entry_hash'],
+        dataColumns: ['entry_hash', 'created_at', 'authorization_id', 'auth_hash', 'operator_user_id', 'operator_pub_key_hash', 'platform_address', 'target_user_id', 'operation', 'execution_index', 'detail', 'result', 'outcome', 'prev_hash', '_hlc'],
+    },
     webauthn_challenges: {
         // id 是节点本地自增主键，不参与同步；以全局唯一的 challenge 字符串为同步键
         keyColumns: ['challenge'],

@@ -21,7 +21,6 @@ export const GENESIS_PREV_HASH = '0x' + '0'.repeat(64);
 
 /** 参与哈希的字段顺序（规范序列化的唯一定义，验算方按此顺序重算） */
 export const EXECUTION_LOG_HASH_FIELDS = [
-  'logId',
   'createdAt',
   'authorizationId',
   'authHash',
@@ -57,27 +56,41 @@ export function computeExecutionLogHash(entry) {
 }
 
 /**
- * 校验一串按 logId 升序排列的日志条目的哈希链完整性
- * （每条 entry_hash 可重算、prev_hash 与前条 entry_hash 衔接）
+ * 校验一组日志条目的哈希链完整性（与条目排列/到达顺序无关）
+ * 沿 prev_hash → entry_hash 的衔接从创世条目一路走到底：每条 entry_hash
+ * 必须可重算；每个 prev_hash 必须恰有一条后继（零条 = 链断裂/有删除，
+ * 多条 = 链分叉）；全部条目必须都被链覆盖（有游离条目 = 有插入）。
  * @param {Object[]} entries
- * @returns {{ valid: boolean, reason?: string, brokenAtLogId?: number }}
+ * @returns {{ valid: boolean, reason?: string, brokenAtEntryHash?: string }}
  */
 export function verifyExecutionLogChain(entries) {
-  let expectedPrev = GENESIS_PREV_HASH;
-  let prevLogId = 0;
   for (const entry of entries) {
-    if (entry.logId <= prevLogId) {
-      return { valid: false, reason: 'logId is not strictly increasing', brokenAtLogId: entry.logId };
+    if (computeExecutionLogHash(entry) !== entry.entryHash) {
+      return { valid: false, reason: 'entry_hash mismatch (entry content was modified)', brokenAtEntryHash: entry.entryHash };
     }
-    if (entry.prevHash !== expectedPrev) {
-      return { valid: false, reason: 'prev_hash does not match the previous entry_hash (deletion or insertion suspected)', brokenAtLogId: entry.logId };
+  }
+  const byPrevHash = new Map();
+  for (const entry of entries) {
+    const siblings = byPrevHash.get(entry.prevHash) || [];
+    siblings.push(entry);
+    byPrevHash.set(entry.prevHash, siblings);
+  }
+  let cursor = GENESIS_PREV_HASH;
+  let visited = 0;
+  for (;;) {
+    const next = byPrevHash.get(cursor) || [];
+    if (next.length === 0) break;
+    if (next.length > 1) {
+      return { valid: false, reason: 'hash chain forked (multiple entries share the same prev_hash)', brokenAtEntryHash: next[1].entryHash };
     }
-    const recomputed = computeExecutionLogHash(entry);
-    if (recomputed !== entry.entryHash) {
-      return { valid: false, reason: 'entry_hash mismatch (entry content was modified)', brokenAtLogId: entry.logId };
-    }
-    expectedPrev = entry.entryHash;
-    prevLogId = entry.logId;
+    cursor = next[0].entryHash;
+    visited++;
+  }
+  if (entries.length > 0 && visited === 0) {
+    return { valid: false, reason: 'no entry chains from the genesis prev_hash (head segment missing)', brokenAtEntryHash: entries[0].entryHash };
+  }
+  if (visited !== entries.length) {
+    return { valid: false, reason: 'entries exist that are not reachable from the genesis chain (insertion or missing middle segment)', brokenAtEntryHash: cursor };
   }
   return { valid: true };
 }

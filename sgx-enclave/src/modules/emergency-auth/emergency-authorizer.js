@@ -341,7 +341,7 @@ export class EmergencyAuthorizer {
    * @param {number} args.executionIndex - 本次是该 (授权,用户,操作) 的第几次执行
    * @param {Object} [args.detail] - 非敏感摘要（严禁私钥/助记词/加密载荷/签名）
    * @param {Object} [args.outcome] - 结果摘要（如 txHash、walletId、计数）
-   * @returns {Promise<Object>} 完整日志条目（含 logId、prevHash、entryHash）
+   * @returns {Promise<Object>} 完整日志条目（含 prevHash、entryHash）
    */
   async recordExecution(verifyResult, { platformAddress, userId, operation, executionIndex, detail = {}, outcome = {} }) {
     return this._state.appendExecutionLog({

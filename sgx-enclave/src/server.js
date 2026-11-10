@@ -56,6 +56,7 @@ import { classifyCoordinationError } from './sync/sync-adapter.js';
 /**
  * 写操作路由集合（这些路径需要路由到分片 Leader 执行，且需要 2PC 同步复制）
  * 读操作（list/get/status/evidence）直接在本地执行，因为数据已通过 sync 全量复制
+ * （例外：带应急授权的取证请求会写状态，按写请求路由到 leader，见 EVIDENCE_PATHS）
  */
 const WRITE_PATHS = new Set([
   '/api/challenge',
@@ -71,6 +72,46 @@ const WRITE_PATHS = new Set([
   '/api/key/export/init',
   '/api/key/export/complete',
 ]);
+
+// 取证本身是读路径（本地执行），但应急取证会写状态（应急使用计数 + 执行
+// 日志）：写必须由目标分片 leader 发起，不能落在哪个节点就在哪个节点本地
+// 发起 engine.write。故带应急授权的取证请求按写请求处理——由写代理送到
+// leader、在 leader 的手动事务内执行，与其它应急操作同一纪律；普通取证
+// 不受影响，仍在本地执行。
+const EVIDENCE_PATHS = new Set([
+  '/api/evidence/get',
+  '/api/evidence/list',
+]);
+
+/**
+ * 请求体（直传字段或信封 payload 内）是否携带应急授权
+ * @param {object} reqBody
+ * @returns {boolean}
+ */
+function _bodyHasEmergencyAuthorization(reqBody) {
+  try {
+    if (!reqBody) return false;
+    if (reqBody.emergencyAuthorizationJson) return true;
+    if (reqBody.payload) {
+      const payload = typeof reqBody.payload === 'string'
+        ? JSON.parse(reqBody.payload)
+        : reqBody.payload;
+      if (payload && payload.emergencyAuthorizationJson) return true;
+    }
+  } catch {}
+  return false;
+}
+
+/**
+ * 本请求是否按写请求处理（写代理路由与 wrap 的 2PC 判定共用同一条件）
+ * @param {string} path
+ * @param {object} reqBody
+ * @returns {boolean}
+ */
+function _isWriteRequest(path, reqBody) {
+  if (WRITE_PATHS.has(path)) return true;
+  return EVIDENCE_PATHS.has(path) && _bodyHasEmergencyAuthorization(reqBody);
+}
 
 /**
  * 从请求 body 中提取 userId（用于分片路由）
@@ -105,7 +146,7 @@ function _extractUserIdForRouting(reqBody) {
 function createWriteProxyMiddleware(syncManager) {
   return async (req, res, next) => {
     // 单节点模式或路径不是写操作，直接放行
-    if (!syncManager || !WRITE_PATHS.has(req.path)) return next();
+    if (!syncManager || !_isWriteRequest(req.path, req.body)) return next();
 
     const userId = _extractUserIdForRouting(req.body);
 
@@ -213,7 +254,7 @@ export function createApp(handlers, accountFreezeManager, syncManager = null) {
   // 本地撤销记录查询（公开接口：无需平台签名或 Passkey，不受账户冻结影响，只读本地表）
   app.post('/api/auth/revocation/query', wrap(req => handlers.authRevocationHandler.handleQuery(req.body), null, null, null, req => req.path));
 
-  // 应急授权执行日志查询（公开接口：无需鉴权，只读本地审计表，支持分页与过滤）
+  // 应急授权执行日志查询（公开接口：无需鉴权，只读同步副本，支持分页与过滤）
   app.post('/api/emergency/execution-log/query', wrap(req => handlers.emergencyLogQueryHandler.handleQuery(req.body), null, null, null, req => req.path));
 
   // 交易签名
@@ -228,8 +269,10 @@ export function createApp(handlers, accountFreezeManager, syncManager = null) {
   app.post('/api/key/export/complete', wrap(req => handlers.exportFlowHandler.handleComplete(req.body), accountFreezeManager, syncManager, req => req.path));
 
   // 取证查询（统一平台签名，payload 区分平台/用户发起）
-  app.post('/api/evidence/get', wrap(req => handlers.evidenceQueryHandler.handleGetRecord(req.body), accountFreezeManager, null, null, req => req.path));
-  app.post('/api/evidence/list', wrap(req => handlers.evidenceQueryHandler.handleListRecords(req.body), accountFreezeManager, null, null, req => req.path));
+  // 取证路由传入 syncManager：普通取证仍是本地读（needs2PC 为假时 wrap 不碰
+  // syncManager）；带应急授权的取证按写请求处理，在 leader 的手动事务内执行
+  app.post('/api/evidence/get', wrap(req => handlers.evidenceQueryHandler.handleGetRecord(req.body), accountFreezeManager, syncManager, req => req.path));
+  app.post('/api/evidence/list', wrap(req => handlers.evidenceQueryHandler.handleListRecords(req.body), accountFreezeManager, syncManager, req => req.path));
 
   // Enclave 信息（无需鉴权，不受冻结影响）
   app.post('/api/enclave/info', wrap(req => handlers.enclaveInfoHandler.handleGetInfo(req.body), null, null, null, req => req.path));
@@ -339,7 +382,7 @@ function wrap(fn, accountFreezeManager, syncManager, getPath, options = {}) {
       // 注意：即使当前无连接（其他节点都死了），多节点部署也需要走 2PC 路径
       // 这样当无连接时，waitForPrepareAck 会 reject，防止数据分叉
       const path = getPath ? getPath(req) : req.path;
-      const needs2PC = syncManager && WRITE_PATHS.has(path) && syncManager.isMultiNodeDeployment();
+      const needs2PC = syncManager && _isWriteRequest(path, req.body) && syncManager.isMultiNodeDeployment();
 
       let result;
       let proxiedSyncEntries = null;

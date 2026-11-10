@@ -38,7 +38,7 @@ function _executionLogFromRow(row) {
     try { return JSON.parse(s); } catch { return {}; }
   };
   return {
-    logId: row.log_id,
+    entryHash: row.entry_hash,
     createdAt: row.created_at,
     authorizationId: row.authorization_id,
     authHash: row.auth_hash,
@@ -52,7 +52,6 @@ function _executionLogFromRow(row) {
     result: row.result,
     outcome: parseJson(row.outcome),
     prevHash: row.prev_hash,
-    entryHash: row.entry_hash,
   };
 }
 
@@ -914,12 +913,15 @@ export class StateManager {
     return count;
   }
 
-  // ========== 应急授权执行日志（本地审计表：自增 id + 哈希链，不参与同步） ==========
+  // ========== 应急授权执行日志（同步审计表：entry_hash 为主键/同步键 + 哈希链） ==========
 
   /**
-   * 事务内追加一条应急执行日志，并返回完整条目（含 logId 与 entryHash）
-   * 哈希在同一事务内两步完成：先 INSERT 拿到 AUTOINCREMENT 的 logId，
-   * 再按规范序列化算 entry_hash 回填——logId 本身参与哈希，改 id 也会断链。
+   * 事务内追加一条应急执行日志，并返回完整条目
+   * entry_hash 只由内容决定（不依赖任何本地序号），插入前即可算出，一条
+   * INSERT 落定——它同时是主键与同步键，副本节点收到的条目逐字一致。
+   * prev_hash 取本节点当前链尾（created_at 最新一条）；同步可能让不同
+   * 节点短暂看到不同链尾，并发追加产生同 prev_hash 的分叉时，分叉在数据
+   * 里可见（verifyExecutionLogChain 可检出），不会静默丢条目。
    * @param {Object} conn - createConnProxy 代理
    * @param {Object} entry - { authorizationId, authHash, operatorUserId, operatorPubKeyHash,
    *   platformAddress, targetUserId, operation, executionIndex, detail?, result?, outcome? }
@@ -933,24 +935,11 @@ export class StateManager {
     const result = entry.result || 'success';
 
     const prevRows = conn.query(
-      'SELECT entry_hash FROM emergency_execution_logs ORDER BY log_id DESC LIMIT 1'
+      'SELECT entry_hash FROM emergency_execution_logs ORDER BY created_at DESC, entry_hash DESC LIMIT 1'
     );
     const prevHash = prevRows.length > 0 ? prevRows[0].entry_hash : GENESIS_PREV_HASH;
 
-    const insertResult = conn.query(
-      `INSERT INTO emergency_execution_logs
-       (created_at, authorization_id, auth_hash, operator_user_id, operator_pub_key_hash,
-        platform_address, target_user_id, operation, execution_index, detail, result, outcome,
-        prev_hash, entry_hash)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '')`,
-      [createdAt, entry.authorizationId, entry.authHash, entry.operatorUserId, entry.operatorPubKeyHash,
-       entry.platformAddress, entry.targetUserId, entry.operation, entry.executionIndex,
-       detailJson, result, outcomeJson, prevHash]
-    );
-    const logId = Number(insertResult.lastInsertRowid);
-
     const full = {
-      logId,
       createdAt,
       authorizationId: entry.authorizationId,
       authHash: entry.authHash,
@@ -966,9 +955,20 @@ export class StateManager {
       prevHash,
     };
     const entryHash = computeExecutionLogHash(full);
-    conn.query('UPDATE emergency_execution_logs SET entry_hash = ? WHERE log_id = ?', [entryHash, logId]);
 
-    console.log(`[EmergencyExecutionLog] appended: logId=${logId}, authorizationId=${entry.authorizationId}, operation=${entry.operation}, targetUserId=${entry.targetUserId}, executionIndex=${entry.executionIndex}, entryHash=${entryHash}`);
+    // 同步表的 HLC 触发器要求 INSERT 时 _hlc 为有效滴答值（与其它业务表同一纪律）
+    const ts = this._engine.hlc.tick();
+    conn.query(
+      `INSERT INTO emergency_execution_logs
+       (entry_hash, created_at, authorization_id, auth_hash, operator_user_id, operator_pub_key_hash,
+        platform_address, target_user_id, operation, execution_index, detail, result, outcome, prev_hash, _hlc)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [entryHash, createdAt, entry.authorizationId, entry.authHash, entry.operatorUserId, entry.operatorPubKeyHash,
+       entry.platformAddress, entry.targetUserId, entry.operation, entry.executionIndex,
+       detailJson, result, outcomeJson, prevHash, ts]
+    );
+
+    console.log(`[EmergencyExecutionLog] appended: authorizationId=${entry.authorizationId}, operation=${entry.operation}, targetUserId=${entry.targetUserId}, executionIndex=${entry.executionIndex}, entryHash=${entryHash}`);
     return { ...full, detail: entry.detail || {}, outcome: entry.outcome || {}, entryHash };
   }
 
@@ -997,12 +997,12 @@ export class StateManager {
    * @param {string} [filter.operation]
    * @param {string} [filter.platformAddress]
    * @param {string} [filter.result]
-   * @param {number} [filter.logId] - 精确查一条
+   * @param {string} [filter.entryHash] - 按条目哈希精确查一条
    * @param {string} [filter.fromCreatedAt] - created_at >= 该 ISO 时间
    * @param {string} [filter.toCreatedAt] - created_at <= 该 ISO 时间
    * @param {number} [page=1]
    * @param {number} [pageSize=10]
-   * @param {string} [order='asc'] - 'asc' | 'desc'（按 logId）
+   * @param {string} [order='asc'] - 'asc' | 'desc'（按 created_at，同刻以 entry_hash 定序，全网一致）
    * @returns {Promise<{ logs: Object[], count: number, totalPages: number, page: number, pageSize: number }>}
    */
   async listExecutionLogs(filter = {}, page = 1, pageSize = 10, order = 'asc') {
@@ -1020,10 +1020,7 @@ export class StateManager {
     addEq('operation', filter.operation);
     addEq('platform_address', filter.platformAddress);
     addEq('result', filter.result);
-    if (filter.logId !== undefined && filter.logId !== null) {
-      clauses.push('log_id = ?');
-      params.push(filter.logId);
-    }
+    addEq('entry_hash', filter.entryHash);
     if (filter.fromCreatedAt) {
       clauses.push('created_at >= ?');
       params.push(filter.fromCreatedAt);
@@ -1042,7 +1039,7 @@ export class StateManager {
     const count = countRows[0]?.cnt || 0;
     const offset = (page - 1) * pageSize;
     const rows = await this._db.readQuery(
-      `SELECT * FROM emergency_execution_logs ${where} ORDER BY log_id ${direction} LIMIT ? OFFSET ?`,
+      `SELECT * FROM emergency_execution_logs ${where} ORDER BY created_at ${direction}, entry_hash ${direction} LIMIT ? OFFSET ?`,
       [...params, pageSize, offset]
     );
     return {
