@@ -610,7 +610,7 @@ export class StateManager {
     if (!userId && !authorizationId && !grantee && !source) {
       throw new Error('at least one query key is required (userId, authorizationId, grantee or source)');
     }
-    if (source && !['platform', 'contract'].includes(source)) {
+    if (source && !['platform', 'contract', 'emergency'].includes(source)) {
       throw new Error(`Invalid revocation source: ${source}`);
     }
     const conditions = [];
@@ -679,7 +679,7 @@ export class StateManager {
     if (!userId || !authorizationId) {
       throw new Error('userId and authorizationId are required');
     }
-    if (!['platform', 'contract'].includes(source)) {
+    if (!['platform', 'contract', 'emergency'].includes(source)) {
       throw new Error(`Invalid revocation source: ${source}`);
     }
     const revokedAt = _normalizeIsoTime(record.revokedAt) || getMonotonicDate().toISOString();
@@ -700,8 +700,8 @@ export class StateManager {
 
       if (existing.length > 0) {
         const ex = existing[0];
-        if (ex.source === 'platform' && source === 'contract') {
-          // platform 记录优先：合约缓存只补元数据，不覆盖来源与撤销时间
+        if ((ex.source === 'platform' || ex.source === 'emergency') && source === 'contract') {
+          // platform / emergency 记录优先（均为本地权威来源）：合约缓存只补元数据，不覆盖来源与撤销时间
           conn.query(
             `UPDATE authorization_revocations
              SET authorization_expires_at = COALESCE(authorization_expires_at, ?),
@@ -800,6 +800,87 @@ export class StateManager {
     if (!deletedRow) return false;
     console.log(`[AuthorizationRevocation] local revocation record deleted: userId=${userId}, authorizationId=${authorizationId}, source=${deletedRow.source}, revokedAt=${deletedRow.revoked_at}, reason=${options.reason || 'unspecified'}`);
     return true;
+  }
+
+  // ========== 应急授权使用计数（只记消费进度，不参与有效性判定） ==========
+
+  /**
+   * 查询应急授权在 (目标用户, 操作) 维度上已成功执行的次数
+   * @param {string} authorizationId - 应急授权 ID（全局唯一）
+   * @param {string} userId - 目标用户（被操作的钱包归属用户）
+   * @param {string} operation - 操作名
+   * @returns {Promise<number>}
+   */
+  async getEmergencyUseCount(authorizationId, userId, operation) {
+    const rows = await this._db.readQuery(
+      'SELECT used_count FROM emergency_authorization_uses WHERE authorization_id = ? AND user_id = ? AND operation = ?',
+      [authorizationId, userId, operation]
+    );
+    return rows.length > 0 ? rows[0].used_count : 0;
+  }
+
+  /**
+   * 事务内检查应急授权使用次数未超限（超限抛错，与业务写同事务回滚）
+   * @param {Object} conn - createConnProxy 代理
+   * @param {string} authorizationId
+   * @param {string} userId
+   * @param {string} operation
+   * @param {number} maxUses
+   */
+  _checkEmergencyUseInTransaction(conn, authorizationId, userId, operation, maxUses) {
+    const rows = conn.query(
+      'SELECT used_count FROM emergency_authorization_uses WHERE authorization_id = ? AND user_id = ? AND operation = ?',
+      [authorizationId, userId, operation]
+    );
+    const used = rows.length > 0 ? rows[0].used_count : 0;
+    if (used >= maxUses) {
+      throw new Error(`Emergency authorization use limit exceeded: operation=${operation}, used=${used}, maxUses=${maxUses}`);
+    }
+  }
+
+  /**
+   * 事务内递增应急授权使用计数（行不存在则创建）
+   * @param {Object} conn - createConnProxy 代理
+   * @param {string} authorizationId
+   * @param {string} userId
+   * @param {string} operation
+   */
+  _incrementEmergencyUseInTransaction(conn, authorizationId, userId, operation) {
+    const ts = this._engine.hlc.tick();
+    const now = getMonotonicSqliteNow();
+    const rows = conn.query(
+      'SELECT used_count FROM emergency_authorization_uses WHERE authorization_id = ? AND user_id = ? AND operation = ?',
+      [authorizationId, userId, operation]
+    );
+    if (rows.length > 0) {
+      conn.query(
+        'UPDATE emergency_authorization_uses SET used_count = used_count + 1, updated_at = ?, _hlc = ? WHERE authorization_id = ? AND user_id = ? AND operation = ?',
+        [now, ts, authorizationId, userId, operation]
+      );
+    } else {
+      conn.query(
+        `INSERT INTO emergency_authorization_uses (authorization_id, user_id, operation, used_count, updated_at, _hlc)
+         VALUES (?, ?, ?, 1, ?, ?)`,
+        [authorizationId, userId, operation, now, ts]
+      );
+    }
+  }
+
+  /**
+   * 记录一次应急授权的成功执行（独立事务，按目标用户分片键写入）
+   * @param {string} authorizationId
+   * @param {string} userId - 目标用户
+   * @param {string} operation
+   * @returns {Promise<number>} 递增后的已用次数
+   */
+  async recordEmergencyUse(authorizationId, userId, operation) {
+    await this._engine.write(async (db) => {
+      const conn = createConnProxy(db);
+      this._incrementEmergencyUseInTransaction(conn, authorizationId, userId, operation);
+    }, userId);
+    const count = await this.getEmergencyUseCount(authorizationId, userId, operation);
+    console.log(`[EmergencyAuth] use recorded: authorizationId=${authorizationId}, userId=${userId}, operation=${operation}, usedCount=${count}`);
+    return count;
   }
 
   /**

@@ -435,4 +435,164 @@ contract WalletTrustContract is Ownable {
         PasskeyRecovery memory recovery = _passkeyRecoveries[_userId][_newPubKeyHash];
         return (recovery.oldPubKeyHash, recovery.uuid, recovery.memo, recovery.createdAt);
     }
+
+    // ============ 治理 Passkey 指定（运营方应急授权用） ============
+
+    /// @dev 治理 Passkey 指定：userId => 公钥哈希(SHA256(COSE 公钥)) => 是否指定
+    ///      治理 Passkey 本身就是普通钱包账户的 Passkey（在 SGX 端按普通流程注册），
+    ///      合约不存公钥本体，只公开指定“哪个普通账户的哪一把 Passkey 具备治理身份”。
+    ///      SGX 每次执行应急授权时都实时查询此指定，指定被移除即刻失效。
+    mapping(string => mapping(bytes32 => bool)) internal _governancePasskeys;
+
+    event GovernancePasskeyDesignated(string userId, bytes32 pubKeyHash);
+    event GovernancePasskeyRemoved(string userId, bytes32 pubKeyHash);
+
+    /// @dev 指定一把普通账户 Passkey 为治理 Passkey（Owner 权限）
+    function designateGovernancePasskey(string calldata _userId, bytes32 _pubKeyHash) external onlyOwner {
+        require(bytes(_userId).length > 0, "Empty userId");
+        require(_pubKeyHash != bytes32(0), "Invalid pubKeyHash");
+        require(!_governancePasskeys[_userId][_pubKeyHash], "Already designated");
+
+        _governancePasskeys[_userId][_pubKeyHash] = true;
+
+        emit GovernancePasskeyDesignated(_userId, _pubKeyHash);
+    }
+
+    /// @dev 移除治理 Passkey 指定（Owner 权限）；移除后该钥匙签发的应急授权立即不可执行
+    function removeGovernancePasskey(string calldata _userId, bytes32 _pubKeyHash) external onlyOwner {
+        require(_governancePasskeys[_userId][_pubKeyHash], "Not designated");
+
+        _governancePasskeys[_userId][_pubKeyHash] = false;
+
+        emit GovernancePasskeyRemoved(_userId, _pubKeyHash);
+    }
+
+    /// @dev 查询某账户的某把 Passkey 是否为当前指定的治理 Passkey（SGX 每次执行时实时调用）
+    function isGovernancePasskey(string calldata _userId, bytes32 _pubKeyHash) external view returns (bool) {
+        return _governancePasskeys[_userId][_pubKeyHash];
+    }
+
+    // ============ 应急授权（运营方治理，面向他人钱包的全量操作授权） ============
+
+    /// @dev 应急授权记录：授权全文与签名完整存于合约，任何人可查，SGX 以此为唯一有效版本
+    struct EmergencyAuthorization {
+        string authorizationJson;   // 授权 JSON 全文（SGX 对递进文本逐字比对）
+        string signatureJson;       // 治理 Passkey 对授权原文的 WebAuthn 签名（JSON 字符串）
+        bytes32 authHash;           // sha256(authorizationJson)，写入时由合约自算，不采信外部传入
+        string operatorUserId;      // 治理方（运营方）userId
+        bytes32 operatorPubKeyHash; // 治理 Passkey 公钥哈希（写入时必须为已指定治理 Passkey）
+        address grantee;            // 唯一允许执行本次授权的服务器平台地址
+        uint256 createdAt;          // 写入时间戳
+        uint256 expiresAt;          // 链上到期时间（unix 秒）
+        bool revoked;               // 是否已被 Owner 撤销（撤销为终态）
+    }
+
+    /// @dev authorizationId => 应急授权记录
+    mapping(string => EmergencyAuthorization) internal _emergencyAuthorizations;
+    /// @dev authorizationId 是否曾经写入过：只写一次、永不复用（撤销/过期后同样不可再用）
+    mapping(string => bool) public emergencyAuthorizationExists;
+
+    event EmergencyAuthorizationSet(
+        string authorizationId,
+        bytes32 authHash,
+        string operatorUserId,
+        bytes32 operatorPubKeyHash,
+        address grantee,
+        uint256 expiresAt
+    );
+    event EmergencyAuthorizationRevoked(string authorizationId);
+
+    /**
+     * @dev 写入一份应急授权（Owner 权限）
+     *      前置条件：签名钥匙必须已被指定为治理 Passkey；authorizationId 全局唯一且永不复用。
+     *      authHash 由合约对 authorizationJson 自行计算，保证记录内的哈希与全文永远一致。
+     * @param _authorizationId 全局唯一授权 ID（写入授权 JSON 原文内）
+     * @param _authorizationJson 授权 JSON 全文
+     * @param _signatureJson 治理 Passkey 对授权原文的 WebAuthn 签名（JSON 字符串）
+     * @param _operatorUserId 治理方 userId
+     * @param _operatorPubKeyHash 治理 Passkey 公钥哈希
+     * @param _grantee 唯一允许执行的平台地址
+     * @param _expiresAt 到期时间（unix 秒，必须在未来）
+     */
+    function setEmergencyAuthorization(
+        string calldata _authorizationId,
+        string calldata _authorizationJson,
+        string calldata _signatureJson,
+        string calldata _operatorUserId,
+        bytes32 _operatorPubKeyHash,
+        address _grantee,
+        uint256 _expiresAt
+    ) external onlyOwner {
+        require(bytes(_authorizationId).length > 0, "Empty authorizationId");
+        require(!emergencyAuthorizationExists[_authorizationId], "Authorization id already used");
+        require(bytes(_authorizationJson).length > 0, "Empty authorizationJson");
+        require(bytes(_signatureJson).length > 0, "Empty signatureJson");
+        require(_governancePasskeys[_operatorUserId][_operatorPubKeyHash], "Passkey not designated as governance");
+        require(_grantee != address(0), "Invalid grantee");
+        require(_expiresAt > block.timestamp, "Authorization already expired");
+
+        bytes32 authHash = sha256(bytes(_authorizationJson));
+
+        _emergencyAuthorizations[_authorizationId] = EmergencyAuthorization({
+            authorizationJson: _authorizationJson,
+            signatureJson: _signatureJson,
+            authHash: authHash,
+            operatorUserId: _operatorUserId,
+            operatorPubKeyHash: _operatorPubKeyHash,
+            grantee: _grantee,
+            createdAt: block.timestamp,
+            expiresAt: _expiresAt,
+            revoked: false
+        });
+        emergencyAuthorizationExists[_authorizationId] = true;
+
+        emit EmergencyAuthorizationSet(_authorizationId, authHash, _operatorUserId, _operatorPubKeyHash, _grantee, _expiresAt);
+    }
+
+    /// @dev 撤销一份应急授权（Owner 权限，终态）；SGX 每次执行实时查合约，撤销在下一次执行尝试时即刻生效
+    function revokeEmergencyAuthorization(string calldata _authorizationId) external onlyOwner {
+        require(emergencyAuthorizationExists[_authorizationId], "Authorization not found");
+        require(!_emergencyAuthorizations[_authorizationId].revoked, "Already revoked");
+
+        _emergencyAuthorizations[_authorizationId].revoked = true;
+
+        emit EmergencyAuthorizationRevoked(_authorizationId);
+    }
+
+    /**
+     * @dev 查询应急授权记录全文（任何人可调用；SGX 每次执行应急授权时实时调用，
+     *      以链上记录判定有效性：存在、未撤销、未过期、递进文本与记录全文一致）
+     */
+    function getEmergencyAuthorization(
+        string calldata _authorizationId
+    ) external view returns (
+        string memory authorizationJson,
+        string memory signatureJson,
+        bytes32 authHash,
+        string memory operatorUserId,
+        bytes32 operatorPubKeyHash,
+        address grantee,
+        uint256 createdAt,
+        uint256 expiresAt,
+        bool revoked,
+        bool exists
+    ) {
+        exists = emergencyAuthorizationExists[_authorizationId];
+        if (!exists) {
+            return ("", "", bytes32(0), "", bytes32(0), address(0), 0, 0, false, false);
+        }
+        EmergencyAuthorization memory record = _emergencyAuthorizations[_authorizationId];
+        return (
+            record.authorizationJson,
+            record.signatureJson,
+            record.authHash,
+            record.operatorUserId,
+            record.operatorPubKeyHash,
+            record.grantee,
+            record.createdAt,
+            record.expiresAt,
+            record.revoked,
+            true
+        );
+    }
 }

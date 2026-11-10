@@ -3,7 +3,7 @@
  * 只定义业务表：accounts, passkeys, wallets, authorization_states,
  * authorization_token_states, authorization_records, authorization_revocations,
  * import_sessions, export_sessions, tx_sign_nonces, webauthn_challenges,
- * account_freezes, pinned_contract。
+ * account_freezes, emergency_authorization_uses, pinned_contract。
  * 同步基础设施表（_sync_log、_sync_peers、_tombstones、_full_sync_*）
  * 由 SyncEngine 在启动时统一创建，app 侧不预建，避免预建形状与引擎
  * 现行 DDL 不一致时被 IF NOT EXISTS 抢先占位。
@@ -164,7 +164,7 @@ CREATE TABLE IF NOT EXISTS authorization_revocations (
     user_id TEXT NOT NULL,
     authorization_id TEXT NOT NULL,
     grantee TEXT,
-    source TEXT NOT NULL CHECK (source IN ('platform', 'contract')),
+    source TEXT NOT NULL CHECK (source IN ('platform', 'contract', 'emergency')),
     revoked_at TEXT NOT NULL,
     authorization_expires_at TEXT,
     authorization_hash TEXT,
@@ -233,6 +233,27 @@ export const CREATE_ACCOUNT_FREEZES_INDEXES_SQL = [
     `CREATE INDEX IF NOT EXISTS idx_account_freezes_status ON account_freezes (status)`,
 ];
 
+// ========== 应急授权使用计数表 ==========
+
+// 应急授权（合约治理）每次成功执行后的使用计数，按 (授权, 目标用户, 操作) 分开计。
+// 上限来自授权原文中逐钱包 policy 的 maxUses（缺省 1）；有效性本身只认合约实时
+// 状态，本表只记消费进度，不参与有效性判定。
+export const CREATE_EMERGENCY_AUTHORIZATION_USES_SQL = `
+CREATE TABLE IF NOT EXISTS emergency_authorization_uses (
+    authorization_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    operation TEXT NOT NULL,
+    used_count INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL,
+    _hlc TEXT NOT NULL DEFAULT '0',
+    PRIMARY KEY (authorization_id, user_id, operation)
+)`;
+
+export const CREATE_EMERGENCY_AUTHORIZATION_USES_INDEXES_SQL = [
+    `CREATE INDEX IF NOT EXISTS idx_emg_uses_auth_id ON emergency_authorization_uses (authorization_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_emg_uses_user_id ON emergency_authorization_uses (user_id)`,
+];
+
 // ========== 合约身份钉住表（安全：防止 env 注入替换合约） ==========
 
 // 单行表（id 恒为 1）。首次成功读到合约数据时写入合约身份 + 最近一次已知的
@@ -270,6 +291,7 @@ export const ALL_TABLE_SQLS = [
     { name: 'tx_sign_nonces', sql: CREATE_TX_SIGN_NONCES_SQL, indexes: CREATE_TX_SIGN_NONCES_INDEXES_SQL },
     { name: 'webauthn_challenges', sql: CREATE_WEBAUTHN_CHALLENGES_SQL, indexes: CREATE_WEBAUTHN_CHALLENGES_INDEXES_SQL },
     { name: 'account_freezes', sql: CREATE_ACCOUNT_FREEZES_SQL, indexes: CREATE_ACCOUNT_FREEZES_INDEXES_SQL },
+    { name: 'emergency_authorization_uses', sql: CREATE_EMERGENCY_AUTHORIZATION_USES_SQL, indexes: CREATE_EMERGENCY_AUTHORIZATION_USES_INDEXES_SQL },
     { name: 'pinned_contract', sql: CREATE_PINNED_CONTRACT_SQL, indexes: [] },
 ];
 

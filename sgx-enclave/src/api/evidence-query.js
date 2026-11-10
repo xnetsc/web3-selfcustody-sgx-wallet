@@ -32,6 +32,8 @@ export class EvidenceQueryHandler {
     this._state = deps.stateManager;
     this._passkey = deps.passkeyManager;
     this._challenge = deps.challengeManager || null;
+    // 应急授权校验器（可选注入）：治理授权可查询他人账户的授权原文记录
+    this._emergency = deps.emergencyAuthorizer || null;
   }
 
   /**
@@ -62,6 +64,17 @@ export class EvidenceQueryHandler {
     console.log(`[EvidenceQuery] handleGetRecord: userId=${request.userId}, authorizationId=${request.authorizationId}`);
     if (!request.userId) throw new Error('userId is required');
     if (!request.authorizationId) throw new Error('authorizationId is required');
+
+    // 应急查询路径：治理授权替代平台 grantee 检查与用户签名
+    if (request.emergencyAuthorizationJson) {
+      const emgCtx = await this._verifyEmergency(request, whitelistResult.address, 'evidence_query', {
+        authorizationId: request.authorizationId,
+      });
+      const record = await this._getRecordOrThrow(request.userId, request.authorizationId);
+      await this._emergency.recordUse(emgCtx.auth, request.userId, 'evidence_query');
+      console.log(`[EvidenceQuery] handleGetRecord: success (emergency)`);
+      return { ...this._formatRecord(record), emergencyAuthorizationId: emgCtx.auth.authorizationId };
+    }
 
     const isUserInitiated = !!(request.credentialId && request.webauthnSignature);
 
@@ -112,6 +125,13 @@ export class EvidenceQueryHandler {
       throw new Error('Invalid payload: must be valid JSON');
     }
 
+    // 应急查询路径：治理授权
+    let emergencyCtx = null;
+    if (request.emergencyAuthorizationJson) {
+      if (!request.userId) throw new Error('userId is required');
+      emergencyCtx = await this._verifyEmergency(request, whitelistResult.address, 'evidence_query', {});
+    }
+
     const isUserInitiated = !!(request.credentialId && request.webauthnSignature);
 
     if (isUserInitiated) {
@@ -123,7 +143,11 @@ export class EvidenceQueryHandler {
 
     const records = await this._state.listAuthorizationRecords(request.userId);
 
-    const mode = isUserInitiated ? 'user via platform' : 'platform';
+    if (emergencyCtx) {
+      await this._emergency.recordUse(emergencyCtx.auth, request.userId, 'evidence_query');
+    }
+
+    const mode = emergencyCtx ? 'emergency' : (isUserInitiated ? 'user via platform' : 'platform');
     console.log(`[EvidenceQuery] handleListRecords: success (${mode}), count=${records.length}`);
 
     return {
@@ -134,7 +158,30 @@ export class EvidenceQueryHandler {
         authorizationHash: r.authorization_hash,
         createdAt: r.created_at,
       })),
+      ...(emergencyCtx ? { emergencyAuthorizationId: emergencyCtx.auth.authorizationId } : {}),
     };
+  }
+
+  /**
+   * 应急授权校验（payload 携带 emergencyAuthorizationJson 时使用）
+   * @private
+   */
+  async _verifyEmergency(request, platformAddress, operation, actualParams) {
+    if (!this._emergency) {
+      throw new Error('Emergency authorization is not enabled on this enclave');
+    }
+    const result = await this._emergency.verify({
+      authorizationJson: request.emergencyAuthorizationJson,
+      signature: request.emergencySignature,
+      platformAddress,
+      operation,
+      userId: request.userId,
+      actualParams,
+    });
+    if (!result.approved) {
+      throw new Error(`Emergency authorization verification failed: ${result.reason}`);
+    }
+    return result;
   }
 
   // ===== 内部方法 =====

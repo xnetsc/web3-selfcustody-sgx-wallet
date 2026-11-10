@@ -27,6 +27,11 @@ export const CONTRACT_ABI = [
   'function passkeyRecoveryExists(string, bytes32) view returns (bool)',
   'function getPasskeyRecovery(string, bytes32) view returns (bytes32 oldPubKeyHash, string uuid, string memo, uint256 createdAt)',
 
+  // ===== 治理 Passkey 指定 + 应急授权（SGX 每次执行实时查询，不走缓存） =====
+  'function isGovernancePasskey(string, bytes32) view returns (bool)',
+  'function emergencyAuthorizationExists(string) view returns (bool)',
+  'function getEmergencyAuthorization(string) view returns (string authorizationJson, string signatureJson, bytes32 authHash, string operatorUserId, bytes32 operatorPubKeyHash, address grantee, uint256 createdAt, uint256 expiresAt, bool revoked, bool exists)',
+
   // ===== 合约迁移目标（无需鉴权，所有人可读） =====
   'function getMigrationTarget() view returns (string rpcUrl, string contractAddress, uint256 chainId, string rpcTlsCaCert)',
 ];

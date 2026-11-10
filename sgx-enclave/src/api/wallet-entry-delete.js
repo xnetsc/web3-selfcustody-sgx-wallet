@@ -30,6 +30,8 @@ export class WalletEntryDeleteHandler {
     this._passkey = deps.passkeyManager;
     this._challenge = deps.challengeManager;
     this._wallet = deps.walletManager;
+    // 应急授权校验器（可选注入）
+    this._emergency = deps.emergencyAuthorizer || null;
   }
 
   /**
@@ -61,9 +63,40 @@ export class WalletEntryDeleteHandler {
     }
 
     if (!request.userId) throw new Error('userId is required');
-    if (!request.credentialId) throw new Error('credentialId is required');
     if (!request.walletId) throw new Error('walletId is required');
     if (!request.address) throw new Error('address is required');
+
+    // 应急授权路径：治理授权替代目标用户的 Passkey 意图签名
+    const isEmergency = !!request.emergencyAuthorizationJson;
+    let emergencyCtx = null;
+    if (isEmergency) {
+      if (!this._emergency) throw new Error('Emergency authorization is not enabled on this enclave');
+      const result = await this._emergency.verify({
+        authorizationJson: request.emergencyAuthorizationJson,
+        signature: request.emergencySignature,
+        platformAddress: whitelistResult.address,
+        operation: 'wallet_entry_delete',
+        userId: request.userId,
+        actualParams: { walletId: request.walletId, address: request.address },
+      });
+      if (!result.approved) {
+        throw new Error(`Emergency authorization verification failed: ${result.reason}`);
+      }
+      emergencyCtx = result;
+      console.log(`[WalletEntryDelete] handleDelete: emergency authorization approved, authorizationId=${result.auth.authorizationId}`);
+
+      await this._wallet.deleteWalletEntry(request.userId, request.walletId, request.address);
+      await this._emergency.recordUse(emergencyCtx.auth, request.userId, 'wallet_entry_delete');
+      console.log(`[WalletEntryDelete] handleDelete: success (emergency), walletId=${request.walletId}, address=${request.address}`);
+      return {
+        success: true,
+        walletId: request.walletId,
+        address: request.address,
+        emergencyAuthorizationId: emergencyCtx.auth.authorizationId,
+      };
+    }
+
+    if (!request.credentialId) throw new Error('credentialId is required');
     if (!request.webauthnSignature) throw new Error('webauthnSignature is required');
     if (!request.rawChallenge) throw new Error('rawChallenge is required');
     if (!request.userIntentJson) throw new Error('userIntentJson is required');

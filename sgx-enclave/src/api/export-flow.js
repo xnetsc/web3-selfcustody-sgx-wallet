@@ -34,6 +34,7 @@
  *     { purpose: "key_export", userId, rsaPublicKey, exportInfo: [{walletId, addresses}] }
  */
 
+import crypto from 'crypto';
 import { verifyWebAuthnSignature } from '../modules/webauthn/verifier.js';
 
 export class ExportFlowHandler {
@@ -56,6 +57,9 @@ export class ExportFlowHandler {
     this._challenge = deps.challengeManager;
     this._wallet = deps.walletManager;
     this._keyExporter = deps.keyExporter;
+    // 应急授权校验器（可选注入）：init/complete 两步都实时重验，
+    // init 与 complete 之间授权被撤销时 complete 被阻断（钱包不会被删）
+    this._emergency = deps.emergencyAuthorizer || null;
   }
 
   /**
@@ -96,7 +100,6 @@ export class ExportFlowHandler {
     console.log(`[ExportFlow] handleInit: userId=${request.userId}, exportInfo=${JSON.stringify(request.exportInfo)}`);
 
     if (!request.userId) throw new Error('userId is required');
-    if (!request.credentialId) throw new Error('credentialId is required');
     if (!Array.isArray(request.exportInfo) || request.exportInfo.length === 0) {
       throw new Error('exportInfo must be a non-empty array');
     }
@@ -120,6 +123,14 @@ export class ExportFlowHandler {
     if (!request.peerPublicKey && !request.rsaPublicKey) {
       throw new Error('Either peerPublicKey (ECDH) or rsaPublicKey (RSA) is required');
     }
+
+    // 应急授权路径：治理授权替代目标用户的 Passkey 意图签名
+    if (request.emergencyAuthorizationJson) {
+      await this._verifyEmergencyExportInit(request, whitelistResult.address);
+      return this._initiateAndRespond(request);
+    }
+
+    if (!request.credentialId) throw new Error('credentialId is required');
     if (!request.webauthnSignature) throw new Error('webauthnSignature is required');
     if (!request.rawChallenge) throw new Error('rawChallenge is required');
     if (!request.userIntentJson) throw new Error('userIntentJson is required');
@@ -234,7 +245,16 @@ export class ExportFlowHandler {
     }
     console.log(`[ExportFlow] handleInit: userIntent verification passed`);
 
-    // 7. 验证所有 walletId 对应的钱包容器存在
+    return this._initiateAndRespond(request);
+  }
+
+  /**
+   * 钱包存在性校验 + 发起批量导出 + 构建 init 响应
+   * （用户路径与应急路径在各自完成授权校验后共用）
+   * @private
+   */
+  async _initiateAndRespond(request) {
+    // 验证所有 walletId 对应的钱包容器存在
     for (const item of request.exportInfo) {
       const wallet = await this._wallet.getWallet(request.userId, item.walletId);
       if (!wallet) {
@@ -242,7 +262,7 @@ export class ExportFlowHandler {
       }
     }
 
-    // 8. 发起批量导出（两种模式都在 init 时加密数据并返回）
+    // 发起批量导出（两种模式都在 init 时加密数据并返回）
     const keyExchangeParams = request.rsaPublicKey
       ? { rsaPublicKey: request.rsaPublicKey }
       : { peerPublicKey: request.peerPublicKey };
@@ -255,7 +275,7 @@ export class ExportFlowHandler {
 
     console.log(`[ExportFlow] handleInit: session created, sessionId=${exportResult.sessionId}, keyType=${exportResult.keyType}`);
 
-    // 9. 构建响应（根据 keyType 返回不同字段，两种模式都在 init 返回加密数据）
+    // 构建响应（根据 keyType 返回不同字段，两种模式都在 init 返回加密数据）
     const response = {
       sessionId: exportResult.sessionId,
       keyType: exportResult.keyType,
@@ -271,6 +291,32 @@ export class ExportFlowHandler {
     }
 
     return response;
+  }
+
+  /**
+   * 应急授权校验（导出 init 用）：接收方公钥哈希按请求中的公钥原文计算，
+   * policy 中声明 recipientKeyHash 时必须与之一致（防平台换接收方）
+   * @private
+   */
+  async _verifyEmergencyExportInit(request, platformAddress) {
+    if (!this._emergency) {
+      throw new Error('Emergency authorization is not enabled on this enclave');
+    }
+    const recipientKey = request.rsaPublicKey || request.peerPublicKey;
+    const recipientKeyHash = '0x' + crypto.createHash('sha256').update(recipientKey, 'utf8').digest('hex');
+    const result = await this._emergency.verify({
+      authorizationJson: request.emergencyAuthorizationJson,
+      signature: request.emergencySignature,
+      platformAddress,
+      operation: 'key_export',
+      userId: request.userId,
+      actualParams: { exportInfo: request.exportInfo, recipientKeyHash },
+    });
+    if (!result.approved) {
+      throw new Error(`Emergency authorization verification failed: ${result.reason}`);
+    }
+    console.log(`[ExportFlow] handleInit: emergency authorization approved, authorizationId=${result.auth.authorizationId}`);
+    return result;
   }
 
   /**
@@ -310,11 +356,7 @@ export class ExportFlowHandler {
     console.log(`[ExportFlow] handleComplete: userId=${request.userId}, sessionId=${request.sessionId}`);
 
     if (!request.userId) throw new Error('userId is required');
-    if (!request.credentialId) throw new Error('credentialId is required');
-    if (!request.webauthnSignature) throw new Error('webauthnSignature is required');
     if (!request.sessionId) throw new Error('sessionId is required');
-    if (!request.rawChallenge) throw new Error('rawChallenge is required');
-    if (!request.userIntentJson) throw new Error('userIntentJson is required');
 
     // 3. 查找导出会话（验证 sessionId 有效性，并获取 exportInfo 和 userId）
     const session = await this._keyExporter.findExportSession(request.sessionId);
@@ -327,6 +369,38 @@ export class ExportFlowHandler {
       console.log(`[ExportFlow] handleComplete: REJECTED - userId mismatch: session.user_id=${session.user_id}, request.userId=${request.userId}`);
       throw new Error('userId mismatch: not authorized to confirm this export session');
     }
+
+    // 应急授权路径：complete 时重新全量验证（init 之后被撤销则在此被阻断，
+    // confirmExport 不执行、钱包不删除）；导出清单以会话中固化的 exportInfo 为准
+    if (request.emergencyAuthorizationJson) {
+      if (!this._emergency) throw new Error('Emergency authorization is not enabled on this enclave');
+      const result = await this._emergency.verify({
+        authorizationJson: request.emergencyAuthorizationJson,
+        signature: request.emergencySignature,
+        platformAddress: whitelistResult.address,
+        operation: 'key_export',
+        userId: request.userId,
+        actualParams: { exportInfo: session.exportInfo },
+      });
+      if (!result.approved) {
+        throw new Error(`Emergency authorization verification failed: ${result.reason}`);
+      }
+      const confirmResult = await this._keyExporter.confirmExport(request.sessionId);
+      await this._emergency.recordUse(result.auth, request.userId, 'key_export');
+      console.log(`[ExportFlow] handleComplete: success (emergency), walletIds=${JSON.stringify(confirmResult.walletIds)}, deletedCount=${confirmResult.deletedCount}`);
+      return {
+        success: true,
+        walletIds: confirmResult.walletIds,
+        deletedCount: confirmResult.deletedCount,
+        deleted: confirmResult.deletedCount > 0,
+        emergencyAuthorizationId: result.auth.authorizationId,
+      };
+    }
+
+    if (!request.credentialId) throw new Error('credentialId is required');
+    if (!request.webauthnSignature) throw new Error('webauthnSignature is required');
+    if (!request.rawChallenge) throw new Error('rawChallenge is required');
+    if (!request.userIntentJson) throw new Error('userIntentJson is required');
 
     // 5. 验证 Passkey 归属
     const ownershipValid = await this._passkey.verifyPasskeyOwnership(request.userId, request.credentialId);

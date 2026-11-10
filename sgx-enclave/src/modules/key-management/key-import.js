@@ -79,7 +79,7 @@ export class KeyImporter {
    * @param {Array<{chainId: number, coinType: number}>} [chains] - 链列表（单个导入时使用）
    * @returns {Promise<Object>} 导入结果
    */
-  async completeImport(sessionId, peerPublicKey, encryptedData, walletId, chains) {
+  async completeImport(sessionId, peerPublicKey, encryptedData, walletId, chains, allowedUserIds = null) {
     console.log(`[KeyImporter] completeImport: sessionId=${sessionId}`);
 
     // 1. 查找会话（校验过期）
@@ -118,7 +118,7 @@ export class KeyImporter {
 
       let result;
       if (session.importType === 'batch') {
-        result = this._batchImportInTransaction(conn, session.userId, plaintext, ts);
+        result = this._batchImportInTransaction(conn, session.userId, plaintext, ts, allowedUserIds);
       } else {
         result = this._singleImportInTransaction(conn, session.userId, session.importType, plaintext, walletId, chains, ts);
       }
@@ -206,7 +206,7 @@ export class KeyImporter {
    * @returns {Promise<{ results: Array, sharedWalletIds: Object<string, string> }>}
    * @private
    */
-  _batchImportInTransaction(conn, defaultUserId, jsonText, ts) { // ts = hlc.tick() from caller
+  _batchImportInTransaction(conn, defaultUserId, jsonText, ts, allowedUserIds = null) { // ts = hlc.tick() from caller
     let items;
     try {
       items = JSON.parse(jsonText);
@@ -236,6 +236,12 @@ export class KeyImporter {
 
     for (const item of items) {
       const itemUserId = item.userId || defaultUserId;
+
+      // 应急授权批量导入约束：每个条目的目标 userId 必须在授权范围内，
+      // 任一条目越界则整笔事务回滚（与导入、会话删除同事务）
+      if (allowedUserIds && !allowedUserIds.includes(itemUserId)) {
+        throw new Error(`Batch import item userId ${itemUserId} is not in the allowed user set for this import`);
+      }
 
       // 确定 walletId：指定的 > 按 userId 分组的 sharedWalletId
       let itemWalletId = item.walletId;

@@ -43,6 +43,7 @@ import { SessionManager } from './src/modules/key-management/session-manager.js'
 import { KeyImporter } from './src/modules/key-management/key-import.js';
 import { KeyExporter } from './src/modules/key-management/key-export.js';
 import { AuthEngine } from './src/modules/auth-engine/auth-engine.js';
+import { EmergencyAuthorizer } from './src/modules/emergency-auth/index.js';
 import { StateManager } from './src/modules/state-management/state-manager.js';
 import { TransactionSigner } from './src/modules/signing/transaction-signer.js';
 
@@ -329,6 +330,14 @@ async function main() {
     walletManager,
   });
 
+  // 8.1 应急授权校验器（运营方治理）：所有 handler 共用同一个实例，
+  //     每次执行都实时查合约判定有效性，不缓存
+  const emergencyAuthorizer = new EmergencyAuthorizer({
+    contractClient,
+    passkeyManager,
+    stateManager,
+  });
+
   // 9. 创建 API handler 实例
   const handlers = {
     challengeHandler: new ChallengeHandler({
@@ -343,12 +352,14 @@ async function main() {
       accountFreezeManager,
       walletManager,
       contractClient,
+      emergencyAuthorizer,
     }),
     walletCrudHandler: new WalletCrudHandler({
       whitelistVerifier,
       passkeyManager,
       challengeManager,
       walletManager,
+      emergencyAuthorizer,
     }),
     txSigningHandler: new TxSigningHandler({
       authEngine,
@@ -356,12 +367,14 @@ async function main() {
       stateManager,
       walletManager,
       engine,
+      emergencyAuthorizer,
     }),
     keyImportHandler: new KeyImportHandler({
       whitelistVerifier,
       keyImporter,
       passkeyManager,
       challengeManager,
+      emergencyAuthorizer,
     }),
     exportFlowHandler: new ExportFlowHandler({
       whitelistVerifier,
@@ -369,12 +382,14 @@ async function main() {
       challengeManager,
       walletManager,
       keyExporter,
+      emergencyAuthorizer,
     }),
     evidenceQueryHandler: new EvidenceQueryHandler({
       whitelistVerifier,
       stateManager,
       passkeyManager,
       challengeManager,
+      emergencyAuthorizer,
     }),
     passkeyListHandler: new PasskeyListHandler({
       whitelistVerifier,
@@ -389,6 +404,7 @@ async function main() {
       passkeyManager,
       challengeManager,
       walletManager,
+      emergencyAuthorizer,
     }),
     authStatusHandler: new AuthStatusHandler({
       whitelistVerifier,
@@ -398,6 +414,7 @@ async function main() {
       whitelistVerifier,
       passkeyManager,
       stateManager,
+      emergencyAuthorizer,
     }),
     enclaveInfoHandler: new EnclaveInfoHandler({
       contractClient,

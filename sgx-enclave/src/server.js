@@ -282,6 +282,15 @@ function wrap(fn, accountFreezeManager, syncManager, getPath, options = {}) {
             skipFreezeCheck = true;
           }
 
+          // 0b. 应急授权请求（payload 携带 emergencyAuthorizationJson）：治理
+          //     授权的操作不被目标账户冻结状态阻挡（冻结防的是冒充绑定后的
+          //     即时盗用，治理处置正是冻结场景下需要的通道），且应急操作
+          //     成功不解除冻结（canLiftFreeze 保持 false，冻结只按原规则
+          //     由用户本人带 Passkey 的请求解除）
+          if (payload.emergencyAuthorizationJson) {
+            skipFreezeCheck = true;
+          }
+
           // 1. challenge 接口：purpose=register 时跳过冻结检查
           if (options.allowPurposeRegister && payload.purpose === 'register') {
             skipFreezeCheck = true;
@@ -466,6 +475,8 @@ function _extractFreezeCheckFields(payload) {
  */
 function classifyError(msg) {
   if (msg.startsWith('Platform verification failed')) return 401;
+  if (msg.startsWith('Emergency authorization verification failed')) return 401;
+  if (msg.startsWith('Emergency authorization is not enabled')) return 400;
   if (msg.startsWith('Revocation signature verification failed')) return 401;
   if (msg.startsWith('Authorization signature verification failed')) return 401;
   if (msg.startsWith('Passkey not bound')) return 401;

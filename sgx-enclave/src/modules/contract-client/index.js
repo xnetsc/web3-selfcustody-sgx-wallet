@@ -737,6 +737,53 @@ export class ContractClient {
     }
   }
 
+  // ===== 治理 Passkey 指定 + 应急授权（实时查询合约，不走缓存） =====
+  // 应急授权的有效性只认合约当场给出的状态：每次执行都重新查询，
+  // 撤销记录、移除治理指定在下一次执行尝试时即刻生效，无缓存窗口。
+  // 合约不可用时这两个方法直接抛错（fail-closed），调用方不得降级放行。
+
+  /**
+   * 查询某账户的某把 Passkey 当前是否为合约指定的治理 Passkey（实时查询）
+   * @param {string} userId - 治理方（运营方）userId
+   * @param {string} pubKeyHash - 0x 前缀 bytes32 hex（SHA256(COSE 公钥)）
+   * @returns {Promise<boolean>}
+   * @throws 合约不可用时抛错
+   */
+  async isGovernancePasskey(userId, pubKeyHash) {
+    this._ensureInitialized();
+    if (!this._contractAvailable || !this._contract) {
+      throw new Error('Contract unavailable: cannot verify governance passkey designation');
+    }
+    return this._contract.isGovernancePasskey(userId, pubKeyHash);
+  }
+
+  /**
+   * 按 authorizationId 精确查询应急授权记录全文（实时查询）
+   * @param {string} authorizationId - 全局唯一授权 ID
+   * @returns {Promise<Object|null>} 记录对象；链上不存在该 ID 时返回 null
+   * @throws 合约不可用时抛错
+   */
+  async getEmergencyAuthorization(authorizationId) {
+    this._ensureInitialized();
+    if (!this._contractAvailable || !this._contract) {
+      throw new Error('Contract unavailable: cannot verify emergency authorization');
+    }
+    const r = await this._contract.getEmergencyAuthorization(authorizationId);
+    if (!r.exists) return null;
+    return {
+      authorizationJson: r.authorizationJson,
+      signatureJson: r.signatureJson,
+      authHash: r.authHash,
+      operatorUserId: r.operatorUserId,
+      operatorPubKeyHash: r.operatorPubKeyHash,
+      grantee: r.grantee,
+      createdAt: Number(r.createdAt),
+      expiresAt: Number(r.expiresAt),
+      revoked: r.revoked,
+      exists: true,
+    };
+  }
+
   /**
    * 获取缓存最后刷新时间戳
    * @returns {number}

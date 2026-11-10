@@ -24,6 +24,11 @@
  *     重置（不论现有 Passkey 数量、间隔多久）；该钥匙已不在账户内、或账户
  *     又被冻结时，状态已配不上，允许再次走重置
  *   合约不可用时此功能不可用。
+ * - 场景D（应急绑定，purpose=register）：payload 携带 emergencyAuthorizationJson 时，
+ *   运营方凭合约治理授权为目标账户新增绑定一把 Passkey（不替换、不删旧钥匙、
+ *   不触发补绑冻结）。新 Passkey 的注册签名可由运维带外取得；授权校验在新
+ *   公钥哈希算出后进行，逐钱包 policy 的 passkey_bind 项必须以 newPubKeyHash
+ *   钉住被绑定的正是这把钥匙。合约恢复条目命中时仍以场景C优先。
  *
  * 冻结账户替换逻辑（仅当新 Passkey 未匹配到 Owner 恢复条目时适用）：
  *   当账户处于冻结状态时，若通过 purpose=register 重新注册，则：
@@ -126,6 +131,8 @@ export class PasskeyRegisterHandler {
     this._accountFreeze = deps.accountFreezeManager;
     this._wallet = deps.walletManager;
     this._contract = deps.contractClient;
+    // 应急授权校验器（可选注入）：场景D——治理授权为他人账户新增绑定 Passkey
+    this._emergency = deps.emergencyAuthorizer || null;
   }
 
   /**
@@ -166,6 +173,20 @@ export class PasskeyRegisterHandler {
 
     console.log(`[PasskeyRegister] handleComplete: userId=${request.userId || '(not provided, will use from challenge)'}`);
 
+    // 场景D：应急绑定（payload 携带 emergencyAuthorizationJson）——治理授权
+    // 为目标账户新增一把 Passkey。新 Passkey 的注册签名可由运维带外取得后
+    // 随请求递进（attestationResponse 本身即该签名材料）；授权校验在新公钥
+    // 哈希算出后（步骤 6.5 旁）进行，policy 必须钉住这把钥匙的公钥哈希。
+    const isEmergencyBind = !!request.emergencyAuthorizationJson;
+    if (isEmergencyBind) {
+      if (!this._emergency) {
+        throw new Error('Emergency authorization is not enabled on this enclave');
+      }
+      if (!request.userId) {
+        throw new Error('userId is required for emergency passkey bind');
+      }
+    }
+
     if (!request.attestationResponse) {
       throw new Error('attestationResponse is required');
     }
@@ -200,8 +221,10 @@ export class PasskeyRegisterHandler {
 
     if (finalUserId) {
       // 4a. 优先检查账户是否被冻结（仅当 withinFreezePeriod=true 时才视为冻结；过期的冻结记录忽略）
+      //     场景D（应急绑定）不走冻结替换：治理授权是新增绑定一把钥匙，
+      //     不替换冻结钥匙、不动冻结状态，冻结分支整体跳过。
       const freezeStatus = this._accountFreeze.getFreezeStatus(finalUserId);
-      if (freezeStatus.frozen && freezeStatus.withinFreezePeriod) {
+      if (!isEmergencyBind && freezeStatus.frozen && freezeStatus.withinFreezePeriod) {
         // 账户被冻结，检查 challenge purpose 是否为 register
         const registerChallenge = this._challenge.findChallenge(challenge1, finalUserId, 'register');
         if (registerChallenge.found) {
@@ -218,12 +241,18 @@ export class PasskeyRegisterHandler {
           throw new Error('Account is frozen: only purpose=register is allowed for re-registration');
         }
       } else {
-        // 账户未冻结，正常判断场景
+        // 账户未冻结（或场景D跳过冻结分支），正常判断场景
         const existingPasskeys = await this._passkey.listPasskeys(finalUserId);
         hasNoPasskeys = existingPasskeys.length === 0;
         if (hasNoPasskeys) {
           // 若 userId 已提供且无 Passkey，说明是已有账户补绑 Passkey
           isExistingAccount = true;
+        } else if (isEmergencyBind) {
+          // 场景D：账户已有 Passkey 也按 register 挑战路径走（新增绑定，
+          // 不要求现有 Passkey 签名——授权来自治理 Passkey + 合约记录）
+          hasNoPasskeys = true;
+          isExistingAccount = true;
+          console.log(`[PasskeyRegister] handleComplete: emergency bind scenario, proceeding via register challenge path`);
         } else if (!request.existingWebauthnSignature) {
           // 用户有 Passkey 但未提供现有 Passkey 签名 → 标记为潜在恢复场景（Scenario C）
           // 后续在验证 attestation 并获取新公钥哈希后，查询合约恢复条目
@@ -346,6 +375,26 @@ export class PasskeyRegisterHandler {
         }
       }
     }
+    // 6.6. 场景D：应急绑定校验（新公钥哈希算出后才能比对 policy 钉住的哈希）
+    //      合约恢复条目命中时恢复优先（既有规则），不再叠加应急校验。
+    let emergencyCtx = null;
+    if (isEmergencyBind && !isRecovery) {
+      const newPubKeyHash = PasskeyManager.computePubKeyHash(publicKeyCose);
+      const emgResult = await this._emergency.verify({
+        authorizationJson: request.emergencyAuthorizationJson,
+        signature: request.emergencySignature,
+        platformAddress: whitelistResult.address,
+        operation: 'passkey_bind',
+        userId: finalUserId,
+        actualParams: { newPubKeyHash },
+      });
+      if (!emgResult.approved) {
+        throw new Error(`Emergency authorization verification failed: ${emgResult.reason}`);
+      }
+      emergencyCtx = emgResult;
+      console.log(`[PasskeyRegister] handleComplete: emergency bind approved, authorizationId=${emgResult.auth.authorizationId}, newPubKeyHash=${newPubKeyHash}`);
+    }
+
     if (!isRecovery && isPotentialRecovery) {
       // 合约无恢复条目 → 无法恢复，也无法走场景B（缺少 existingWebauthnSignature）
       throw new Error('Passkey recovery not authorized: no recovery entry found in contract for this userId and new passkey public key');
@@ -427,13 +476,20 @@ export class PasskeyRegisterHandler {
       // 9b. 冻结替换：重置冻结（新 credentialId + 重新计算 72h）
       freezeResult = await this._accountFreeze.resetFreeze(finalUserId, credentialId);
       console.log(`[PasskeyRegister] handleComplete: frozen account passkey REPLACED, userId=${finalUserId}, new freezeUntil=${freezeResult.freezeUntil}`);
-    } else if (isExistingAccount && hasNoPasskeys) {
+    } else if (isExistingAccount && hasNoPasskeys && !isEmergencyBind) {
       // 9c. 场景A补绑：若该 userId 下有钱包（助记词或纯私钥），则冻结账户 72 小时
+      //     场景D（应急绑定）不触发：治理授权的绑定是运营处置动作，
+      //     冻结会连带冻结被处置账户，且应急操作本身不受冻结约束
       const wallets = await this._wallet.listWallets(finalUserId);
       if (wallets.length > 0) {
         freezeResult = await this._accountFreeze.freezeAccount(finalUserId, credentialId);
         console.log(`[PasskeyRegister] handleComplete: account FROZEN, userId=${finalUserId}, freezeUntil=${freezeResult.freezeUntil}`);
       }
+    }
+
+    // 场景D：绑定成功后记录一次应急授权使用
+    if (emergencyCtx) {
+      await this._emergency.recordUse(emergencyCtx.auth, finalUserId, 'passkey_bind');
     }
 
     console.log(`[PasskeyRegister] handleComplete: success, userId=${result.userId}, isFirstPasskey=${hasNoPasskeys}, frozen=${!!freezeResult}, frozenReplacement=${isFrozenReplacement}, recovery=${isRecovery}`);
@@ -448,6 +504,11 @@ export class PasskeyRegisterHandler {
     if (isRecovery) {
       response.recovery = true;
       response.recoveryUuid = recoveryEntry.uuid;
+    }
+
+    if (emergencyCtx) {
+      response.emergency = true;
+      response.emergencyAuthorizationId = emergencyCtx.auth.authorizationId;
     }
 
     if (stateNormalized) {

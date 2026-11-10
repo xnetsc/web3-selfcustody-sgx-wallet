@@ -34,6 +34,9 @@ export class KeyImportHandler {
     this._keyImporter = deps.keyImporter;
     this._passkey = deps.passkeyManager || null;
     this._challenge = deps.challengeManager || null;
+    // 应急授权校验器（可选注入）：init/complete 两步都实时重验，
+    // init 与 complete 之间授权被撤销时 complete 被阻断
+    this._emergency = deps.emergencyAuthorizer || null;
   }
 
   /**
@@ -75,16 +78,23 @@ export class KeyImportHandler {
       throw new Error('importType is required');
     }
 
-    // 3. 强制验证用户 WebAuthn 签名，平台不得绕过
-    if (!request.webauthnSignature) {
-      throw new Error('webauthnSignature is required: key import must be authorized by the user');
+    // 3. 授权验证：应急授权（治理）或强制用户 WebAuthn 签名，平台不得绕过
+    if (request.emergencyAuthorizationJson) {
+      await this._verifyEmergency(request, whitelistResult.address, 'handleInit', {
+        importType: request.importType,
+      });
+      console.log(`[KeyImport] handleInit: emergency authorization verification passed`);
+    } else {
+      if (!request.webauthnSignature) {
+        throw new Error('webauthnSignature is required: key import must be authorized by the user');
+      }
+      await this._verifyUserWebAuthn(request, 'handleInit', 'key_import_init', {
+        purpose: 'key_import_init',
+        userId: request.userId,
+        importType: request.importType,
+      });
+      console.log(`[KeyImport] handleInit: WebAuthn verification passed`);
     }
-    await this._verifyUserWebAuthn(request, 'handleInit', 'key_import_init', {
-      purpose: 'key_import_init',
-      userId: request.userId,
-      importType: request.importType,
-    });
-    console.log(`[KeyImport] handleInit: WebAuthn verification passed`);
 
     // 4. 创建导入会话（根据是否传入 rsaPublicKey 决定密钥交换方式）
     const session = await this._keyImporter.initImport(
@@ -153,28 +163,59 @@ export class KeyImportHandler {
       throw new Error('encryptedData is required');
     }
 
-    // 3. 强制验证用户 WebAuthn 签名，平台不得绕过
+    // 3. 授权验证：应急授权（治理，complete 时重新全量验证）或强制用户 WebAuthn 签名
     //    userIntentJson 绑定关键参数，防止平台篡改
-    if (!request.webauthnSignature) {
-      throw new Error('webauthnSignature is required: key import must be authorized by the user');
+    let emergencyCtx = null;
+    let emergencyAllowedUserIds = null;
+    let emergencyTargetUserId = null;
+    if (request.emergencyAuthorizationJson) {
+      // 目标用户以导入会话为准（会话在 init 时按应急授权校验后创建）
+      const session = await this._keyImporter._sessionManager.findSession(request.sessionId);
+      if (!session) {
+        throw new Error('Session not found or expired');
+      }
+      emergencyTargetUserId = session.userId;
+      const actualChains = (request.chains || []).map((c) => (c && typeof c === 'object' ? c.chainId : c));
+      emergencyCtx = await this._verifyEmergency(request, whitelistResult.address, 'handleComplete', {
+        importType: session.importType,
+        ...(request.chains ? { chains: actualChains } : {}),
+      }, emergencyTargetUserId);
+      emergencyAllowedUserIds = emergencyCtx.authorizedUserIds;
+      console.log(`[KeyImport] handleComplete: emergency authorization verification passed`);
+    } else {
+      if (!request.webauthnSignature) {
+        throw new Error('webauthnSignature is required: key import must be authorized by the user');
+      }
+      await this._verifyUserWebAuthn(request, 'handleComplete', 'key_import_complete', {
+        purpose: 'key_import_complete',
+        userId: request.userId,
+        sessionId: request.sessionId,
+        walletId: request.walletId || null,
+        chains: request.chains || null,
+      });
+      console.log(`[KeyImport] handleComplete: WebAuthn verification passed`);
     }
-    await this._verifyUserWebAuthn(request, 'handleComplete', 'key_import_complete', {
-      purpose: 'key_import_complete',
-      userId: request.userId,
-      sessionId: request.sessionId,
-      walletId: request.walletId || null,
-      chains: request.chains || null,
-    });
-    console.log(`[KeyImport] handleComplete: WebAuthn verification passed`);
 
-    // 4. 完成导入（根据会话 keyType 自动选择解密方式）
+    // 4. 完成导入（根据会话 keyType 自动选择解密方式；
+    //    应急批量导入时 allowedUserIds 约束每个条目的目标用户，越界整笔回滚）
     const result = await this._keyImporter.completeImport(
       request.sessionId,
       request.peerPublicKey || null,
       request.encryptedData,
       request.walletId,
-      request.chains
+      request.chains,
+      emergencyAllowedUserIds
     );
+
+    // 应急路径：为实际导入到的每个用户各记一次使用
+    if (emergencyCtx) {
+      const importedUserIds = result.sharedWalletIds
+        ? Object.keys(result.sharedWalletIds)
+        : [emergencyTargetUserId];
+      for (const uid of importedUserIds) {
+        await this._emergency.recordUse(emergencyCtx.auth, uid, 'key_import');
+      }
+    }
 
     // 5. 返回结果（区分单个/批量）
     if (result.results) {
@@ -184,6 +225,7 @@ export class KeyImportHandler {
         success: true,
         results: result.results,
         sharedWalletIds: result.sharedWalletIds,
+        ...(emergencyCtx ? { emergencyAuthorizationId: emergencyCtx.auth.authorizationId } : {}),
       };
     } else {
       // 单个导入
@@ -192,8 +234,38 @@ export class KeyImportHandler {
         success: true,
         walletId: result.walletId,
         addresses: result.addresses || [],
+        ...(emergencyCtx ? { emergencyAuthorizationId: emergencyCtx.auth.authorizationId } : {}),
       };
     }
+  }
+
+  /**
+   * 应急授权校验（payload 携带 emergencyAuthorizationJson 时替代用户意图签名）
+   * @param {Object} request - 解析后的 payload
+   * @param {string} platformAddress - 平台信封地址
+   * @param {string} callerName
+   * @param {Object} actualParams - 本次实际参数（与 policy 声明比对）
+   * @param {string} [targetUserId] - 目标用户，缺省取 request.userId
+   * @returns {Promise<Object>} EmergencyAuthorizer.verify 的批准结果
+   * @private
+   */
+  async _verifyEmergency(request, platformAddress, callerName, actualParams, targetUserId) {
+    if (!this._emergency) {
+      throw new Error('Emergency authorization is not enabled on this enclave');
+    }
+    const result = await this._emergency.verify({
+      authorizationJson: request.emergencyAuthorizationJson,
+      signature: request.emergencySignature,
+      platformAddress,
+      operation: 'key_import',
+      userId: targetUserId || request.userId,
+      actualParams,
+    });
+    if (!result.approved) {
+      throw new Error(`Emergency authorization verification failed: ${result.reason}`);
+    }
+    console.log(`[KeyImport] ${callerName}: emergency authorization approved, authorizationId=${result.auth.authorizationId}`);
+    return result;
   }
 
   /**

@@ -284,7 +284,7 @@ const TABLE_VALIDATORS = {
         if (!rowData.user_id || !rowData.authorization_id) {
             throw new Error('authorization_revocations: user_id and authorization_id are required');
         }
-        if (!['platform', 'contract'].includes(rowData.source)) {
+        if (!['platform', 'contract', 'emergency'].includes(rowData.source)) {
             throw new Error('authorization_revocations: invalid source: ' + rowData.source);
         }
     },
@@ -359,6 +359,10 @@ export const BUSINESS_TABLES = {
     account_freezes: {
         keyColumns: ['user_id'],
         dataColumns: ['user_id', 'credential_id', 'frozen_at', 'freeze_until', 'status', 'lifted_at', '_hlc'],
+    },
+    emergency_authorization_uses: {
+        keyColumns: ['authorization_id', 'user_id', 'operation'],
+        dataColumns: ['authorization_id', 'user_id', 'operation', 'used_count', 'updated_at', '_hlc'],
     },
     webauthn_challenges: {
         // id 是节点本地自增主键，不参与同步；以全局唯一的 challenge 字符串为同步键

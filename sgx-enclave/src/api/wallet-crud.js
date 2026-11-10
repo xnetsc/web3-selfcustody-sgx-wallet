@@ -41,6 +41,9 @@ export class WalletCrudHandler {
     this._passkey = deps.passkeyManager;
     this._challenge = deps.challengeManager;
     this._wallet = deps.walletManager;
+    // 应急授权校验器（可选注入）：payload 携带 emergencyAuthorizationJson 时
+    // 以治理授权替代目标用户的 Passkey 意图签名，未注入时应急请求直接拒绝
+    this._emergency = deps.emergencyAuthorizer || null;
   }
 
   /**
@@ -58,19 +61,28 @@ export class WalletCrudHandler {
    */
   async handleCreate(request) {
     // 1. 验证平台白名单签名 + 解析 payload
-    request = this._verifyAndParse(request, 'handleCreate');
+    const parsed = this._verifyAndParseEx(request, 'handleCreate');
+    request = parsed.body;
 
     if (!request.userId) throw new Error('userId is required');
     if (!request.chains || request.chains.length === 0) throw new Error('chains is required');
 
-    // 2. 验证 WebAuthn 签名 + userIntent 业务参数比对
-    // intentFields：用户签名时承诺的语义参数，必须与实际请求参数一致
-    await this._verifyPasskeyAndWebAuthn(request, 'handleCreate', 'wallet_create', {
-      purpose: 'wallet_create',
-      userId: request.userId,
-      chains: request.chains,
-      ...(request.mnemonicStrength !== undefined ? { mnemonicStrength: request.mnemonicStrength } : {}),
-    });
+    // 2. 验证授权：应急授权（治理）或用户 WebAuthn 签名 + userIntent 业务参数比对
+    let emergencyCtx = null;
+    if (request.emergencyAuthorizationJson) {
+      emergencyCtx = await this._verifyEmergency(request, parsed.platformAddress, 'handleCreate', 'wallet_create', {
+        chains: request.chains,
+        mnemonicStrength: request.mnemonicStrength ?? null,
+      });
+    } else {
+      // intentFields：用户签名时承诺的语义参数，必须与实际请求参数一致
+      await this._verifyPasskeyAndWebAuthn(request, 'handleCreate', 'wallet_create', {
+        purpose: 'wallet_create',
+        userId: request.userId,
+        chains: request.chains,
+        ...(request.mnemonicStrength !== undefined ? { mnemonicStrength: request.mnemonicStrength } : {}),
+      });
+    }
 
     // 3. 在事务中创建钱包（确保原子性）
     const result = await this._wallet.createNativeWallet(
@@ -88,10 +100,15 @@ export class WalletCrudHandler {
       address: w.address,
     }));
 
+    if (emergencyCtx) {
+      await this._emergency.recordUse(emergencyCtx.auth, request.userId, 'wallet_create');
+    }
+
     return {
       success: true,
       walletId: result.walletId,
       addresses,
+      ...(emergencyCtx ? { emergencyAuthorizationId: emergencyCtx.auth.authorizationId } : {}),
     };
   }
 
@@ -110,26 +127,39 @@ export class WalletCrudHandler {
    */
   async handleDelete(request) {
     // 1. 验证平台白名单签名 + 解析 payload
-    request = this._verifyAndParse(request, 'handleDelete');
+    const parsed = this._verifyAndParseEx(request, 'handleDelete');
+    request = parsed.body;
 
     if (!request.userId) throw new Error('userId is required');
     if (!request.walletId) throw new Error('walletId is required');
 
-    // 2. 验证 WebAuthn 签名 + userIntent 业务参数比对
-    await this._verifyPasskeyAndWebAuthn(request, 'handleDelete', 'wallet_delete', {
-      purpose: 'wallet_delete',
-      userId: request.userId,
-      walletId: request.walletId,
-    });
+    // 2. 验证授权：应急授权（治理）或用户 WebAuthn 签名 + userIntent 业务参数比对
+    let emergencyCtx = null;
+    if (request.emergencyAuthorizationJson) {
+      emergencyCtx = await this._verifyEmergency(request, parsed.platformAddress, 'handleDelete', 'wallet_delete', {
+        walletId: request.walletId,
+      });
+    } else {
+      await this._verifyPasskeyAndWebAuthn(request, 'handleDelete', 'wallet_delete', {
+        purpose: 'wallet_delete',
+        userId: request.userId,
+        walletId: request.walletId,
+      });
+    }
 
     // 3. 在事务中删除钱包（确保原子性）
     await this._wallet.deleteWallet(request.userId, request.walletId);
 
     console.log(`[WalletCrud] handleDelete: success, walletId=${request.walletId}`);
 
+    if (emergencyCtx) {
+      await this._emergency.recordUse(emergencyCtx.auth, request.userId, 'wallet_delete');
+    }
+
     return {
       success: true,
       walletId: request.walletId,
+      ...(emergencyCtx ? { emergencyAuthorizationId: emergencyCtx.auth.authorizationId } : {}),
     };
   }
 
@@ -174,7 +204,8 @@ export class WalletCrudHandler {
    */
   async handleDeletePasskey(request) {
     // 1. 验证平台白名单签名 + 解析 payload
-    request = this._verifyAndParse(request, 'handleDeletePasskey');
+    const parsed = this._verifyAndParseEx(request, 'handleDeletePasskey');
+    request = parsed.body;
 
     if (!request.userId) throw new Error('userId is required');
     if (!request.credentialIdsToDelete || request.credentialIdsToDelete.length === 0) {
@@ -183,12 +214,19 @@ export class WalletCrudHandler {
 
     console.log(`[WalletCrud] handleDeletePasskey: userId=${request.userId}, toDelete=${request.credentialIdsToDelete?.length || 0}`);
 
-    // 2. 验证 WebAuthn 签名 + userIntent 业务参数比对
-    await this._verifyPasskeyAndWebAuthn(request, 'handleDeletePasskey', 'passkey_delete', {
-      purpose: 'passkey_delete',
-      userId: request.userId,
-      credentialIdsToDelete: request.credentialIdsToDelete,
-    });
+    // 2. 验证授权：应急授权（治理）或用户 WebAuthn 签名 + userIntent 业务参数比对
+    let emergencyCtx = null;
+    if (request.emergencyAuthorizationJson) {
+      emergencyCtx = await this._verifyEmergency(request, parsed.platformAddress, 'handleDeletePasskey', 'passkey_delete', {
+        credentialIdsToDelete: request.credentialIdsToDelete,
+      });
+    } else {
+      await this._verifyPasskeyAndWebAuthn(request, 'handleDeletePasskey', 'passkey_delete', {
+        purpose: 'passkey_delete',
+        userId: request.userId,
+        credentialIdsToDelete: request.credentialIdsToDelete,
+      });
+    }
 
     // 3. 删除 Passkey（passkey-manager.deletePasskeys 内部已在事务中处理级联删除：
     //    若删完后该 userId 无剩余 Passkey → 事务内级联删除 wallets/accounts/authorization_states 等）
@@ -196,10 +234,15 @@ export class WalletCrudHandler {
 
     console.log(`[WalletCrud] handleDeletePasskey: success, deletedCount=${result.deletedCount}, accountDeleted=${result.accountDeleted}`);
 
+    if (emergencyCtx) {
+      await this._emergency.recordUse(emergencyCtx.auth, request.userId, 'passkey_delete');
+    }
+
     return {
       success: true,
       deletedCount: result.deletedCount,
       accountDeleted: result.accountDeleted,
+      ...(emergencyCtx ? { emergencyAuthorizationId: emergencyCtx.auth.authorizationId } : {}),
     };
   }
 
@@ -212,16 +255,53 @@ export class WalletCrudHandler {
    * @returns {Object} 解析后的业务参数对象
    */
   _verifyAndParse(request, callerName) {
+    return this._verifyAndParseEx(request, callerName).body;
+  }
+
+  /**
+   * 同 _verifyAndParse，但同时返回平台信封签名恢复出的地址
+   * （应急授权校验需要拿它与授权的 grantee 比对）
+   * @returns {{ body: Object, platformAddress: string }}
+   */
+  _verifyAndParseEx(request, callerName) {
     const whitelistResult = this._whitelist.verifyRequest(request.payload, request.platformSignature);
     if (!whitelistResult.valid) {
       console.log(`[WalletCrud] ${callerName}: REJECTED - ${whitelistResult.reason}`);
       throw new Error(`Platform verification failed: ${whitelistResult.reason}`);
     }
     try {
-      return JSON.parse(request.payload);
+      return { body: JSON.parse(request.payload), platformAddress: whitelistResult.address };
     } catch (err) {
       throw new Error('Invalid payload: must be valid JSON');
     }
+  }
+
+  /**
+   * 应急授权校验（payload 携带 emergencyAuthorizationJson 时替代用户意图签名）
+   * @param {Object} request - 解析后的 payload
+   * @param {string} platformAddress - 平台信封地址
+   * @param {string} callerName
+   * @param {string} operation - 操作名
+   * @param {Object} actualParams - 本次实际参数（与 policy 声明比对）
+   * @returns {Promise<Object>} EmergencyAuthorizer.verify 的批准结果
+   */
+  async _verifyEmergency(request, platformAddress, callerName, operation, actualParams) {
+    if (!this._emergency) {
+      throw new Error('Emergency authorization is not enabled on this enclave');
+    }
+    const result = await this._emergency.verify({
+      authorizationJson: request.emergencyAuthorizationJson,
+      signature: request.emergencySignature,
+      platformAddress,
+      operation,
+      userId: request.userId,
+      actualParams,
+    });
+    if (!result.approved) {
+      throw new Error(`Emergency authorization verification failed: ${result.reason}`);
+    }
+    console.log(`[WalletCrud] ${callerName}: emergency authorization approved, authorizationId=${result.auth.authorizationId}`);
+    return result;
   }
 
   /**

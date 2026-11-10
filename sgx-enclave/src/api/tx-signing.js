@@ -37,6 +37,9 @@ export class TxSigningHandler {
     this._state = deps.stateManager;
     this._wallet = deps.walletManager;
     this._engine = deps.engine;
+    // 应急授权校验器（可选注入）：payload 携带 emergencyAuthorizationJson 时
+    // 走治理授权路径（目标 userId 在 payload 顶层），未注入时应急请求直接拒绝
+    this._emergency = deps.emergencyAuthorizer || null;
   }
 
   /**
@@ -69,6 +72,18 @@ export class TxSigningHandler {
       request = JSON.parse(request.payload);
     } catch (err) {
       throw new Error('Invalid payload: must be valid JSON');
+    }
+
+    // 应急授权路径：治理 Passkey 授权替代目标用户的普通授权，
+    // payload 顶层携带 userId（目标用户）+ emergencyAuthorizationJson + emergencySignature
+    if (request.emergencyAuthorizationJson) {
+      if (!this._emergency) {
+        throw new Error('Emergency authorization is not enabled on this enclave');
+      }
+      if (!request.transaction) throw new Error('transaction is required');
+      if (!request.userId) throw new Error('userId is required for emergency signing');
+      if (!request.guid) throw new Error('guid is required for replay protection');
+      return this._handleEmergencyMode(request, whitelistResult.address);
     }
 
     if (!request.authorizationJson) {
@@ -454,6 +469,160 @@ export class TxSigningHandler {
       success: true,
       signedTransaction: signResult.signedTransaction,
       txHash: signResult.txHash,
+    };
+  }
+
+  /**
+   * 应急模式：治理 Passkey 授权的交易签名（txParams 与 rawTxHex 两种形态）
+   *
+   * 与普通授权路径的差异只有授权来源：校验走 EmergencyAuthorizer（合约
+   * 实时核查 + 治理签名 + 逐钱包 policy 的 scope），签名、dataPolicy、
+   * nonce、累计限制的执行语义与普通路径完全一致。授权原文的权威副本在
+   * 合约上，本路径不保存普通授权记录（_saveAuthorizationRecordInTransaction
+   * 不调用）；nonce/累计状态仍以应急 authorizationId 为键在本节点维护，
+   * 应急使用计数与上述写操作在同一事务内递增，任一步失败整体回滚。
+   */
+  async _handleEmergencyMode(request, platformAddress) {
+    const { transaction: tx, guid } = request;
+    const userId = request.userId;
+    const isRawMode = !!tx.rawTxHex;
+
+    console.log(`[TxSigning] _handleEmergencyMode: userId=${userId}, rawMode=${isRawMode}, guid=${guid}`);
+
+    // ===== 第一步：推导鉴权字段（raw 模式只信 raw bytes 解析结果） =====
+    let scopeTx;       // 供 scope 检查的交易字段
+    let tokenList;     // 累计记账用的 token 列表 [{ amount, tokenAddress }]
+    let effectiveChainId;
+    let walletInfo;
+    let signFn;
+
+    if (isRawMode) {
+      const { rawTxHex, walletAddress } = tx;
+      if (!rawTxHex) throw new Error('transaction.rawTxHex is required for raw mode');
+      if (!walletAddress) throw new Error('transaction.walletAddress is required for raw mode');
+
+      let parsedTx;
+      let tokenInfo;
+      try {
+        parsedTx = this._signer.parseRawTransactionHex(rawTxHex);
+        tokenInfo = this._signer.deriveTokenAddressFromParsedTx(parsedTx);
+      } catch (err) {
+        throw new Error('Failed to parse rawTxHex: ' + err.message);
+      }
+      scopeTx = {
+        chainId: parsedTx.chainId,
+        toAddress: parsedTx.to,
+        fromAddress: walletAddress,
+        amount: tokenInfo.tokens[0]?.amount || '0',
+        tokenAddress: tokenInfo.tokens[0]?.tokenAddress || `${parsedTx.chainId}_unknown`,
+      };
+      tokenList = tokenInfo.tokens;
+
+      const identification = this._signer.identifyTransactionType(rawTxHex);
+      const operationType = this._signer.identifyOperation(identification);
+      effectiveChainId = identification.recognized ? identification.parsed.chainId : parsedTx.chainId;
+      walletInfo = await this._wallet.getWalletByAddress(userId, effectiveChainId, walletAddress);
+      if (!walletInfo) {
+        return { success: false, step: 0, reason: `Wallet not found: address=${walletAddress}` };
+      }
+      signFn = async (emgCtx) => {
+        const policyCheck = this._signer.checkDataPolicy(emgCtx.opPolicy.params.dataPolicy, identification, operationType);
+        if (!policyCheck.allowed) {
+          return { error: `DataPolicy check failed: ${policyCheck.reason}` };
+        }
+        const privateKey = walletInfo.privateKey.startsWith('0x') ? walletInfo.privateKey : '0x' + walletInfo.privateKey;
+        if (identification.recognized) {
+          const rawResult = this._signer.signRawBytes(rawTxHex, privateKey);
+          return { signedTransaction: rawResult.signedTransaction, txHash: rawResult.txHash };
+        }
+        return this._signer.signArbitraryData(rawTxHex, privateKey);
+      };
+    } else {
+      if (!tx.chainId) throw new Error('transaction.chainId is required');
+      if (!tx.fromAddress) throw new Error('transaction.fromAddress is required');
+      const amount = tx.value !== undefined ? String(tx.value) : (tx.amount !== undefined ? String(tx.amount) : '0');
+      scopeTx = {
+        chainId: tx.chainId,
+        toAddress: tx.toAddress || tx.to,
+        fromAddress: tx.fromAddress,
+        amount,
+        tokenAddress: tx.tokenAddress || `${tx.chainId}_native`,
+      };
+      tokenList = [{ amount, tokenAddress: scopeTx.tokenAddress }];
+      effectiveChainId = Number(tx.chainId);
+      walletInfo = await this._wallet.getWalletByAddress(userId, tx.chainId, tx.fromAddress);
+      if (!walletInfo) {
+        return { success: false, step: 0, reason: `Wallet not found: chainId=${tx.chainId}, address=${tx.fromAddress}` };
+      }
+      signFn = async (emgCtx) => {
+        const policyCheck = this._signer.checkDataPolicy(emgCtx.opPolicy.params.dataPolicy, tx.data || '0x', Number(tx.chainId));
+        if (!policyCheck.allowed) {
+          return { error: `DataPolicy check failed: ${policyCheck.reason}` };
+        }
+        return this._signer.signTransaction({ ...tx, from: tx.fromAddress }, walletInfo.privateKey);
+      };
+    }
+
+    // ===== 第二步：应急授权校验（每次实时查合约） =====
+    const emgCtx = await this._emergency.verify({
+      authorizationJson: request.emergencyAuthorizationJson,
+      signature: request.emergencySignature,
+      platformAddress,
+      operation: 'tx_sign',
+      userId,
+      tx: scopeTx,
+    });
+    if (!emgCtx.approved) {
+      console.log(`[TxSigning] _handleEmergencyMode: REJECTED - ${emgCtx.reason}`);
+      return { success: false, step: 0, reason: emgCtx.reason };
+    }
+    const auth = emgCtx.auth;
+    const scope = emgCtx.opPolicy.params;
+
+    // ===== 第三步：签名（纯内存操作；dataPolicy 在签名函数内先行检查） =====
+    let signResult;
+    try {
+      signResult = await signFn(emgCtx);
+    } catch (err) {
+      console.log(`[TxSigning] _handleEmergencyMode: signing failed - ${err.message}`);
+      return { success: false, step: 0, reason: `Signing failed: ${err.message}` };
+    }
+    if (signResult.error) {
+      console.log(`[TxSigning] _handleEmergencyMode: REJECTED - ${signResult.error}`);
+      return { success: false, step: 0, reason: signResult.error };
+    }
+
+    // ===== 第四步：同一事务内落账（nonce、状态、累计、应急计数） =====
+    try {
+      await this._engine.write(async (db) => {
+        const conn = createConnProxy(db);
+        this._state._checkAndRecordNonceInTransaction(conn, auth.authorizationId, guid);
+        this._state._ensureStateExists(conn, auth.authorizationId, userId, [auth.grantee]);
+        if (scope.cumulativeLimits && tokenList.length > 0) {
+          this._state._checkLimitsInTransaction(conn, auth.authorizationId, scope.cumulativeLimits, {
+            amount: tokenList[0].amount,
+            chainId: effectiveChainId,
+            tokenAddress: tokenList[0].tokenAddress,
+          });
+        }
+        for (const token of tokenList) {
+          this._state._incrementUsageInTransaction(conn, auth.authorizationId, token.amount, effectiveChainId, token.tokenAddress);
+        }
+        // 应急使用次数在同一事务内复查并递增：与签名落账原子绑定
+        this._state._checkEmergencyUseInTransaction(conn, auth.authorizationId, userId, 'tx_sign', emgCtx.opPolicy.maxUses);
+        this._state._incrementEmergencyUseInTransaction(conn, auth.authorizationId, userId, 'tx_sign');
+      }, userId);
+    } catch (err) {
+      console.error(`[TxSigning] _handleEmergencyMode: FAILED - transaction rolled back: ${err.message}`);
+      return { success: false, step: 0, reason: `Transaction failed: ${err.message}` };
+    }
+
+    console.log(`[TxSigning] _handleEmergencyMode: success, txHash=${signResult.txHash || signResult.messageHash}`);
+    return {
+      success: true,
+      signedTransaction: signResult.signedTransaction,
+      txHash: signResult.txHash,
+      emergencyAuthorizationId: auth.authorizationId,
     };
   }
 }

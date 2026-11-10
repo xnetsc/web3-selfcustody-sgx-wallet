@@ -98,6 +98,9 @@ export class AuthRevocationHandler {
     this._whitelist = deps.whitelistVerifier;
     this._passkey = deps.passkeyManager;
     this._state = deps.stateManager;
+    // 应急授权校验器（可选注入）：治理授权可代替目标用户撤销其普通授权，
+    // 落库来源记为 source=emergency（与 platform 同为本地权威来源）
+    this._emergency = deps.emergencyAuthorizer || null;
   }
 
   /**
@@ -126,6 +129,12 @@ export class AuthRevocationHandler {
       payload = JSON.parse(request.payload);
     } catch (err) {
       throw new Error('Invalid payload: must be valid JSON');
+    }
+
+    // 应急撤销路径：payload 携带 emergencyAuthorizationJson 时，治理授权
+    // 替代目标用户的撤销签名（用户已无法操作的前提下，撤销签名无从取得）
+    if (payload.emergencyAuthorizationJson) {
+      return this._handleEmergencyRevoke(payload, whitelistResult.address);
     }
 
     const { userId, authorizationId, credentialId } = payload;
@@ -190,6 +199,84 @@ export class AuthRevocationHandler {
       authorizationId,
       grantee,
       source: 'platform',
+      revocationRecord: stored,
+      authorizationRecord: {
+        userId,
+        authorizationId,
+        grantee: authorizationRecord.grantee,
+        authorizationJson: authorizationRecord.authorizationJson,
+        authorizationHash: authorizationRecord.authorizationHash,
+        createdAt: authorizationRecord.createdAt,
+      },
+    };
+  }
+
+  /**
+   * 应急撤销：凭合约治理授权撤销目标用户的某份普通授权
+   *
+   * payload JSON: {
+   *   userId, authorizationId, grantee,           // 被撤销的普通授权的标识
+   *   emergencyAuthorizationJson, emergencySignature,
+   *   authorizationJson?, authorizationSignature? // SGX 无目标授权原文记录时必填，
+   *                                               // 语义与平台转发路径完全相同
+   * }
+   * 撤销的到期时间/哈希可信来源规则与用户签名路径一致（复用
+   * _resolveAuthorizationRecord），落库来源记为 source=emergency。
+   *
+   * @private
+   */
+  async _handleEmergencyRevoke(payload, platformAddress) {
+    if (!this._emergency) {
+      throw new Error('Emergency authorization is not enabled on this enclave');
+    }
+    const { userId, authorizationId } = payload;
+    if (!userId) throw new Error('userId is required');
+    if (!authorizationId) throw new Error('authorizationId is required');
+    if (!payload.grantee || !/^0x[0-9a-fA-F]{40}$/.test(payload.grantee)) {
+      throw new Error('grantee is required and must be an Ethereum address');
+    }
+    const grantee = payload.grantee;
+
+    console.log(`[AuthRevocation] handleRevoke (emergency): userId=${userId}, authorizationId=${authorizationId}, grantee=${grantee}, forwardedBy=${platformAddress}`);
+
+    const emgResult = await this._emergency.verify({
+      authorizationJson: payload.emergencyAuthorizationJson,
+      signature: payload.emergencySignature,
+      platformAddress,
+      operation: 'auth_revoke',
+      userId,
+      actualParams: { authorizationId, grantee },
+    });
+    if (!emgResult.approved) {
+      throw new Error(`Emergency authorization verification failed: ${emgResult.reason}`);
+    }
+
+    // 到期时间与哈希的可信来源与用户路径同一规则
+    const authorizationRecord = await this._resolveAuthorizationRecord(payload, { userId, authorizationId, grantee });
+
+    const toSave = authorizationRecord.authorizationToSave;
+    const stored = await this._state.recordRevocation({
+      userId,
+      authorizationId,
+      grantee,
+      source: 'emergency',
+      authorizationExpiresAt: authorizationRecord.authorizationJson?.timePolicy?.deadline || null,
+      authorizationHash: authorizationRecord.authorizationHash,
+    }, toSave
+      ? (conn) => this._state._saveAuthorizationRecordInTransaction(conn, userId, authorizationId, toSave.grantee, toSave.authorizationJson, authorizationRecord.authorizationHash)
+      : null);
+
+    await this._emergency.recordUse(emgResult.auth, userId, 'auth_revoke');
+
+    console.log(`[AuthRevocation] handleRevoke (emergency): recorded emergency revocation for userId=${userId}, authorizationId=${authorizationId}, emergencyAuthorizationId=${emgResult.auth.authorizationId}`);
+
+    return {
+      revoked: true,
+      userId,
+      authorizationId,
+      grantee,
+      source: 'emergency',
+      emergencyAuthorizationId: emgResult.auth.authorizationId,
       revocationRecord: stored,
       authorizationRecord: {
         userId,
