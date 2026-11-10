@@ -255,6 +255,12 @@ export class SyncManager {
         await this._startServer();
 
         for (const url of this.peerUrls) {
+            if (!url.startsWith('wss://')) {
+                // 配置里的对端地址使用明文 ws://：同步只接受 WSS，直接退出。
+                console.error('[SyncManager] FATAL: configured peer URL uses plaintext ws:// — sync requires wss:// (RA-TLS): ' + url);
+                console.error('[SyncManager] Fix SYNC_NODES / peer configuration to wss:// URLs. Exiting.');
+                process.exit(1);
+            }
             if (this._isSelfUrl(url)) {
                 console.log('[SyncManager] Skipping self-connection: ' + url);
                 continue;
@@ -526,15 +532,13 @@ export class SyncManager {
                     if (!this._started) reject(err);
                 });
             } else {
-                console.warn('[SyncManager] No RA-TLS certificates — starting plain WS server (insecure)');
-                this.wss = new WebSocketServer({ port: this.listenPort }, () => {
-                    console.log('[SyncManager] WS server listening on port ' + this.listenPort);
-                    resolve();
-                });
-                this.wss.on('error', (err) => {
-                    console.error('[SyncManager] WS server error:', err.message);
-                    if (!this._started) reject(err);
-                });
+                // 明文 WS 已禁止：同步链路承载钱包业务数据，无 RA-TLS 证书时
+                // 拒绝以明文提供同步服务，直接退出并说明原因与补法。
+                console.error('[SyncManager] FATAL: no RA-TLS certificate/key available — refusing to start a plaintext WS sync server.');
+                console.error('[SyncManager] Sync traffic carries wallet data and must run over RA-TLS (WSS) only; plaintext WS is not supported.');
+                console.error('[SyncManager] Cause: this process was not started via gramine-launcher (which generates the certificate), or RATLS_CERT_PATH does not point at the generated certificate, or SyncManager was constructed without raTlsOptions.');
+                console.error('[SyncManager] Fix: start the enclave via gramine-launcher.js, or construct SyncManager with raTlsOptions { certPath, keyPem }. Exiting.');
+                process.exit(1);
             }
 
             this.wss.on('connection', (ws, req) => {
@@ -618,6 +622,12 @@ export class SyncManager {
     // ========== 连接远程节点 ==========
 
     _connectToPeer(url) {
+        if (!url.startsWith('wss://')) {
+            // 发现/重连路径的明文地址一律不拨号（不因此退出：地址来自对端
+            // 通告，单个坏地址不能拖垮本节点）；配置路径已在 start() 拦截。
+            console.error('[SyncManager] Refusing plaintext peer URL (wss:// required): ' + url);
+            return;
+        }
         if (this._peerWsMap.has(url)) return;
         const pending = this.pendingConnections.get(url);
         if (pending && pending._connecting) return;

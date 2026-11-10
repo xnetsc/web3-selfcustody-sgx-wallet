@@ -442,7 +442,9 @@ export async function verifyCodeIntegrity(codeRepository, opts = {}) {
   console.log(`[CodeIntegrity] Local files to verify: ${localFiles.length}`);
 
   if (localFiles.length === 0) {
-    return { verified: true, fileCount: 0, details: 'No app code files found to verify' };
+    // 已配置代码仓库却没有任何本地文件可校验 = 无法验证，按失败关闭处理：
+    // 清单解析/过滤异常时绝不能放行（否则完整性验证可被空集悄悄绕过）。
+    return { verified: false, fileCount: 0, details: 'No local app code files found in enclave trusted_files — cannot verify against repository' };
   }
 
   // 4. 计算本地文件哈希

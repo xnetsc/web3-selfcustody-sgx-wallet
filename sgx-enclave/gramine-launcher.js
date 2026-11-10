@@ -41,18 +41,16 @@ import { generateRaTlsCertificate } from '@xnetx/sgx-ra-tls-verify';
 /**
  * Gramine-specific quote producer.
  * Writes user_report_data to Gramine pseudo-file, reads quote back.
- * Returns null on non-SGX environments (file will not exist).
+ * Throws when the attestation device is unavailable (non-SGX environment).
  */
 async function gramineProduceQuote(reportDataBytes) {
     const userReportData = Buffer.alloc(64);
     Buffer.from(reportDataBytes).copy(userReportData, 0);
-    try {
-        fs.writeFileSync('/dev/attestation/user_report_data', userReportData);
-        return fs.readFileSync('/dev/attestation/quote');
-    } catch (err) {
-        console.warn(`[SGX-Enclave Launcher] Gramine quote unavailable: ${err.message}`);
-        return null;
-    }
+    // 证明设备不可用时直接抛错（生产环境预期 SGX 必然存在，不做降级）：
+    // 由上层捕获后终止启动。模拟器镜像在构建期打桩替换本函数（见
+    // test-integration/sim-stub.cjs 与 Dockerfile 的 SGX_MODE 构建参数）。
+    fs.writeFileSync('/dev/attestation/user_report_data', userReportData);
+    return fs.readFileSync('/dev/attestation/quote');
 }
 
 const cert_path = "/app/sgx-enclave/ratls-cert.pem";
@@ -94,6 +92,9 @@ if (!fs.existsSync(ratlsCertPath)) {
     console.error(`[SGX-Enclave Launcher] RA-TLS cert not found after generation: ${ratlsCertPath}`);
     process.exit(1);
 }
+// 把实际证书路径写回环境变量：index.js 只认 RATLS_CERT_PATH，未透传时它会
+// 误判 RA-TLS 不可用并让同步退化。由生成方（本启动器）回填，保证两者一致。
+process.env.RATLS_CERT_PATH = ratlsCertPath;
 console.log(`[SGX-Enclave Launcher] RA-TLS cert: ${ratlsCertPath}`);
 console.log('[SGX-Enclave Launcher] RA-TLS key:  in-memory only');
 

@@ -18,6 +18,23 @@ import { ALL_TABLE_SQLS } from '../sgx-enclave/src/database/schema.js';
 const require_fn = createRequire(import.meta.url);
 const Database = require_fn('../sgx-enclave/node_modules/better-sqlite3');
 
+// 同步明文 WS 已禁止：测试节点统一用桩生成的普通自签证书走 WSS
+// （produceQuote 返回 null，与启动器在非 SGX 环境的生成方式一致）。
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { generateRaTlsCertificate } from '../sgx-enclave/node_modules/@xnetx/sgx-ra-tls-verify/index.mjs';
+
+const testCert = await generateRaTlsCertificate({
+    produceQuote: async () => null,
+    subjectCommonName: 'SGX RA-TLS',
+    validityDays: 365,
+});
+const testCertPath = path.join(os.tmpdir(), 'ratls-p2p-suite-cert.pem');
+fs.writeFileSync(testCertPath, testCert.certPem);
+const TEST_RATLS_OPTIONS = { certPath: testCertPath, keyPem: testCert.keyPem, allowNonRaTls: true };
+
+
 const identity = {
     rpcUrl: 'http://127.0.0.1:8545',
     rpcTlsCaCert: 'test-ca-cert',
@@ -54,6 +71,7 @@ function createNode(name, port, peerUrls, advertisedUrl) {
         advertisedUrl,
         contractClient: createMockContractClient(),
         getMinQuorum: () => 1,
+        raTlsOptions: TEST_RATLS_OPTIONS,
     });
     return { name, mgr, db };
 }
@@ -65,9 +83,9 @@ async function main() {
 
     // B 配置两个通告地址（JSON 数组字符串，与环境变量形态一致）；
     // A 只按其中可达的一个拨入
-    const configuredSet = ['ws://b.internal:3322', 'ws://127.0.0.1:3322'];
+    const configuredSet = ['wss://b.internal:3322', 'wss://127.0.0.1:3322'];
     const nodeB = createNode('nodeB', 3322, [], JSON.stringify(configuredSet));
-    const nodeA = createNode('nodeA', 3321, ['ws://127.0.0.1:3322'], 'ws://127.0.0.1:3321');
+    const nodeA = createNode('nodeA', 3321, ['wss://127.0.0.1:3322'], 'wss://127.0.0.1:3321');
 
     await nodeB.mgr.start();
     await nodeA.mgr.start();

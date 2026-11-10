@@ -126,6 +126,19 @@ COPY sgx-enclave/src/ ./src/
 COPY sgx-enclave/gramine-launcher.js ./
 COPY sgx-enclave/node.manifest.template ./
 
+# 构建模式参数 SGX_MODE（与镜像运行期的 SGX_MODE 同名同义：direct/sim 为
+# 模拟器，sgx 为真实 SGX，默认 sgx）：模拟器构建时在构建期给启动器打桩——
+# quote 生成改为返回 null，生成无 quote 的普通自签证书，使无 SGX 设备的
+# direct/sim 环境能启动。sgx 构建（生产）不打桩：镜像内启动器为生产原样，
+# SGX 证明不可用时直接失败退出，镜像不含任何桩。桩脚本经构建挂载临时
+# 提供，不落入镜像层；脚本本体在 test-integration/sim-stub.cjs（测试工具）。
+ARG SGX_MODE=sgx
+RUN --mount=type=bind,source=test-integration/sim-stub.cjs,target=/tmp/sim-stub.cjs \
+    if [ "$SGX_MODE" = "direct" ] || [ "$SGX_MODE" = "sim" ]; then \
+        echo "[build] SGX_MODE=$SGX_MODE: applying simulator stub to gramine-launcher.js"; \
+        node /tmp/sim-stub.cjs /app/sgx-enclave/gramine-launcher.js; \
+    fi
+
 # =================================================================
 # Create runtime directories
 #   ./wallet - encrypted storage (encrypted mount in manifest)

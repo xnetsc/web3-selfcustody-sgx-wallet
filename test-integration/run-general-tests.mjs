@@ -80,6 +80,11 @@ const WALLET_TRUST_CONTRACT_ABI = [
   // 配置管理
   'function updateCodeRepository(string calldata _codeRepository) external',
   'function updateRuntimeParams(string calldata _runtimeParams) external',
+  'function setRpcTlsCaCert(string calldata _rpcTlsCaCert) external',
+  'function getRpcTlsCaCert() external view returns (string)',
+  'function setMigrationTarget(string calldata _rpcUrl, string calldata _contractAddress, uint256 _chainId, string calldata _rpcTlsCaCert) external',
+  'function getMigrationTarget() external view returns (string, string, uint256, string)',
+  'function clearMigrationTarget() external',
   'function getCodeRepository() external view returns (string)',
   'function getRuntimeParams() external view returns (string)',
   'function getPublicInfo() external view returns (string, string, tuple(bytes32 mrenclave, bytes32 mrsigner, uint16 isvprodid, uint16 isvsvn, string description)[])',
@@ -2148,6 +2153,71 @@ async function testAuthStatus() {
   console.log(`  [info] auth/status status=${res.status}, body=${JSON.stringify(res.body).substring(0, 120)}`);
 }
 
+/**
+ * 授权撤销端点测试（POST /api/auth/revoke + /api/auth/revocation/query）
+ *
+ * /api/auth/revoke：平台转发用户撤销——信封须过平台白名单验签，payload 携带
+ * 目标用户 Passkey 对 sha256(userId‖authorizationId‖grantee) 的 P256 签名
+ * （与合约 revokeAuthorization 同构），SGX 校验签名与绑定 Passkey 一致后本地落库。
+ * /api/auth/revocation/query：无鉴权公开查询，批量精确查询单次上限 5 个 key。
+ * 本测试在 state.authorizationId 已被 tx/sign 使用（授权原文已落库）之后执行，
+ * 撤销它不影响后续章节（后续章节不再使用该 authorizationId）。
+ */
+async function testAuthRevocationEndpoints() {
+  console.log('\n=== 17b. POST /api/auth/revoke + /api/auth/revocation/query ===');
+  if (!state.authorizationId) { skip('auth/revoke endpoints', 'no authorization fixture'); return; }
+
+  const queryKey = { userId: state.userId, authorizationId: state.authorizationId, grantee: PLATFORM_ADDRESS };
+
+  // 撤销前公开查询：未撤销
+  const beforeRes = await httpPost('/api/auth/revocation/query', { keys: [queryKey] });
+  const beforeParsed = parseAttestationResponse(beforeRes);
+  assert(beforeRes.status === 200 && !!(beforeParsed && beforeParsed.data &&
+    Array.isArray(beforeParsed.data.results) && beforeParsed.data.results[0] &&
+    beforeParsed.data.results[0].revoked === false),
+    'revocation/query: authorization not revoked before revoke');
+
+  // 批量上限：6 个 key 必须被拒
+  const overRes = await httpPost('/api/auth/revocation/query', { keys: Array(6).fill(queryKey) });
+  assert(overRes.status !== 200, 'revocation/query: batch over 5 keys rejected');
+
+  // 平台信封签名被篡改 → revoke 被拒
+  const goodEnvelope = await buildRequest({ probe: 'tamper' });
+  const tamperedRes = await httpPost('/api/auth/revoke', {
+    payload: JSON.stringify({ userId: state.userId, authorizationId: state.authorizationId }),
+    platformSignature: goodEnvelope.platformSignature,
+  });
+  assert(tamperedRes.status !== 200, 'revoke: tampered platform envelope rejected');
+
+  // 正常撤销：用户 Passkey 对撤销摘要签名，平台信封转发
+  const p256PubDer = p256KeyPair.publicKey.export({ type: 'spki', format: 'der' });
+  const p256Uncompressed = p256PubDer.subarray(p256PubDer.length - 65);
+  const pubKeyX = '0x' + p256Uncompressed.subarray(1, 33).toString('hex');
+  const pubKeyY = '0x' + p256Uncompressed.subarray(33, 65).toString('hex');
+  const { r, s } = signP256ForRevocation(p256KeyPair.privateKey, state.userId, state.authorizationId, PLATFORM_ADDRESS);
+  const revokeRes = await httpPost('/api/auth/revoke', await buildRequest({
+    userId: state.userId,
+    authorizationId: state.authorizationId,
+    credentialId: state.credentialId,
+    grantee: PLATFORM_ADDRESS,
+    passkeyPubKeyX: pubKeyX,
+    passkeyPubKeyY: pubKeyY,
+    signatureR: r,
+    signatureS: s,
+  }));
+  const revokeParsed = parseAttestationResponse(revokeRes);
+  assert(revokeRes.status === 200 && !!(revokeParsed && revokeParsed.data && revokeParsed.data.revoked === true),
+    'revoke: platform-forwarded user revocation recorded');
+
+  // 撤销后公开查询：已撤销
+  const afterRes = await httpPost('/api/auth/revocation/query', { keys: [queryKey] });
+  const afterParsed = parseAttestationResponse(afterRes);
+  assert(afterRes.status === 200 && !!(afterParsed && afterParsed.data &&
+    Array.isArray(afterParsed.data.results) && afterParsed.data.results[0] &&
+    afterParsed.data.results[0].revoked === true),
+    'revocation/query: authorization revoked after revoke');
+}
+
 async function testWalletEntryDelete() {
   console.log('\n=== 18. POST /api/wallet/entry/delete ===');
 
@@ -3417,6 +3487,36 @@ async function testEmergencyAuthorization() {
 }
 
 /** 指定端口的 POST（多节点测试用；httpPost 固定主节点端口） */
+function sleepMs(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+async function ownerContract() {
+    const env = loadContractEnv();
+    const { ethers } = await import('ethers');
+    const provider = new ethers.JsonRpcProvider(env.rpcUrl);
+    const ownerWallet = new ethers.Wallet('0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80', provider);
+    return { contract: new ethers.Contract(env.contractAddress, WALLET_TRUST_CONTRACT_ABI, ownerWallet), ownerWallet };
+}
+
+async function setAttestationAllowNonRaTls(value) {
+    const { contract, ownerWallet } = await ownerContract();
+    const paramsStr = await contract.getRuntimeParams();
+    const params = JSON.parse(paramsStr);
+    params.attestation = { ...(params.attestation || {}), allowNonRaTls: value };
+    const tx = await contract.updateRuntimeParams(JSON.stringify(params), { nonce: await ownerWallet.getNonce('pending') });
+    await tx.wait();
+}
+
+async function getRuntimeParamsStr() {
+    const { contract } = await ownerContract();
+    return contract.getRuntimeParams();
+}
+
+async function updateRuntimeParamsStr(paramsStr) {
+    const { contract, ownerWallet } = await ownerContract();
+    const tx = await contract.updateRuntimeParams(paramsStr, { nonce: await ownerWallet.getNonce('pending') });
+    await tx.wait();
+}
+
 function httpPostTo(port, apiPath, body) {
   return new Promise((resolve, reject) => {
     const data = JSON.stringify(body);
@@ -3463,6 +3563,7 @@ async function testMultiNodeSync() {
   const NODE_B = 'test-sgx-enclave-2';
   const NODE_B_HTTP = 3001;
   let sectionCompleted = false;
+  let paramsBeforeSync = null;
   const dockerHostRpcUrl = contractEnv.rpcUrl.replace('127.0.0.1', '172.17.0.1').replace('localhost', '172.17.0.1');
   try {
     // 前序合约管理测试已把 codeRepository 设为测试仓库地址；新节点启动时会据此做
@@ -3478,13 +3579,28 @@ async function testMultiNodeSync() {
       await tx.wait();
       console.log('  [info] codeRepository cleared so node B skips code-integrity verification at boot');
     }
+    // 前序配置测试会整表重写 runtimeParams（attestation 被清掉）：节点经启动器
+    // 都带证书，B 钉住的 allowNonRaTls 若为 false 会把与 A 的同步连接全部拒掉。
+    // 拉起 B 前确保当前参数允许非 RA-TLS 证书，章节结束恢复原参数串。
+    try {
+      const { contract: syncContract, ownerWallet: syncOwner } = await ownerContract();
+      const cur = await syncContract.getRuntimeParams();
+      const p = JSON.parse(cur);
+      if (!p.attestation || p.attestation.allowNonRaTls !== true) {
+        paramsBeforeSync = cur;
+        p.attestation = { ...(p.attestation || {}), allowNonRaTls: true };
+        const tx = await syncContract.updateRuntimeParams(JSON.stringify(p), { nonce: await syncOwner.getNonce('pending') });
+        await tx.wait();
+        console.log('  [info] attestation.allowNonRaTls ensured true for node B boot');
+      }
+    } catch (e) { console.log('  [warn] could not ensure attestation params: ' + e.message); }
     runScript('start-enclave.sh', [PLATFORM_ADDRESS], {
       ENCLAVE_CONTAINER: NODE_B,
       ENCLAVE_HTTP_PORT: String(NODE_B_HTTP),
       SYNC_LISTEN_PORT: '3308',
       NODE_ID: 'integration-test-node-2',
-      SYNC_NODES: 'ws://172.17.0.1:3307',
-      SYNC_ADVERTISED_URL: 'ws://172.17.0.1:3308',
+      SYNC_NODES: 'wss://172.17.0.1:3307',
+      SYNC_ADVERTISED_URL: 'wss://172.17.0.1:3308',
       CONTRACT_RPC_URL: dockerHostRpcUrl,
       CONTRACT_CHAIN_ID: String(contractEnv.chainId),
       CONTRACT_ADDRESS: contractEnv.contractAddress,
@@ -3570,8 +3686,739 @@ async function testMultiNodeSync() {
         console.log(`\n--- ${NODE_B} logs (last 80 lines, section incomplete) ---\n${blog.split('\n').slice(-80).join('\n')}`);
       } catch { /* 容器日志不可得时不掩盖原始失败 */ }
     }
+    if (paramsBeforeSync !== null) {
+      try { await updateRuntimeParamsStr(paramsBeforeSync); } catch (_) {}
+    }
     dockerCmd(`docker rm -f ${NODE_B} 2>/dev/null`);
   }
+}
+
+/**
+ * 代码完整性验证测试（合约 codeRepository → 节点启动时比对本地代码与公示仓库）
+ *
+ * 验证逻辑（sgx-enclave/src/utils/code-integrity.js）：合约配置 codeRepository 非空时，
+ * 节点启动解析 Gramine manifest 的 sgx.trusted_files，过滤出应用代码
+ * （index.js / gramine-launcher.js / package.json / package-lock.json / src/ / config/，
+ * 排除 node_modules 与系统路径），逐个算 SHA256；远程侧一次性下载仓库 tar.gz 归档
+ * （GitHub codeload 或直链 .tar.gz）在内存中算同样的映射；先比文件清单是否齐全
+ * （含强制文件 package-lock.json），再逐文件比哈希。不一致 → 拒绝启动（does not match）；
+ * 仓库不可达/URL 非法/manifest 缺失等验证本身失败 → 同样拒绝启动（cannot verify）；
+ * codeRepository 为空 → 跳过验证正常启动。
+ *
+ * 本测试用模块自带的直链归档模式（注释注明适用于自托管发布和测试）：
+ * 以当前仓库 sgx-enclave 目录现打三份 tar.gz（原样 / 篡改 index.js / 删一个源文件），
+ * 由本进程在 8899 端口提供下载，逐一设为 codeRepository 后拉起第三个节点观察结果。
+ */
+async function testCodeIntegrity() {
+  console.log('\n=== Code Integrity Verification (contract codeRepository) ===');
+
+  const contractEnv = loadContractEnv();
+  if (!contractEnv) {
+    skip('code-integrity', 'requires contract deployment (--contract mode)');
+    return;
+  }
+
+  const NODE_C = 'test-sgx-enclave-3';
+  const NODE_C_HTTP = 3002;
+  const ARCHIVE_PORT = 8899;
+  const ARCHIVE_BASE = `http://172.17.0.1:${ARCHIVE_PORT}`;
+  const dockerHostRpcUrl = contractEnv.rpcUrl.replace('127.0.0.1', '172.17.0.1').replace('localhost', '172.17.0.1');
+  const HARDHAT_OWNER_PRIVKEY = '0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80';
+
+  const provider = new ethers.JsonRpcProvider(contractEnv.rpcUrl);
+  const ownerWallet = new ethers.Wallet(HARDHAT_OWNER_PRIVKEY, provider);
+  const contract = new ethers.Contract(contractEnv.contractAddress, WALLET_TRUST_CONTRACT_ABI, ownerWallet);
+  const setRepo = async (url) => {
+    const tx = await contract.updateCodeRepository(url, { nonce: await ownerWallet.getNonce('pending') });
+    await tx.wait();
+  };
+
+  // ---- 以当前仓库代码打包归档（顶层目录 wallet-test/ 会被解包侧剥离） ----
+  const buildArchive = (tamper) => {
+    const repoEnclaveDir = path.join(__dirname, '..', 'sgx-enclave');
+    const stageRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ci-archive-'));
+    const stageApp = path.join(stageRoot, 'wallet-test', 'sgx-enclave');
+    fs.mkdirSync(stageApp, { recursive: true });
+    for (const f of ['gramine-launcher.js', 'index.js', 'package.json', 'package-lock.json']) {
+      const src = path.join(repoEnclaveDir, f);
+      if (fs.existsSync(src)) fs.copyFileSync(src, path.join(stageApp, f));
+    }
+    for (const d of ['src', 'config']) {
+      const srcDir = path.join(repoEnclaveDir, d);
+      if (fs.existsSync(srcDir)) fs.cpSync(srcDir, path.join(stageApp, d), { recursive: true });
+    }
+    // 归档须与模拟器镜像内的实际运行代码一致：镜像构建时启动器已被打桩
+    // （SGX_MODE=direct 构建），暂存副本同样打桩后再打包，否则启动器一项必然哈希不一致。
+    execSync(`node "${path.join(__dirname, 'sim-stub.cjs')}" "${path.join(stageApp, 'gramine-launcher.js')}"`, { stdio: 'pipe' });
+    if (tamper === 'mismatch') {
+      fs.appendFileSync(path.join(stageApp, 'index.js'), '\n// tampered for integrity test\n');
+    } else if (tamper === 'missing') {
+      fs.rmSync(path.join(stageApp, 'src', 'utils', 'code-integrity.js'), { force: true });
+    }
+    const tarPath = path.join(stageRoot, 'archive.tar.gz');
+    execSync(`tar -czf "${tarPath}" -C "${stageRoot}" wallet-test`, { stdio: 'pipe' });
+    return { stageRoot, tarPath };
+  };
+
+  const archives = {
+    good: buildArchive(null),
+    tampered: buildArchive('mismatch'),
+    missing: buildArchive('missing'),
+  };
+  const server = http.createServer((req, res) => {
+    const name = (req.url || '').replace(/^\//, '').replace(/\.tar\.gz$/, '');
+    const entry = archives[name];
+    if (!entry) { res.writeHead(404); res.end(); return; }
+    res.writeHead(200, { 'Content-Type': 'application/gzip' });
+    fs.createReadStream(entry.tarPath).pipe(res);
+  });
+  await new Promise((r) => server.listen(ARCHIVE_PORT, '0.0.0.0', r));
+  console.log(`  [info] code archives served on port ${ARCHIVE_PORT}`);
+
+  const startNodeC = () => runScript('start-enclave.sh', [PLATFORM_ADDRESS], {
+    ENCLAVE_CONTAINER: NODE_C,
+    ENCLAVE_HTTP_PORT: String(NODE_C_HTTP),
+    SYNC_LISTEN_PORT: '3309',
+    NODE_ID: 'integration-test-node-3',
+    SYNC_NODES: '',
+    CONTRACT_RPC_URL: dockerHostRpcUrl,
+    CONTRACT_CHAIN_ID: String(contractEnv.chainId),
+    CONTRACT_ADDRESS: contractEnv.contractAddress,
+  });
+  const nodeCLogs = () => {
+    try { return execSync(`docker logs ${NODE_C} 2>&1`, { stdio: 'pipe', timeout: 10000 }).toString(); }
+    catch { return ''; }
+  };
+  const expectRefusal = async (pattern, label) => {
+    let logs = '';
+    for (let i = 0; i < 18; i++) {
+      logs = nodeCLogs();
+      if (logs.includes('Refusing to start')) break;
+      await new Promise((r) => setTimeout(r, 5000));
+    }
+    assert(logs.includes('Refusing to start') && pattern.test(logs), label);
+    return logs;
+  };
+  let sectionCompleted = false;
+
+  try {
+    // ---- 正例：归档与本地代码逐字节一致 → 验证通过、节点正常启动 ----
+    await setRepo(`${ARCHIVE_BASE}/good.tar.gz`);
+    startNodeC();
+    await waitForHTTP(NODE_C_HTTP, '127.0.0.1', 120000);
+    assert(/Code integrity verification PASSED: All \d+ files verified/.test(nodeCLogs()),
+      'integrity: node boots and verification PASSED when archive matches local code');
+    dockerCmd(`docker rm -f ${NODE_C} 2>/dev/null`);
+
+    // ---- 篡改：归档内 index.js 被改 → 哈希不一致拒绝启动 ----
+    await setRepo(`${ARCHIVE_BASE}/tampered.tar.gz`);
+    startNodeC();
+    const mismatchLogs = await expectRefusal(/does not match published repository/,
+      'integrity: tampered archive rejected at boot (does not match)');
+    assert(mismatchLogs.includes('HASH MISMATCH'), 'integrity: refusal reports HASH MISMATCH detail');
+    dockerCmd(`docker rm -f ${NODE_C} 2>/dev/null`);
+
+    // ---- 缺文件：归档少一个源文件 → 清单不一致拒绝启动 ----
+    await setRepo(`${ARCHIVE_BASE}/missing.tar.gz`);
+    startNodeC();
+    const missingLogs = await expectRefusal(/does not match published repository/,
+      'integrity: archive missing a source file rejected at boot');
+    assert(/missing in remote repository/.test(missingLogs), 'integrity: refusal reports missing-in-remote detail');
+    dockerCmd(`docker rm -f ${NODE_C} 2>/dev/null`);
+
+    // ---- 非 GitHub 托管地址（非归档）→ URL 解析即失败，cannot verify 拒绝启动 ----
+    await setRepo('https://example.com/some/repo');
+    startNodeC();
+    await expectRefusal(/cannot verify code against repository/,
+      'integrity: non-GitHub repository URL rejected at boot (cannot verify)');
+    dockerCmd(`docker rm -f ${NODE_C} 2>/dev/null`);
+
+    // ---- 不存在的 GitHub 仓库 → 取默认分支失败，cannot verify 拒绝启动 ----
+    await setRepo('https://github.com/test-org-does-not-exist-zzz/nope');
+    startNodeC();
+    await expectRefusal(/cannot verify code against repository/,
+      'integrity: unreachable repository rejected at boot (cannot verify)');
+    dockerCmd(`docker rm -f ${NODE_C} 2>/dev/null`);
+    sectionCompleted = true;
+  } finally {
+    if (!sectionCompleted) {
+      const blog = nodeCLogs();
+      if (blog) console.log(`\n--- ${NODE_C} logs (last 80 lines, section incomplete) ---\n${blog.split('\n').slice(-80).join('\n')}`);
+    }
+    // 恢复为空：后续节点启动跳过验证（与多节点章节的前置状态一致）
+    try { await setRepo(''); } catch { /* 链不可用时不掩盖原始失败 */ }
+    server.close();
+    for (const entry of Object.values(archives)) {
+      fs.rmSync(entry.stageRoot, { recursive: true, force: true });
+    }
+    dockerCmd(`docker rm -f ${NODE_C} 2>/dev/null`);
+  }
+}
+
+/**
+ * 合约 RPC 的 TLS CA 证书测试（setRpcTlsCaCert / getRpcTlsCaCert + 节点经 HTTPS RPC 读合约）
+ *
+ * 背景：合约 RPC 可走 HTTPS 且证书为自签时，节点需要一份 CA 才能验证 RPC 端点：
+ * 首次连接的 CA 来自环境变量 CONTRACT_RPC_TLS_CA_CERT（启动引导），连接建立后
+ * 合约上的 rpcTlsCaCert 成为后续连接（含迁移目标）的信任锚。
+ * 本测试自签 CA + 服务器证书，在 8546 端口起一个 HTTPS JSON-RPC 代理转发到本地
+ * Hardhat，验证：链上证书存取往返；节点无 CA 时 TLS 验证失败、合约不可用；
+ * 节点带 CA（env 引导）时成功读到合约。
+ */
+async function testRpcTlsCaCert() {
+  console.log('\n=== RPC TLS CA Cert (HTTPS contract RPC) ===');
+
+  const contractEnv = loadContractEnv();
+  if (!contractEnv) {
+    skip('rpc-tls-ca', 'requires contract deployment (--contract mode)');
+    return;
+  }
+
+  const NODE_F = 'test-sgx-enclave-4';
+  const NODE_F_HTTP = 3003;
+  const TLS_PORT = 8546;
+  const TLS_HOST_FOR_NODE = '172.17.0.1';
+  const HARDHAT_OWNER_PRIVKEY = '0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80';
+  const dockerHostRpcUrl = contractEnv.rpcUrl.replace('127.0.0.1', '172.17.0.1').replace('localhost', '172.17.0.1');
+
+  const provider = new ethers.JsonRpcProvider(contractEnv.rpcUrl);
+  const ownerWallet = new ethers.Wallet(HARDHAT_OWNER_PRIVKEY, provider);
+  const contract = new ethers.Contract(contractEnv.contractAddress, WALLET_TRUST_CONTRACT_ABI, ownerWallet);
+
+  // ---- 生成 CA 与服务器证书（SAN 覆盖回环与 Docker 网关两种到达方式） ----
+  const tlsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'rpc-tls-'));
+  try {
+    execSync(`openssl req -x509 -newkey rsa:2048 -keyout "${tlsDir}/ca.key" -out "${tlsDir}/ca.crt" -days 2 -nodes -subj "/CN=Integration Test CA"`, { stdio: 'pipe' });
+    execSync(`openssl req -newkey rsa:2048 -keyout "${tlsDir}/srv.key" -out "${tlsDir}/srv.csr" -nodes -subj "/CN=localhost"`, { stdio: 'pipe' });
+    const sanHostEntry = /^\d+\.\d+\.\d+\.\d+$/.test(TLS_HOST_FOR_NODE) ? `IP:${TLS_HOST_FOR_NODE}` : `DNS:${TLS_HOST_FOR_NODE}`;
+    const sanList = [...new Set(['IP:127.0.0.1', sanHostEntry, 'DNS:localhost'])].join(',');
+    fs.writeFileSync(`${tlsDir}/srv.ext`, `subjectAltName=${sanList}\n`);
+    execSync(`openssl x509 -req -in "${tlsDir}/srv.csr" -CA "${tlsDir}/ca.crt" -CAkey "${tlsDir}/ca.key" -CAcreateserial -out "${tlsDir}/srv.crt" -days 2 -extfile "${tlsDir}/srv.ext"`, { stdio: 'pipe' });
+  } catch (err) {
+    skip('rpc-tls-ca', `openssl certificate generation failed: ${err.message}`);
+    fs.rmSync(tlsDir, { recursive: true, force: true });
+    return;
+  }
+  const caPem = fs.readFileSync(`${tlsDir}/ca.crt`, 'utf8');
+
+  // ---- 链上存取往返 ----
+  {
+    const tx = await contract.setRpcTlsCaCert(caPem, { nonce: await ownerWallet.getNonce('pending') });
+    await tx.wait();
+    const stored = await contract.getRpcTlsCaCert();
+    assert(stored === caPem, 'tls-ca: on-chain setRpcTlsCaCert/getRpcTlsCaCert round-trip');
+  }
+
+  // ---- HTTPS JSON-RPC 代理（转发到本地 Hardhat 明文 RPC） ----
+  const https = await import('node:https');
+  const proxy = https.createServer({
+    key: fs.readFileSync(`${tlsDir}/srv.key`),
+    cert: fs.readFileSync(`${tlsDir}/srv.crt`),
+  }, (req, res) => {
+    let body = '';
+    req.on('data', (c) => (body += c));
+    req.on('end', () => {
+      const upstream = http.request({ hostname: '127.0.0.1', port: 8545, path: '/', method: 'POST', headers: { 'Content-Type': 'application/json' } }, (up) => {
+        let out = '';
+        up.on('data', (c) => (out += c));
+        up.on('end', () => { res.writeHead(up.statusCode || 502, { 'Content-Type': 'application/json' }); res.end(out); });
+      });
+      upstream.on('error', () => { res.writeHead(502); res.end(); });
+      upstream.write(body);
+      upstream.end();
+    });
+  });
+  await new Promise((r) => proxy.listen(TLS_PORT, '0.0.0.0', r));
+  console.log(`  [info] HTTPS RPC proxy on port ${TLS_PORT}`);
+
+  const nodeFLogs = () => {
+    try { return execSync(`docker logs ${NODE_F} 2>&1`, { stdio: 'pipe', timeout: 10000 }).toString(); }
+    catch { return ''; }
+  };
+  const startNodeF = (caCertEnv) => runScript('start-enclave.sh', [PLATFORM_ADDRESS], {
+    ENCLAVE_CONTAINER: NODE_F,
+    ENCLAVE_HTTP_PORT: String(NODE_F_HTTP),
+    SYNC_LISTEN_PORT: '3310',
+    NODE_ID: 'integration-test-node-4',
+    SYNC_NODES: '',
+    CONTRACT_RPC_URL: `https://${TLS_HOST_FOR_NODE}:${TLS_PORT}`,
+    CONTRACT_CHAIN_ID: String(contractEnv.chainId),
+    CONTRACT_ADDRESS: contractEnv.contractAddress,
+    CONTRACT_RPC_TLS_CA_CERT: caCertEnv,
+  });
+
+  try {
+    // ---- 无 CA：自签证书无法验证 → 合约不可用（但节点本身应起来） ----
+    startNodeF('');
+    await waitForHTTP(NODE_F_HTTP, '127.0.0.1', 120000);
+    assert(nodeFLogs().includes('contractAvailable=false'),
+      'tls-ca: node without CA cannot verify HTTPS RPC (contractAvailable=false)');
+    dockerCmd(`docker rm -f ${NODE_F} 2>/dev/null`);
+
+    // ---- 带 CA（env 引导）：成功验证并读到合约 ----
+    startNodeF(caPem);
+    await waitForHTTP(NODE_F_HTTP, '127.0.0.1', 120000);
+    assert(nodeFLogs().includes('contractAvailable=true'),
+      'tls-ca: node with env CA verifies HTTPS RPC and reads contract (contractAvailable=true)');
+    dockerCmd(`docker rm -f ${NODE_F} 2>/dev/null`);
+  } finally {
+    proxy.close();
+    try {
+      const tx = await contract.setRpcTlsCaCert('', { nonce: await ownerWallet.getNonce('pending') });
+      await tx.wait();
+    } catch { /* 链不可用时不掩盖原始失败 */ }
+    fs.rmSync(tlsDir, { recursive: true, force: true });
+    dockerCmd(`docker rm -f ${NODE_F} 2>/dev/null`);
+  }
+}
+
+/**
+ * NTP 对时测试（runtimeParams.security.ntpServers → 单调时钟锚点校准）
+ *
+ * 逻辑（sgx-enclave/src/utils/monotonic-clock.js + index.js 步骤 3.1 +
+ * contract-client 刷新检测）：合约配置 ntpServers 非空时，节点启动以 SNTP
+ * （UDP 123，RFC 4330 简化版）并行查询全部服务器，对有效估计取中位数校正
+ * 单调时钟锚点；全部失败 → 启动拒绝（untrusted local clock）。运行中合约刷新
+ * 发现 ntpServers 变更会立即重校准，重校准全部失败 → 进程退出（fail-closed）。
+ * 服务器条目只含主机名/IP，端口固定 123——本测试在宿主机 123 端口起一个假
+ * NTP 服务端， Transmit 时间故意偏移 +1 小时，断言锚点调整量与之吻合。
+ * 绑定 123 失败（无权限）时整节 skip。
+ */
+async function testNtpCalibration() {
+  console.log('\n=== NTP Clock Calibration (security.ntpServers) ===');
+
+  const contractEnv = loadContractEnv();
+  if (!contractEnv) {
+    skip('ntp', 'requires contract deployment (--contract mode)');
+    return;
+  }
+
+  const dgram = await import('node:dgram');
+  const NODE_D = 'test-sgx-enclave-5';
+  const NODE_D_HTTP = 3004;
+  const NTP_HOST_FOR_NODE = '172.17.0.1';
+  const DEAD_NTP_HOST = '10.255.255.1';
+  const OFFSET_MS = 3600_000;
+  const HARDHAT_OWNER_PRIVKEY = '0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80';
+  const dockerHostRpcUrl = contractEnv.rpcUrl.replace('127.0.0.1', '172.17.0.1').replace('localhost', '172.17.0.1');
+
+  const provider = new ethers.JsonRpcProvider(contractEnv.rpcUrl);
+  const ownerWallet = new ethers.Wallet(HARDHAT_OWNER_PRIVKEY, provider);
+  const contract = new ethers.Contract(contractEnv.contractAddress, WALLET_TRUST_CONTRACT_ABI, ownerWallet);
+  const originalParamsStr = await contract.getRuntimeParams();
+  const setNtpServers = async (servers) => {
+    const params = JSON.parse(originalParamsStr || '{}');
+    params.security = { ...(params.security || {}), ntpServers: servers };
+    const tx = await contract.updateRuntimeParams(JSON.stringify(params), { nonce: await ownerWallet.getNonce('pending') });
+    await tx.wait();
+  };
+
+  // ---- 假 NTP 服务端：应答时间 = 当前时间 + OFFSET_MS ----
+  const ntpServer = dgram.createSocket('udp4');
+  const writeNtpTimestamp = (buf, offset, unixMs) => {
+    const totalMs = unixMs + 2208988800000;
+    buf.writeUInt32BE(Math.floor(totalMs / 1000), offset);
+    buf.writeUInt32BE(Math.floor((totalMs % 1000) / 1000 * 4294967296), offset + 4);
+  };
+  ntpServer.on('message', (msg, rinfo) => {
+    const resp = Buffer.alloc(48);
+    resp[0] = 0x24; // LI=0, VN=4, Mode=4 (server)
+    resp[1] = 2;    // stratum
+    const servedMs = Date.now() + OFFSET_MS;
+    writeNtpTimestamp(resp, 32, servedMs); // Receive Timestamp
+    writeNtpTimestamp(resp, 40, servedMs); // Transmit Timestamp
+    ntpServer.send(resp, rinfo.port, rinfo.address);
+  });
+  const bound = await new Promise((resolve) => {
+    ntpServer.once('error', () => resolve(false));
+    ntpServer.bind(123, '0.0.0.0', () => resolve(true));
+  });
+  if (!bound) {
+    skip('ntp', 'cannot bind UDP 123 for fake NTP server (insufficient privilege)');
+    try { ntpServer.close(); } catch { /* ignore */ }
+    return;
+  }
+  console.log(`  [info] fake NTP server on UDP 123 (offset +${OFFSET_MS}ms)`);
+
+  const nodeDLogs = () => {
+    try { return execSync(`docker logs ${NODE_D} 2>&1`, { stdio: 'pipe', timeout: 10000 }).toString(); }
+    catch { return ''; }
+  };
+  const mainLogs = () => {
+    try { return execSync(`docker logs ${ENCLAVE_CONTAINER} 2>&1`, { stdio: 'pipe', timeout: 10000 }).toString(); }
+    catch { return ''; }
+  };
+  const startNodeD = () => runScript('start-enclave.sh', [PLATFORM_ADDRESS], {
+    ENCLAVE_CONTAINER: NODE_D,
+    ENCLAVE_HTTP_PORT: String(NODE_D_HTTP),
+    SYNC_LISTEN_PORT: '3311',
+    NODE_ID: 'integration-test-node-5',
+    SYNC_NODES: '',
+    CONTRACT_RPC_URL: dockerHostRpcUrl,
+    CONTRACT_CHAIN_ID: String(contractEnv.chainId),
+    CONTRACT_ADDRESS: contractEnv.contractAddress,
+  });
+
+  // 等待节点 D 就绪但不抛错：本节的失败只记本节断言，不得中断整套后续章节
+  const waitNodeD = async () => {
+    try { await waitForHTTP(NODE_D_HTTP, '127.0.0.1', 120000); return true; }
+    catch { return false; }
+  };
+  try {
+    // ---- 正例：单服务器 +1h → 启动成功且锚点调整量 ≈ +1h ----
+    await setNtpServers([NTP_HOST_FOR_NODE]);
+    startNodeD();
+    const ready1 = await waitNodeD();
+    const okLogs = nodeDLogs();
+    assert(ready1 && okLogs.includes('NTP calibration succeeded'), 'ntp: node boots with NTP calibration succeeded');
+    const driftMatch = okLogs.match(/anchor adjusted by \+([0-9.]+)ms/);
+    assert(!!driftMatch && Math.abs(parseFloat(driftMatch[1]) - OFFSET_MS) < 120000,
+      `ntp: monotonic anchor adjusted by served offset (~+${OFFSET_MS}ms, got ${driftMatch ? driftMatch[1] : 'none'})`);
+    dockerCmd(`docker rm -f ${NODE_D} 2>/dev/null`);
+
+    // ---- 混合：一个不可达 + 一个可用 → 取有效估计的中位数，启动成功 ----
+    await setNtpServers([DEAD_NTP_HOST, NTP_HOST_FOR_NODE]);
+    startNodeD();
+    const ready2 = await waitNodeD();
+    assert(ready2 && nodeDLogs().includes('NTP calibration succeeded'),
+      'ntp: node boots when one of two NTP servers is unreachable (valid-only median)');
+    dockerCmd(`docker rm -f ${NODE_D} 2>/dev/null`);
+
+    // ---- 全不可达：新节点拒绝启动；运行中的主节点重校准失败并记录退出原因 ----
+    await setNtpServers([DEAD_NTP_HOST]);
+    startNodeD();
+    let dLogs = '';
+    for (let i = 0; i < 24; i++) {
+      dLogs = nodeDLogs();
+      if (dLogs.includes('Refusing to start with untrusted local clock')) break;
+      await new Promise((r) => setTimeout(r, 5000));
+    }
+    assert(dLogs.includes('Refusing to start with untrusted local clock'),
+      'ntp: node refuses to start when all NTP servers are unreachable');
+    dockerCmd(`docker rm -f ${NODE_D} 2>/dev/null`);
+
+    let mLogs = '';
+    for (let i = 0; i < 8; i++) {
+      mLogs = mainLogs();
+      if (mLogs.includes('NTP re-calibration failed')) break;
+      await new Promise((r) => setTimeout(r, 5000));
+    }
+    assert(mLogs.includes('NTP re-calibration failed'),
+      'ntp: running node fails closed on re-calibration failure (exits)');
+  } finally {
+    try {
+      const tx = await contract.updateRuntimeParams(originalParamsStr, { nonce: await ownerWallet.getNonce('pending') });
+      await tx.wait();
+    } catch { /* 链不可用时不掩盖原始失败 */ }
+    try { ntpServer.close(); } catch { /* ignore */ }
+    dockerCmd(`docker rm -f ${NODE_D} 2>/dev/null`);
+  }
+}
+
+
+// ============ RA-TLS 同步验证门（证书级，direct 形态） ============
+// 节点经 gramine-launcher 启动时生成自签名证书（非 SGX 环境无 quote 扩展）：
+// - attestation.allowNonRaTls=false（强制模式）：无 quote 的对端证书被真实
+//   CertificateVerifier 拒绝，连接不注册、Passkey 不复制（负例以建钱包失败判）；
+// - allowNonRaTls=true：证书本地分支放行，连接建立且数据真实复制。
+// quote 内部的 DCAP 抵押链验证（Intel PKI 签发的抵押物 + 真实 SGX quote）无法
+// 在无 SGX 硬件的测试环境构造，桩点设在验证器接缝（p2p-verify-gate 套件在
+// SyncManager 构造处注入 stub verifier），这是必须跳过的最小原子；验证门其余
+// 逻辑——证书呈现检查、quote 扩展检查、allowNonRaTls 分支、注册延迟与消息
+// 缓冲——全部走真实代码。带 quote 的证书只有启动器在 SGX 模式下能生成，故本
+// 节用无 quote 证书覆盖验证门在 direct 形态下可达的全部行为。
+async function testRaTlsGate() {
+    console.log('\n--- RA-TLS Sync Verification Gate ---');
+    const contractEnv = loadContractEnv();
+    const dockerHostRpcUrl = contractEnv.rpcUrl.replace('127.0.0.1', '172.17.0.1').replace('localhost', '172.17.0.1');
+    let originalParamsStr = null;
+    try { originalParamsStr = await getRuntimeParamsStr(); } catch (_) {}
+    const restoreParams = async () => {
+        if (originalParamsStr !== null) {
+            try { await updateRuntimeParamsStr(originalParamsStr); } catch (_) {}
+        }
+    };
+    const pair = [
+        { name: 'test-sgx-enclave-6', http: 3005, sync: 3313 },
+        { name: 'test-sgx-enclave-7', http: 3006, sync: 3314 },
+    ];
+    const stopPair = async () => {
+        for (const n of pair) { dockerCmd(`docker rm -f ${n.name} 2>/dev/null`); }
+    };
+    const logsOf = (name) => {
+        try { return execSync(`docker logs ${name} 2>&1`, { stdio: 'pipe', timeout: 10000 }).toString(); }
+        catch { return ''; }
+    };
+    const bootPair = async () => {
+        const startNode = (n, peer) => runScript('start-enclave.sh', [PLATFORM_ADDRESS], {
+            ENCLAVE_CONTAINER: n.name,
+            ENCLAVE_HTTP_PORT: String(n.http),
+            SYNC_LISTEN_PORT: String(n.sync),
+            NODE_ID: `integration-test-node-${n.http}`,
+            SYNC_NODES: `wss://172.17.0.1:${peer.sync}`,
+            CONTRACT_RPC_URL: dockerHostRpcUrl,
+            CONTRACT_CHAIN_ID: String(contractEnv.chainId),
+            CONTRACT_ADDRESS: contractEnv.contractAddress,
+        });
+        startNode(pair[0], pair[1]);
+        await waitForHTTP(pair[0].http, '127.0.0.1', 120000);
+        startNode(pair[1], pair[0]);
+        await waitForHTTP(pair[1].http, '127.0.0.1', 120000);
+    };
+    // 在 pair[1] 注册用户，再尝试在 pair[0] 用其密钥建钱包：
+    // 建钱包能成功当且仅当 Passkey 已经同步复制到 pair[0]。
+    const registerAndTryCreate = async (tag) => {
+        const userId = `${tag}-${crypto.randomBytes(4).toString('hex')}`;
+        const keys = crypto.generateKeyPairSync('ec', { namedCurve: 'P-256' });
+        const der = keys.publicKey.export({ type: 'spki', format: 'der' });
+        const point = der.subarray(26);
+        const pubX = point.subarray(1, 33);
+        const pubY = point.subarray(33, 65);
+        const credId = crypto.randomBytes(32);
+        const credIdB64 = toBase64URL(credId);
+        // 挑战+注册整体重试：节点对刚启动时分片选主与预热门（leader warming up /
+        // no leader）会让写请求暂时 503，这是同步层的设计内暂态，不是注册失败。
+        let regOk = false;
+        for (let attempt = 0; attempt < 40 && !regOk; attempt++) {
+            const chRes = await httpPostTo(pair[1].http, '/api/challenge',
+                await buildRequest({ purpose: 'register', userId }));
+            const chParsed = parseAttestationResponse(chRes);
+            if (!(chRes.status === 200 && chParsed && chParsed.data && chParsed.data.challenge)) {
+                await sleepMs(3000);
+                continue;
+            }
+            const regResp = makeWebAuthnRegistrationResponse(chParsed.data.challenge, {
+                credentialId: credId, publicKeyX: pubX, publicKeyY: pubY,
+            });
+            const regRes = await httpPostTo(pair[1].http, '/api/passkey/register/complete',
+                await buildRequest({ userId: chParsed.data.userId, attestationResponse: regResp }));
+            if (regRes.status === 200) { regOk = true; break; }
+            await sleepMs(3000);
+        }
+        if (!regOk) return { registered: false, created: false };
+        const chains = [{ chainId: 1, coinType: 60 }];
+        const intentJson = JSON.stringify({ purpose: 'wallet_create', userId, chains, mnemonicStrength: 128 });
+        let created = false;
+        for (let i = 0; i < 6 && !created; i++) {
+            const cRes = await httpPostTo(pair[0].http, '/api/challenge',
+                await buildRequest({ userId, credentialId: credIdB64, purpose: 'wallet_create' }));
+            const cParsed = parseAttestationResponse(cRes);
+            if (cParsed && cParsed.data && cParsed.data.challenge) {
+                const intentHash = computeIntentHash(cParsed.data.challenge, intentJson);
+                const webauthnSignature = makeWebAuthnSignature(intentHash, {
+                    privateKey: keys.privateKey, credentialId: credId, signCount: i + 1,
+                });
+                const wRes = await httpPostTo(pair[0].http, '/api/wallet/create', await buildRequest({
+                    userId, credentialId: credIdB64, webauthnSignature,
+                    rawChallenge: cParsed.data.challenge, userIntentJson: intentJson,
+                    chains, mnemonicStrength: 128,
+                }));
+                created = wRes.status === 200;
+            }
+            if (!created) await sleepMs(3000);
+        }
+        return { registered: true, created };
+    };
+    try {
+        // —— 用例 1：强制模式拒绝无 quote 证书 ——
+        await setAttestationAllowNonRaTls(false);
+        await bootPair();
+        await sleepMs(15000); // 等连接尝试与验证失败落日志
+        const logs0 = logsOf(pair[0].name);
+        const logs1 = logsOf(pair[1].name);
+        assert(/RA-TLS verification failed|Outbound RA-TLS failed/.test(logs0 + logs1),
+            'ratls gate: quoteless peer cert rejected when mandatory');
+        // 连接被拒 → 节点对无法成形：双节点集合下任何分片都选不出 leader
+        // （严格多数不可达），对端节点写请求 503 no_leader，复制无从发生。
+        // 这是验证门在系统层的可观察后果，与上面的证书级拒绝日志互为印证。
+        let isoNoLeader = false;
+        for (let i = 0; i < 10 && !isoNoLeader; i++) {
+            const isoCh = await httpPostTo(pair[1].http, '/api/challenge',
+                await buildRequest({ purpose: 'register', userId: `ratls-iso-${crypto.randomBytes(4).toString('hex')}` }));
+            if (isoCh.status === 200) break; // 节点对已成形，与强制模式预期相反
+            isoNoLeader = isoCh.status === 503 && JSON.stringify(isoCh.body ?? isoCh).includes('no_leader');
+            if (!isoNoLeader) await sleepMs(3000);
+        }
+        assert(isoNoLeader,
+            'ratls gate: rejected connection leaves pair unformed (no leader, no replication possible)');
+        await stopPair();
+
+        // —— 用例 2：allowNonRaTls 放行且数据真实复制 ——
+        await setAttestationAllowNonRaTls(true);
+        await bootPair();
+        const pos = await registerAndTryCreate('ratls-pos');
+        assert(pos.registered, 'ratls gate: registration works on peer node (allow mode)');
+        assert(pos.created, 'ratls gate: passkey replicated across allowed connection (wallet_create on first node)');
+        await stopPair();
+    } finally {
+        await stopPair();
+        await restoreParams();
+    }
+}
+
+// ============ 合约钉住跨容器持久化（命名卷） ============
+// 钱包数据目录挂命名卷：容器删除后以同一卷起新容器，即使新容器的 env 指向
+// 另一个合约地址，节点也必须以卷中数据库的钉住记录为准（忽略 env 身份），
+// 平台信封按被钉住合约的白名单可用为准入判据。
+async function testContractPinVolume() {
+    console.log('\n--- Contract Pin Persistence (Volume) ---');
+    const contractEnv = loadContractEnv();
+    const dockerHostRpcUrl = contractEnv.rpcUrl.replace('127.0.0.1', '172.17.0.1').replace('localhost', '172.17.0.1');
+    const volume = 'sgx-wallet-pin-test';
+    const p1 = { name: 'test-sgx-enclave-8', http: 3007 };
+    const p2 = { name: 'test-sgx-enclave-9', http: 3008 };
+    const startPinned = (n, syncPort, address) => runScript('start-enclave.sh', [PLATFORM_ADDRESS], {
+        ENCLAVE_CONTAINER: n.name,
+        ENCLAVE_HTTP_PORT: String(n.http),
+        SYNC_LISTEN_PORT: String(syncPort),
+        NODE_ID: `integration-test-node-${n.http}`,
+        SYNC_NODES: '',
+        WALLET_VOLUME: volume,
+        CONTRACT_RPC_URL: dockerHostRpcUrl,
+        CONTRACT_CHAIN_ID: String(contractEnv.chainId),
+        CONTRACT_ADDRESS: address,
+    });
+    const stopNode = (n) => dockerCmd(`docker rm -f ${n.name} 2>/dev/null`);
+    const logsOf = (name) => {
+        try { return execSync(`docker logs ${name} 2>&1`, { stdio: 'pipe', timeout: 10000 }).toString(); }
+        catch { return ''; }
+    };
+    try {
+        dockerCmd(`docker volume rm -f ${volume} 2>/dev/null`);
+        startPinned(p1, 3315, contractEnv.contractAddress);
+        await waitForHTTP(p1.http, '127.0.0.1', 120000);
+        const st1 = await httpPostTo(p1.http, '/api/admin/userId/list', await buildRequest({})).catch(() => null);
+        assert(!!(st1 && st1.status === 200),
+            `pin volume: first container serves with contract identity (${st1 ? 'status=' + st1.status : 'no response'})`);
+        stopNode(p1); // 删容器，卷保留
+
+        const bogusAddress = '0x1111111111111111111111111111111111111111';
+        startPinned(p2, 3316, bogusAddress);
+        await waitForHTTP(p2.http, '127.0.0.1', 120000);
+        assert(/contractAvailable=true/.test(logsOf(p2.name)),
+            'pin volume: new container reports pinned contract available');
+        const st2 = await httpPostTo(p2.http, '/api/admin/userId/list', await buildRequest({})).catch(() => null);
+        assert(!!(st2 && st2.status === 200),
+            `pin volume: pinned identity governs despite bogus env address (${st2 ? 'status=' + st2.status : 'no response'})`);
+        stopNode(p2);
+    } finally {
+        stopNode(p1);
+        stopNode(p2);
+        dockerCmd(`docker volume rm -f ${volume} 2>/dev/null`);
+    }
+}
+
+/**
+ * 合约迁移与身份钉住测试（setMigrationTarget / clearMigrationTarget + ContractPinStore）
+ *
+ * 逻辑（contract-client）：节点每次成功读合约后检查 migrationTarget——目标
+ * （rpcUrl + contractAddress + chainId）与当前身份不同则连接新合约读其数据，
+ * 新合约 runtimeParams 非空即把钉住身份与配置快照切换到新合约并立即生效；
+ * 此后重启时以钉住身份为准，忽略环境变量中的旧合约地址。
+ * 本测试部署第二个合约 B（白名单多一个平台3），在 A 上设置/清除/再设置迁移
+ * 目标，断言：清除往返正确；迁移后平台3 的信封从被拒变为通过（配置已切到 B）；
+ * 主节点重启（stop/start，env 仍指向 A）后平台3 仍通过——身份已被钉住为 B。
+ * 迁移不可逆，本测试放在合约章节最后执行。
+ */
+async function testContractMigrationAndPin() {
+  console.log('\n=== Contract Migration & Pin (setMigrationTarget) ===');
+
+  const contractEnv = loadContractEnv();
+  if (!contractEnv) {
+    skip('migration', 'requires contract deployment (--contract mode)');
+    return;
+  }
+
+  const HARDHAT_OWNER_PRIVKEY = '0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80';
+  const PLATFORM3_ADDRESS = '0x90F79bf6EB2c4f870365E785982E1f101E93b906';
+  const PLATFORM3_PRIVKEY = '0x7c852118294e51e653712a81e05800f419141751be58f605c371e15141b007a6';
+  const dockerHostRpcUrl = contractEnv.rpcUrl.replace('127.0.0.1', '172.17.0.1').replace('localhost', '172.17.0.1');
+
+  const provider = new ethers.JsonRpcProvider(contractEnv.rpcUrl);
+  const ownerWallet = new ethers.Wallet(HARDHAT_OWNER_PRIVKEY, provider);
+  const contractA = new ethers.Contract(contractEnv.contractAddress, WALLET_TRUST_CONTRACT_ABI, ownerWallet);
+  // 本地计数器发号（种子取已上链 nonce）：getNonce('pending') 在部署等大额
+  // 交易刚上链时可能读到旧值，导致后续交易 nonce 重用被拒（实测 NONCE_EXPIRED）。
+  let _nonceCounter = null;
+  const nextNonce = async () => {
+    if (_nonceCounter === null) _nonceCounter = await ownerWallet.getNonce('latest');
+    return _nonceCounter++;
+  };
+
+  const buildRequestWithKey = async (privKey, payloadObj) => {
+    const payload = JSON.stringify(payloadObj);
+    const platformSignature = await new ethers.Wallet(privKey).signMessage(payload);
+    return { payload, platformSignature };
+  };
+  const platform3ListStatus = async () => {
+    const res = await httpPost('/api/admin/userId/list', await buildRequestWithKey(PLATFORM3_PRIVKEY, {}));
+    return res.status;
+  };
+  const mainLogsTail = () => {
+    try { return execSync(`docker logs ${ENCLAVE_CONTAINER} 2>&1`, { stdio: 'pipe', timeout: 10000 }).toString(); }
+    catch { return ''; }
+  };
+
+  // 主节点可能已在 NTP 章节的运行中重校准失败后退出——按需拉回
+  try {
+    await httpPost('/api/enclave/info', await buildRequest({}));
+  } catch { /* 连接失败走下面的拉回路径 */ }
+  let mainUp = false;
+  try {
+    const probe = await httpPost('/api/enclave/info', await buildRequest({}));
+    mainUp = probe.status === 200;
+  } catch { mainUp = false; }
+  if (!mainUp) {
+    console.log('  [info] main enclave not responding — starting it (post-NTP exit recovery)');
+    dockerCmd(`docker start ${ENCLAVE_CONTAINER} 2>/dev/null`);
+    await waitForHTTP(ENCLAVE_HTTP_PORT, '127.0.0.1', 120000);
+  }
+
+  // ---- 部署合约 B 并初始化（白名单 = 平台 + 平台3） ----
+  const artifactPath = path.join(__dirname, '..', 'contracts', 'artifacts', 'contracts', 'WalletTrustContract.sol', 'WalletTrustContract.json');
+  const artifact = JSON.parse(fs.readFileSync(artifactPath, 'utf8'));
+  const factory = new ethers.ContractFactory(artifact.abi, artifact.bytecode, ownerWallet);
+  const contractB = await factory.deploy({ nonce: await nextNonce() });
+  await contractB.waitForDeployment();
+  const addressB = await contractB.getAddress();
+  console.log(`  [info] contract B deployed at ${addressB}`);
+  const baseParams = JSON.stringify({
+    session: { importTtlSeconds: 300, exportTtlSeconds: 86400 },
+    cache: { refreshInterval: 5000 },
+  });
+  await (await contractB.updateRuntimeParams(baseParams, { nonce: await nextNonce() })).wait();
+  await (await contractB.addPlatformAddress(PLATFORM_ADDRESS, { nonce: await nextNonce() })).wait();
+  await (await contractB.addPlatformAddress(PLATFORM3_ADDRESS, { nonce: await nextNonce() })).wait();
+
+  // ---- 迁移前：平台3 不在 A 的白名单 → 被拒 ----
+  assert((await platform3ListStatus()) !== 200, 'migration: platform3 rejected before migration (not on A whitelist)');
+
+  // ---- set/clear 往返 ----
+  await (await contractA.setMigrationTarget(dockerHostRpcUrl, addressB, contractEnv.chainId, '', { nonce: await nextNonce() })).wait();
+  const target = await contractA.getMigrationTarget();
+  assert(target[0] === dockerHostRpcUrl && target[1].toLowerCase() === addressB.toLowerCase() && Number(target[2]) === contractEnv.chainId,
+    'migration: setMigrationTarget/getMigrationTarget round-trip');
+  await (await contractA.clearMigrationTarget({ nonce: await nextNonce() })).wait();
+  const cleared = await contractA.getMigrationTarget();
+  assert(!cleared[1] || cleared[1] === '0x0000000000000000000000000000000000000000' || cleared[1] === '',
+    'migration: clearMigrationTarget empties the target');
+
+  // ---- 正式设置迁移目标 → 主节点在刷新周期内切换到 B ----
+  await (await contractA.setMigrationTarget(dockerHostRpcUrl, addressB, contractEnv.chainId, '', { nonce: await nextNonce() })).wait();
+  let migrated = false;
+  for (let i = 0; i < 12 && !migrated; i++) {
+    migrated = (await platform3ListStatus()) === 200;
+    if (!migrated) await new Promise((r) => setTimeout(r, 5000));
+  }
+  assert(mainLogsTail().includes('migration target detected'), 'migration: node logs migration target detection');
+  assert(migrated, 'migration: platform3 accepted after migration (node now follows contract B)');
+
+  // ---- 重启主节点（stop/start 同一容器，env 仍指向 A）→ 钉住身份 B 生效 ----
+  execSync(`docker stop ${ENCLAVE_CONTAINER}`, { stdio: 'pipe', timeout: 60000 });
+  execSync(`docker start ${ENCLAVE_CONTAINER}`, { stdio: 'pipe', timeout: 10000 });
+  await waitForHTTP(ENCLAVE_HTTP_PORT, '127.0.0.1', 120000);
+  assert((await platform3ListStatus()) === 200,
+    'pin: after restart node still follows pinned contract B, ignoring env contract A');
 }
 
 // ============================================================
@@ -3759,6 +4606,7 @@ async function main() {
     await testEvidenceGet();
     await testEvidenceList();
     await testAuthStatus();
+    await testAuthRevocationEndpoints();
     await testWalletEntryDelete();
     await testWalletDelete();
     await testPasskeyDelete();
@@ -3777,6 +4625,12 @@ async function main() {
       await testPasskeyRecovery();
       await testEmergencyAuthorization();
       await testMultiNodeSync();
+      await testCodeIntegrity();
+      await testRpcTlsCaCert();
+      await testRaTlsGate();
+      await testContractPinVolume();
+      await testContractMigrationAndPin();
+      await testNtpCalibration();
     }
 
     // Dump enclave logs after API tests for debugging

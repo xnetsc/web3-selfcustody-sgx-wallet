@@ -81,7 +81,14 @@ COMMON_ENVS=(
     -e "SYNC_LISTEN_PORT=${SYNC_LISTEN_PORT_INSIDE:-3307}"
     -e "SYNC_ADVERTISED_URL=${SYNC_ADVERTISED_URL:-}"
     -e "NODE_ID=${NODE_ID:-}"
+    -e "RATLS_CERT_PATH=${RATLS_CERT_PATH:-}"
 )
+
+# 可选：钱包数据目录使用命名卷（跨容器持久化，合约钉住等测试用）
+VOLUME_ARGS=()
+if [ -n "${WALLET_VOLUME:-}" ]; then
+    VOLUME_ARGS=(-v "$WALLET_VOLUME:/app/sgx-enclave/wallet")
+fi
 
 if [ "$SGX_MODE" = "direct" ] || [ "$SGX_MODE" = "sim" ]; then
     # Direct/simulation mode — no SGX devices needed
@@ -89,6 +96,7 @@ if [ "$SGX_MODE" = "direct" ] || [ "$SGX_MODE" = "sim" ]; then
         --name "$ENCLAVE_CONTAINER" \
         --network "$DOCKER_NETWORK" \
         "${COMMON_ENVS[@]}" \
+        "${VOLUME_ARGS[@]}" \
         -p "${ENCLAVE_HTTP_PORT}:3000" \
         -p "${SYNC_LISTEN_PORT}:3307" \
         --security-opt seccomp=unconfined \
@@ -102,6 +110,7 @@ else
         --name "$ENCLAVE_CONTAINER" \
         --network "$DOCKER_NETWORK" \
         "${COMMON_ENVS[@]}" \
+        "${VOLUME_ARGS[@]}" \
         --device /dev/sgx_enclave \
         --device /dev/sgx_provision \
         -p "${ENCLAVE_HTTP_PORT}:3000" \

@@ -20,6 +20,23 @@ import { ALL_TABLE_SQLS } from '../sgx-enclave/src/database/schema.js';
 const require_fn = createRequire(import.meta.url);
 const Database = require_fn('../sgx-enclave/node_modules/better-sqlite3');
 
+// 同步明文 WS 已禁止：测试节点统一用桩生成的普通自签证书走 WSS
+// （produceQuote 返回 null，与启动器在非 SGX 环境的生成方式一致）。
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { generateRaTlsCertificate } from '../sgx-enclave/node_modules/@xnetx/sgx-ra-tls-verify/index.mjs';
+
+const testCert = await generateRaTlsCertificate({
+    produceQuote: async () => null,
+    subjectCommonName: 'SGX RA-TLS',
+    validityDays: 365,
+});
+const testCertPath = path.join(os.tmpdir(), 'ratls-p2p-suite-cert.pem');
+fs.writeFileSync(testCertPath, testCert.certPem);
+const TEST_RATLS_OPTIONS = { certPath: testCertPath, keyPem: testCert.keyPem, allowNonRaTls: true };
+
+
 // 缩短广播间隔以加速测试（覆盖模块常量不可行，直接手动触发广播）
 
 function createDb() {
@@ -56,9 +73,10 @@ function createNode(name, port, peerUrls) {
         hlc,
         peerUrls,
         listenPort: port,
-        advertisedUrl: 'ws://127.0.0.1:' + port, // 显式自报地址
+        advertisedUrl: 'wss://127.0.0.1:' + port, // 显式自报地址
         contractClient: createMockContractClient(),
         getMinQuorum: () => 1,
+        raTlsOptions: TEST_RATLS_OPTIONS,
     });
     return { name, mgr, db };
 }
@@ -69,9 +87,9 @@ async function main() {
     console.log('=== P2P 发现端到端测试（真实 SyncManager）===\n');
 
     // 拓扑：A → B ← C（B 无任何配置）
-    const nodeA = createNode('nodeA', 3311, ['ws://127.0.0.1:3312']);
+    const nodeA = createNode('nodeA', 3311, ['wss://127.0.0.1:3312']);
     const nodeB = createNode('nodeB', 3312, []);
-    const nodeC = createNode('nodeC', 3313, ['ws://127.0.0.1:3312']);
+    const nodeC = createNode('nodeC', 3313, ['wss://127.0.0.1:3312']);
 
     await nodeA.mgr.start();
     await nodeB.mgr.start();
@@ -86,8 +104,8 @@ async function main() {
     assert(bKnown.has('nodeA'), 'B should learn nodeA via pin-check self-advertisement');
     assert(bKnown.has('nodeC'), 'B should learn nodeC via pin-check self-advertisement');
     // 地址簿为多地址候选集（nodeId → urls 数组），自报地址在首位
-    assert.deepEqual(bKnown.get('nodeA'), ['ws://127.0.0.1:3311']);
-    assert.deepEqual(bKnown.get('nodeC'), ['ws://127.0.0.1:3313']);
+    assert.deepEqual(bKnown.get('nodeA'), ['wss://127.0.0.1:3311']);
+    assert.deepEqual(bKnown.get('nodeC'), ['wss://127.0.0.1:3313']);
     console.log('✓ 验证 1 通过：入站方通过 pin-check 自报学到可连接地址\n');
 
     // 验证 2：手动触发 B 广播 peers-list，A 和 C 应互相发现并连接

@@ -214,6 +214,9 @@ const nextNonce = () => nonce++;
 const runtimeParams = JSON.stringify({
     session: { importTtlSeconds: 300, exportTtlSeconds: 86400 },
     cache: { refreshInterval: 5000 },
+    // 测试部署为 direct 模式：节点证书无 SGX quote，同步互连须允许非 RA-TLS 证书；
+    // RA-TLS 强制模式的行为由集成测试的 RA-TLS 章节单独改参数验证。
+    attestation: { allowNonRaTls: true },
 });
 const tx1 = await contract.updateRuntimeParams(runtimeParams, { nonce: nextNonce() });
 await tx1.wait();
