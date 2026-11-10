@@ -346,7 +346,10 @@ export class EmergencyAuthorizer {
   async recordExecution(verifyResult, { platformAddress, userId, operation, executionIndex, detail = {}, outcome = {} }) {
     return this._state.appendExecutionLog({
       authorizationId: verifyResult.auth.authorizationId,
-      authHash: verifyResult.authHash,
+      // 日志 authHash 与合约记录统一为 0x hex 表示（verify 的 authHash 是
+      // WebAuthn challenge 的 base64url 编码，是同一哈希的另一种表示；
+      // 公开日志要与链上记录互证，必须同表示）
+      authHash: '0x' + Buffer.from(verifyResult.authHash, 'base64url').toString('hex'),
       operatorUserId: verifyResult.auth.operatorUserId,
       operatorPubKeyHash: verifyResult.operatorPubKeyHash,
       platformAddress,

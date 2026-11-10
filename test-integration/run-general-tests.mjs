@@ -102,6 +102,13 @@ const WALLET_TRUST_CONTRACT_ABI = [
   'function removePasskeyRecovery(string calldata _userId, bytes32 _newPubKeyHash) external',
   'function getPasskeyRecovery(string calldata _userId, bytes32 _newPubKeyHash) external view returns (bytes32 oldPubKeyHash, string uuid, string memo, uint256 createdAt)',
   'function passkeyRecoveryExists(string calldata _userId, bytes32 _newPubKeyHash) external view returns (bool)',
+  // 应急授权（运营方治理）
+  'function designateGovernancePasskey(string calldata _userId, bytes32 _pubKeyHash) external',
+  'function removeGovernancePasskey(string calldata _userId, bytes32 _pubKeyHash) external',
+  'function isGovernancePasskey(string calldata _userId, bytes32 _pubKeyHash) external view returns (bool)',
+  'function setEmergencyAuthorization(string calldata _authorizationId, string calldata _authorizationJson, string calldata _signatureJson, string calldata _operatorUserId, bytes32 _operatorPubKeyHash, address _grantee, uint256 _expiresAt) external',
+  'function revokeEmergencyAuthorization(string calldata _authorizationId) external',
+  'function getEmergencyAuthorization(string calldata _authorizationId) external view returns (string, string, bytes32, string, bytes32, address, uint256, uint256, bool, bool)',
   // 事件
   'event CodeRepositoryUpdated(string codeRepository)',
   'event RuntimeParamsUpdated(string runtimeParams)',
@@ -3264,6 +3271,309 @@ async function testAccountFreezeNoFreezeNewUser() {
   console.log(`  [info] New user ${newUserId} registered without freeze`);
 }
 
+/**
+ * 应急授权（运营方治理）端到端测试
+ *
+ * 测试内容：
+ *   - 运营方以普通账户 Passkey 注册（独立 P-256 密钥）
+ *   - Owner 在合约上指定该 Passkey 为治理 Passkey
+ *   - 治理方签署授权原文（challenge = sha256(授权原文)），授权全文上链存档
+ *   - 递进文本与链上存档不一致（改一字节）→ SGX 拒绝
+ *   - 平台信封 + 应急授权代替目标用户签名执行 wallet_create，响应带执行日志
+ *   - 执行日志公开查询（无鉴权）可查到该条目且 authHash 与授权原文一致
+ *   - Owner 在合约上撤销授权 → 再次执行被 SGX 拒绝
+ */
+async function testEmergencyAuthorization() {
+  console.log('\n=== Emergency Authorization (governance, end-to-end) ===');
+
+  const contractEnv = loadContractEnv();
+  if (!contractEnv) {
+    skip('contract/emergency', 'no .env.contract file (run setup-contract.sh first)');
+    return;
+  }
+
+  const provider = new ethers.JsonRpcProvider(contractEnv.rpcUrl);
+  const HARDHAT_OWNER_PRIVKEY = '0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80';
+  const ownerSigner = new ethers.Wallet(HARDHAT_OWNER_PRIVKEY, provider);
+  await provider.getBlockNumber();
+  let ownerNonce = await provider.getTransactionCount(ownerSigner.address, 'latest');
+  const getOwnerNonce = () => ownerNonce++;
+  const contract = new ethers.Contract(contractEnv.contractAddress, WALLET_TRUST_CONTRACT_ABI, ownerSigner);
+
+  // ---- 运营方 Passkey（独立密钥的普通账户） ----
+  const opUserId = `ops-gov-${crypto.randomBytes(4).toString('hex')}`;
+  const opKeys = crypto.generateKeyPairSync('ec', { namedCurve: 'P-256' });
+  const opDer = opKeys.publicKey.export({ type: 'spki', format: 'der' });
+  const opPoint = opDer.subarray(26);
+  const opX = opPoint.subarray(1, 33);
+  const opY = opPoint.subarray(33, 65);
+  const opCredId = crypto.randomBytes(32);
+  const opCredIdB64 = toBase64URL(opCredId);
+  const opCose = cborEncode(new Map([[1, 2], [3, -7], [-1, 1], [-2, opX], [-3, opY]]));
+  const opPubKeyHash = '0x' + crypto.createHash('sha256').update(opCose).digest('hex');
+
+  const chRes = await httpPost('/api/challenge', await buildRequest({ purpose: 'register', userId: opUserId }));
+  const chParsed = parseAttestationResponse(chRes);
+  assert(chRes.status === 200 && !!(chParsed && chParsed.data && chParsed.data.challenge), 'emergency: operator register challenge issued');
+  if (!chParsed || !chParsed.data || !chParsed.data.challenge) { provider.destroy(); return; }
+
+  const regResp = makeWebAuthnRegistrationResponse(chParsed.data.challenge, {
+    credentialId: opCredId, publicKeyX: opX, publicKeyY: opY,
+  });
+  const regRes = await httpPost('/api/passkey/register/complete', await buildRequest({
+    userId: chParsed.data.userId, attestationResponse: regResp,
+  }));
+  const regParsed = parseAttestationResponse(regRes);
+  assert(regRes.status === 200 && !!regParsed && !!regParsed.data && regParsed.data.credentialId === opCredIdB64,
+    'emergency: operator passkey registered');
+
+  // ---- 链上指定治理 Passkey + 授权全文存档 ----
+  const txDes = await contract.designateGovernancePasskey(opUserId, opPubKeyHash, { nonce: getOwnerNonce() });
+  await txDes.wait();
+  assert(await contract.isGovernancePasskey(opUserId, opPubKeyHash), 'emergency: governance passkey designated on contract');
+
+  const victim1 = `emg-victim-${crypto.randomBytes(4).toString('hex')}`;
+  const victim2 = `emg-victim2-${crypto.randomBytes(4).toString('hex')}`;
+  const deadlineMs = Math.floor((Date.now() + 3600_000) / 1000) * 1000;
+  const authObj = {
+    authorizationId: `emg-${crypto.randomBytes(6).toString('hex')}`,
+    type: 'emergency',
+    operatorUserId: opUserId,
+    operatorCredentialId: opCredIdB64,
+    grantee: PLATFORM_ADDRESS,
+    wallets: [
+      { userId: victim1, policy: { operations: { wallet_create: { chains: [1] } } } },
+      { userId: victim2, policy: { operations: { wallet_create: { chains: [1] } } } },
+    ],
+    timePolicy: { deadline: new Date(deadlineMs).toISOString() },
+    createdAt: '2026-11-10T00:00:00.000Z',
+  };
+  const authText = JSON.stringify(authObj);
+  const authHash = crypto.createHash('sha256').update(authText, 'utf8').digest();
+  const emergencySignature = makeWebAuthnSignature(toBase64URL(authHash), {
+    privateKey: opKeys.privateKey, credentialId: opCredId, signCount: 1,
+  });
+
+  const txSet = await contract.setEmergencyAuthorization(
+    authObj.authorizationId, authText, JSON.stringify(emergencySignature),
+    opUserId, opPubKeyHash, PLATFORM_ADDRESS, Math.floor(deadlineMs / 1000),
+    { nonce: getOwnerNonce() },
+  );
+  await txSet.wait();
+  const record = await contract.getEmergencyAuthorization(authObj.authorizationId);
+  assert(record[9] === true && record[2].toLowerCase() === '0x' + authHash.toString('hex'),
+    'emergency: authorization stored on contract, authHash matches sha256(text)');
+
+  // ---- 负控制：递进文本被改动 → 拒绝 ----
+  const badRes = await httpPost('/api/wallet/create', await buildRequest({
+    userId: victim1,
+    chains: [{ chainId: 1, coinType: 60 }],
+    emergencyAuthorizationJson: authText + ' ',
+    emergencySignature,
+  }));
+  assert(badRes.status !== 200, 'emergency: tampered authorization text rejected');
+
+  // ---- 正向执行：应急授权代替用户签名建钱包 ----
+  const createRes = await httpPost('/api/wallet/create', await buildRequest({
+    userId: victim1,
+    chains: [{ chainId: 1, coinType: 60 }],
+    emergencyAuthorizationJson: authText,
+    emergencySignature,
+  }));
+  const createParsed = parseAttestationResponse(createRes);
+  assert(createRes.status === 200 && !!createParsed && !!createParsed.data && !!createParsed.data.walletId,
+    'emergency: wallet_create executed under emergency authorization');
+  assert(!!createParsed && !!createParsed.data && !!createParsed.data.executionLog && !!createParsed.data.executionLog.entryHash,
+    'emergency: create response carries execution log entry');
+
+  // ---- 公开执行日志查询 ----
+  const qRes = await httpPost('/api/emergency/execution-log/query', {
+    authorizationId: authObj.authorizationId, pageSize: 10,
+  });
+  const qParsed = parseAttestationResponse(qRes);
+  const logs = (qParsed && qParsed.data && qParsed.data.logs) || [];
+  const entry = logs.find((l) => !!createParsed && !!createParsed.data && !!createParsed.data.executionLog && l.entryHash === createParsed.data.executionLog.entryHash);
+  assert(!!entry && entry.operation === 'wallet_create' && entry.targetUserId === victim1 &&
+    entry.authHash.toLowerCase() === '0x' + authHash.toString('hex'),
+    'emergency: execution log entry publicly queryable and matches the authorization');
+  // 供多节点同步测试跨节点核对同一条日志
+  state.emergencyAuthorizationId = authObj.authorizationId;
+  state.emergencyEntryHash = createParsed && createParsed.data && createParsed.data.executionLog
+    ? createParsed.data.executionLog.entryHash : null;
+
+  // ---- 链上撤销 → 再执行被拒 ----
+  const txRev = await contract.revokeEmergencyAuthorization(authObj.authorizationId, { nonce: getOwnerNonce() });
+  await txRev.wait();
+  const afterRes = await httpPost('/api/wallet/create', await buildRequest({
+    userId: victim2,
+    chains: [{ chainId: 1, coinType: 60 }],
+    emergencyAuthorizationJson: authText,
+    emergencySignature,
+  }));
+  assert(afterRes.status !== 200 && /revoked/i.test(JSON.stringify(afterRes.body)),
+    'emergency: execution rejected after on-chain revocation');
+
+  provider.destroy();
+}
+
+/** 指定端口的 POST（多节点测试用；httpPost 固定主节点端口） */
+function httpPostTo(port, apiPath, body) {
+  return new Promise((resolve, reject) => {
+    const data = JSON.stringify(body);
+    const req = http.request({
+      hostname: '127.0.0.1',
+      port,
+      path: apiPath,
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data) },
+    }, (res) => {
+      let chunks = '';
+      res.on('data', (c) => (chunks += c));
+      res.on('end', () => {
+        let parsed;
+        try { parsed = JSON.parse(chunks); } catch { parsed = chunks; }
+        resolve({ status: res.statusCode, body: parsed });
+      });
+    });
+    req.on('error', reject);
+    req.write(data);
+    req.end();
+  });
+}
+
+/**
+ * 多节点同步测试（第二个 enclave 节点由 start-enclave.sh 以独立容器名/端口拉起）
+ *
+ * 覆盖近期的同步类功能在真实进程间的行为：
+ *   - 节点发现/互连：B 经 SYNC_NODES 拨号 A，日志可见连接建立
+ *   - 数据同步复制：在 B 注册的用户 Passkey 同步到 A 后，可在 A 验签建钱包
+ *     （写经分片 leader 执行、条目经同步流复制，最终一致，断言带重试窗口）
+ *   - 应急执行日志跨节点同步：主节点产生的日志条目可在 B 的公开查询读到，
+ *     且三节点视角的 latestEntryHash 一致
+ */
+async function testMultiNodeSync() {
+  console.log('\n=== Multi-Node Sync (second enclave node) ===');
+
+  const contractEnv = loadContractEnv();
+  if (!contractEnv || !state.emergencyAuthorizationId || !state.emergencyEntryHash) {
+    skip('sync/multi-node', 'requires contract + emergency section state');
+    return;
+  }
+
+  const NODE_B = 'test-sgx-enclave-2';
+  const NODE_B_HTTP = 3001;
+  let sectionCompleted = false;
+  const dockerHostRpcUrl = contractEnv.rpcUrl.replace('127.0.0.1', '172.17.0.1').replace('localhost', '172.17.0.1');
+  try {
+    // 前序合约管理测试已把 codeRepository 设为测试仓库地址；新节点启动时会据此做
+    // 代码完整性验证、在假仓库下拒绝启动（主节点启动时该值为空、跳过验证）。
+    // 先由 owner 清空，再拉起第二节点。
+    {
+      const { ethers } = await import('ethers');
+      const HARDHAT_OWNER_PRIVKEY = '0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80';
+      const provider = new ethers.JsonRpcProvider(contractEnv.rpcUrl);
+      const ownerWallet = new ethers.Wallet(HARDHAT_OWNER_PRIVKEY, provider);
+      const contract = new ethers.Contract(contractEnv.contractAddress, WALLET_TRUST_CONTRACT_ABI, ownerWallet);
+      const tx = await contract.updateCodeRepository('', { nonce: await ownerWallet.getNonce('pending') });
+      await tx.wait();
+      console.log('  [info] codeRepository cleared so node B skips code-integrity verification at boot');
+    }
+    runScript('start-enclave.sh', [PLATFORM_ADDRESS], {
+      ENCLAVE_CONTAINER: NODE_B,
+      ENCLAVE_HTTP_PORT: String(NODE_B_HTTP),
+      SYNC_LISTEN_PORT: '3308',
+      NODE_ID: 'integration-test-node-2',
+      SYNC_NODES: 'ws://172.17.0.1:3307',
+      SYNC_ADVERTISED_URL: 'ws://172.17.0.1:3308',
+      CONTRACT_RPC_URL: dockerHostRpcUrl,
+      CONTRACT_CHAIN_ID: String(contractEnv.chainId),
+      CONTRACT_ADDRESS: contractEnv.contractAddress,
+    });
+    await waitForHTTP(NODE_B_HTTP, '127.0.0.1', 120000);
+    console.log('  [info] second node HTTP ready');
+
+    // ---- 互连：B 的日志应出现与 A 的连接 ----
+    let connected = false;
+    for (let i = 0; i < 12 && !connected; i++) {
+      const logs = execSync(`docker logs ${NODE_B} 2>&1`, { stdio: 'pipe', timeout: 5000 }).toString();
+      connected = logs.includes('Connected to peer');
+      if (!connected) await new Promise((r) => setTimeout(r, 5000));
+    }
+    assert(connected, 'sync: node B connected to node A via SYNC_NODES bootstrap');
+
+    // ---- 在 B 注册新用户（独立密钥），其 Passkey 行同步到 A ----
+    const userId = `sync-user-${crypto.randomBytes(4).toString('hex')}`;
+    const keys = crypto.generateKeyPairSync('ec', { namedCurve: 'P-256' });
+    const der = keys.publicKey.export({ type: 'spki', format: 'der' });
+    const point = der.subarray(26);
+    const pubX = point.subarray(1, 33);
+    const pubY = point.subarray(33, 65);
+    const credId = crypto.randomBytes(32);
+    const credIdB64 = toBase64URL(credId);
+
+    const chRes = await httpPostTo(NODE_B_HTTP, '/api/challenge', await buildRequest({ purpose: 'register', userId }));
+    const chParsed = parseAttestationResponse(chRes);
+    assert(chRes.status === 200 && !!(chParsed && chParsed.data && chParsed.data.challenge), 'sync: register challenge issued on node B');
+    const regResp = makeWebAuthnRegistrationResponse(chParsed.data.challenge, {
+      credentialId: credId, publicKeyX: pubX, publicKeyY: pubY,
+    });
+    const regRes = await httpPostTo(NODE_B_HTTP, '/api/passkey/register/complete', await buildRequest({
+      userId: chParsed.data.userId, attestationResponse: regResp,
+    }));
+    assert(regRes.status === 200, 'sync: user registered on node B');
+
+    // ---- 在 A 用该用户的密钥签名建钱包：A 必须已同步到其 Passkey 才能验签 ----
+    const chains = [{ chainId: 1, coinType: 60 }];
+    const intentJson = JSON.stringify({ purpose: 'wallet_create', userId, chains, mnemonicStrength: 128 });
+    let created = false;
+    let lastStatus = 0;
+    for (let i = 0; i < 10 && !created; i++) {
+      const cRes = await httpPost('/api/challenge', await buildRequest({ userId, credentialId: credIdB64, purpose: 'wallet_create' }));
+      const cParsed = parseAttestationResponse(cRes);
+      if (cParsed && cParsed.data && cParsed.data.challenge) {
+        const intentHash = computeIntentHash(cParsed.data.challenge, intentJson);
+        const webauthnSignature = makeWebAuthnSignature(intentHash, {
+          privateKey: keys.privateKey, credentialId: credId, signCount: i + 1,
+        });
+        const wRes = await httpPost('/api/wallet/create', await buildRequest({
+          userId, credentialId: credIdB64, webauthnSignature,
+          rawChallenge: cParsed.data.challenge, userIntentJson: intentJson,
+          chains, mnemonicStrength: 128,
+        }));
+        lastStatus = wRes.status;
+        created = wRes.status === 200;
+      }
+      if (!created) await new Promise((r) => setTimeout(r, 3000));
+    }
+    assert(created, `sync: wallet_create on node A verifies passkey registered on node B (replicated) — last status ${lastStatus}`);
+
+    // ---- 应急执行日志跨节点：B 的公开查询应读到主节点产生的条目 ----
+    let foundOnB = false;
+    let latestOnB = null;
+    for (let i = 0; i < 10 && !foundOnB; i++) {
+      const qRes = await httpPostTo(NODE_B_HTTP, '/api/emergency/execution-log/query', {
+        authorizationId: state.emergencyAuthorizationId, pageSize: 10,
+      });
+      const qParsed = parseAttestationResponse(qRes);
+      const logsOnB = (qParsed && qParsed.data && qParsed.data.logs) || [];
+      latestOnB = qParsed && qParsed.data ? qParsed.data.latestEntryHash : null;
+      foundOnB = logsOnB.some((l) => l.entryHash === state.emergencyEntryHash);
+      if (!foundOnB) await new Promise((r) => setTimeout(r, 3000));
+    }
+    assert(foundOnB, 'sync: emergency execution log entry replicated to node B public query');
+    assert(latestOnB === state.emergencyEntryHash, 'sync: latestEntryHash on node B equals the entry written on node A');
+    sectionCompleted = true;
+  } finally {
+    if (!sectionCompleted) {
+      try {
+        const blog = execSync(`docker logs ${NODE_B} 2>&1`, { stdio: 'pipe', timeout: 10000 }).toString();
+        console.log(`\n--- ${NODE_B} logs (last 80 lines, section incomplete) ---\n${blog.split('\n').slice(-80).join('\n')}`);
+      } catch { /* 容器日志不可得时不掩盖原始失败 */ }
+    }
+    dockerCmd(`docker rm -f ${NODE_B} 2>/dev/null`);
+  }
+}
+
 // ============================================================
 // 9. Main
 // ============================================================
@@ -3465,6 +3775,8 @@ async function main() {
     if (RUN_CONTRACT_TESTS) {
       await testContractTeeCollaboration();
       await testPasskeyRecovery();
+      await testEmergencyAuthorization();
+      await testMultiNodeSync();
     }
 
     // Dump enclave logs after API tests for debugging

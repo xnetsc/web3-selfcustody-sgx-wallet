@@ -628,7 +628,9 @@ test('execution-log: 应急操作返回当前日志条目，字段可对着授�
   assert.match(log.entryHash, /^0x[0-9a-f]{64}$/);
   assert.equal(log.authorizationId, auth.authorizationId);
   // authHash 必须等于对授权 JSON 原文重算的哈希——用户拿着授权 JSON 即可验证
-  assert.equal(log.authHash, computeAuthorizationHash(json));
+  // 表示与合约记录统一为 0x hex（computeAuthorizationHash 返回的是同一哈希的 base64url 编码）
+  assert.equal(log.authHash, '0x' + crypto.createHash('sha256').update(json, 'utf8').digest('hex'));
+  assert.equal(Buffer.from(computeAuthorizationHash(json), 'base64url').toString('hex'), log.authHash.slice(2));
   assert.equal(log.operatorUserId, OPERATOR);
   assert.equal(log.operatorPubKeyHash, OPERATOR_PUBKEY_HASH);
   assert.equal(log.platformAddress, PLATFORM);
