@@ -403,6 +403,11 @@ class LazyConnectionManager {
         return this._inner.getDatabase();
     }
 
+    getReadDatabase() {
+        this._ensureReady();
+        return this._inner.getReadDatabase();
+    }
+
     trapRawDatabases() {
         this._ensureReady();
         return this._inner.trapRawDatabases();
