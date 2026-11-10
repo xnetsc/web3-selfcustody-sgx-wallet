@@ -316,7 +316,7 @@ export class EmergencyAuthorizer {
     const authorizedUserIds = auth.wallets
       .filter((w) => getOperationPolicy(w, operation) !== null)
       .map((w) => w.userId);
-    return { approved: true, auth, walletEntry, opPolicy, operatorPubKeyHash, authorizedUserIds };
+    return { approved: true, auth, walletEntry, opPolicy, operatorPubKeyHash, authorizedUserIds, authHash: expectedChallenge };
   }
 
   /**
@@ -324,8 +324,37 @@ export class EmergencyAuthorizer {
    * @param {Object} auth - 已验签的授权对象
    * @param {string} userId - 目标用户
    * @param {string} operation
+   * @returns {Promise<number>} 递增后的已用次数（即本次的 executionIndex）
    */
   async recordUse(auth, userId, operation) {
     return this._state.recordEmergencyUse(auth.authorizationId, userId, operation);
+  }
+
+  /**
+   * 操作成功后追加一条执行日志，返回完整条目（handler 把它放进响应，
+   * 响应整体经 wrap 注入 attestation quote，条目哈希即成为度量材料）
+   * @param {Object} verifyResult - verify() 的批准结果（取 auth/authHash/治理公钥哈希）
+   * @param {Object} args
+   * @param {string} args.platformAddress - 执行平台地址（信封恢复）
+   * @param {string} args.userId - 目标用户
+   * @param {string} args.operation
+   * @param {number} args.executionIndex - 本次是该 (授权,用户,操作) 的第几次执行
+   * @param {Object} [args.detail] - 非敏感摘要（严禁私钥/助记词/加密载荷/签名）
+   * @param {Object} [args.outcome] - 结果摘要（如 txHash、walletId、计数）
+   * @returns {Promise<Object>} 完整日志条目（含 logId、prevHash、entryHash）
+   */
+  async recordExecution(verifyResult, { platformAddress, userId, operation, executionIndex, detail = {}, outcome = {} }) {
+    return this._state.appendExecutionLog({
+      authorizationId: verifyResult.auth.authorizationId,
+      authHash: verifyResult.authHash,
+      operatorUserId: verifyResult.auth.operatorUserId,
+      operatorPubKeyHash: verifyResult.operatorPubKeyHash,
+      platformAddress,
+      targetUserId: userId,
+      operation,
+      executionIndex,
+      detail,
+      outcome,
+    });
   }
 }

@@ -10,3 +10,9 @@ export {
   normalizeOperationEntry,
   EMERGENCY_OPERATIONS,
 } from './emergency-authorization-parser.js';
+export {
+  GENESIS_PREV_HASH,
+  EXECUTION_LOG_HASH_FIELDS,
+  computeExecutionLogHash,
+  verifyExecutionLogChain,
+} from './execution-log.js';

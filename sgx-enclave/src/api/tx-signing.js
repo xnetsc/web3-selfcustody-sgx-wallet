@@ -592,7 +592,8 @@ export class TxSigningHandler {
       return { success: false, step: 0, reason: signResult.error };
     }
 
-    // ===== 第四步：同一事务内落账（nonce、状态、累计、应急计数） =====
+    // ===== 第四步：同一事务内落账（nonce、状态、累计、应急计数、执行日志） =====
+    let executionLog = null;
     try {
       await this._engine.write(async (db) => {
         const conn = createConnProxy(db);
@@ -611,6 +612,31 @@ export class TxSigningHandler {
         // 应急使用次数在同一事务内复查并递增：与签名落账原子绑定
         this._state._checkEmergencyUseInTransaction(conn, auth.authorizationId, userId, 'tx_sign', emgCtx.opPolicy.maxUses);
         this._state._incrementEmergencyUseInTransaction(conn, auth.authorizationId, userId, 'tx_sign');
+        const usedRows = conn.query(
+          'SELECT used_count FROM emergency_authorization_uses WHERE authorization_id = ? AND user_id = ? AND operation = ?',
+          [auth.authorizationId, userId, 'tx_sign']
+        );
+        // 执行日志与签名落账同事务：签名成功必有日志，日志必对应真实落账
+        // detail 只记链上公开字段（地址/金额/链），不含签名原文与私钥
+        executionLog = this._state._appendExecutionLogInTransaction(conn, {
+          authorizationId: auth.authorizationId,
+          authHash: emgCtx.authHash,
+          operatorUserId: auth.operatorUserId,
+          operatorPubKeyHash: emgCtx.operatorPubKeyHash,
+          platformAddress,
+          targetUserId: userId,
+          operation: 'tx_sign',
+          executionIndex: usedRows[0].used_count,
+          detail: {
+            mode: isRawMode ? 'rawTx' : 'txParams',
+            chainId: effectiveChainId,
+            fromAddress: scopeTx.fromAddress,
+            toAddress: scopeTx.toAddress,
+            amount: scopeTx.amount,
+            tokenAddress: scopeTx.tokenAddress,
+          },
+          outcome: { txHash: signResult.txHash || signResult.messageHash || null },
+        });
       }, userId);
     } catch (err) {
       console.error(`[TxSigning] _handleEmergencyMode: FAILED - transaction rolled back: ${err.message}`);
@@ -623,6 +649,7 @@ export class TxSigningHandler {
       signedTransaction: signResult.signedTransaction,
       txHash: signResult.txHash,
       emergencyAuthorizationId: auth.authorizationId,
+      executionLog,
     };
   }
 }

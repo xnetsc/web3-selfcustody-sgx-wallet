@@ -100,15 +100,24 @@ export class WalletCrudHandler {
       address: w.address,
     }));
 
+    let executionLog = null;
     if (emergencyCtx) {
-      await this._emergency.recordUse(emergencyCtx.auth, request.userId, 'wallet_create');
+      const usedCount = await this._emergency.recordUse(emergencyCtx.auth, request.userId, 'wallet_create');
+      executionLog = await this._emergency.recordExecution(emergencyCtx, {
+        platformAddress: parsed.platformAddress,
+        userId: request.userId,
+        operation: 'wallet_create',
+        executionIndex: usedCount,
+        detail: { chains: request.chains.map((c) => c.chainId), walletId: result.walletId },
+        outcome: { walletId: result.walletId, addresses },
+      });
     }
 
     return {
       success: true,
       walletId: result.walletId,
       addresses,
-      ...(emergencyCtx ? { emergencyAuthorizationId: emergencyCtx.auth.authorizationId } : {}),
+      ...(emergencyCtx ? { emergencyAuthorizationId: emergencyCtx.auth.authorizationId, executionLog } : {}),
     };
   }
 
@@ -152,14 +161,23 @@ export class WalletCrudHandler {
 
     console.log(`[WalletCrud] handleDelete: success, walletId=${request.walletId}`);
 
+    let executionLog = null;
     if (emergencyCtx) {
-      await this._emergency.recordUse(emergencyCtx.auth, request.userId, 'wallet_delete');
+      const usedCount = await this._emergency.recordUse(emergencyCtx.auth, request.userId, 'wallet_delete');
+      executionLog = await this._emergency.recordExecution(emergencyCtx, {
+        platformAddress: parsed.platformAddress,
+        userId: request.userId,
+        operation: 'wallet_delete',
+        executionIndex: usedCount,
+        detail: { walletId: request.walletId },
+        outcome: { walletId: request.walletId, deleted: true },
+      });
     }
 
     return {
       success: true,
       walletId: request.walletId,
-      ...(emergencyCtx ? { emergencyAuthorizationId: emergencyCtx.auth.authorizationId } : {}),
+      ...(emergencyCtx ? { emergencyAuthorizationId: emergencyCtx.auth.authorizationId, executionLog } : {}),
     };
   }
 
@@ -234,15 +252,24 @@ export class WalletCrudHandler {
 
     console.log(`[WalletCrud] handleDeletePasskey: success, deletedCount=${result.deletedCount}, accountDeleted=${result.accountDeleted}`);
 
+    let executionLog = null;
     if (emergencyCtx) {
-      await this._emergency.recordUse(emergencyCtx.auth, request.userId, 'passkey_delete');
+      const usedCount = await this._emergency.recordUse(emergencyCtx.auth, request.userId, 'passkey_delete');
+      executionLog = await this._emergency.recordExecution(emergencyCtx, {
+        platformAddress: parsed.platformAddress,
+        userId: request.userId,
+        operation: 'passkey_delete',
+        executionIndex: usedCount,
+        detail: { credentialIdsToDelete: request.credentialIdsToDelete },
+        outcome: { deletedCount: result.deletedCount, accountDeleted: result.accountDeleted },
+      });
     }
 
     return {
       success: true,
       deletedCount: result.deletedCount,
       accountDeleted: result.accountDeleted,
-      ...(emergencyCtx ? { emergencyAuthorizationId: emergencyCtx.auth.authorizationId } : {}),
+      ...(emergencyCtx ? { emergencyAuthorizationId: emergencyCtx.auth.authorizationId, executionLog } : {}),
     };
   }
 

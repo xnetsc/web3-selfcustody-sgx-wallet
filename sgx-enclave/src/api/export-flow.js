@@ -386,7 +386,17 @@ export class ExportFlowHandler {
         throw new Error(`Emergency authorization verification failed: ${result.reason}`);
       }
       const confirmResult = await this._keyExporter.confirmExport(request.sessionId);
-      await this._emergency.recordUse(result.auth, request.userId, 'key_export');
+      const usedCount = await this._emergency.recordUse(result.auth, request.userId, 'key_export');
+      // 执行日志 detail 只记导出清单（walletId + 地址，均为公开信息），
+      // 绝不含加密载荷或任何密钥材料
+      const executionLog = await this._emergency.recordExecution(result, {
+        platformAddress: whitelistResult.address,
+        userId: request.userId,
+        operation: 'key_export',
+        executionIndex: usedCount,
+        detail: { exportInfo: session.exportInfo },
+        outcome: { walletIds: confirmResult.walletIds, deletedCount: confirmResult.deletedCount },
+      });
       console.log(`[ExportFlow] handleComplete: success (emergency), walletIds=${JSON.stringify(confirmResult.walletIds)}, deletedCount=${confirmResult.deletedCount}`);
       return {
         success: true,
@@ -394,6 +404,7 @@ export class ExportFlowHandler {
         deletedCount: confirmResult.deletedCount,
         deleted: confirmResult.deletedCount > 0,
         emergencyAuthorizationId: result.auth.authorizationId,
+        executionLog,
       };
     }
 

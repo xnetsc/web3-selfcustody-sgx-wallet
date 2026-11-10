@@ -71,9 +71,17 @@ export class EvidenceQueryHandler {
         authorizationId: request.authorizationId,
       });
       const record = await this._getRecordOrThrow(request.userId, request.authorizationId);
-      await this._emergency.recordUse(emgCtx.auth, request.userId, 'evidence_query');
+      const usedCount = await this._emergency.recordUse(emgCtx.auth, request.userId, 'evidence_query');
+      const executionLog = await this._emergency.recordExecution(emgCtx, {
+        platformAddress: whitelistResult.address,
+        userId: request.userId,
+        operation: 'evidence_query',
+        executionIndex: usedCount,
+        detail: { queriedAuthorizationId: request.authorizationId },
+        outcome: { found: true },
+      });
       console.log(`[EvidenceQuery] handleGetRecord: success (emergency)`);
-      return { ...this._formatRecord(record), emergencyAuthorizationId: emgCtx.auth.authorizationId };
+      return { ...this._formatRecord(record), emergencyAuthorizationId: emgCtx.auth.authorizationId, executionLog };
     }
 
     const isUserInitiated = !!(request.credentialId && request.webauthnSignature);
@@ -143,8 +151,17 @@ export class EvidenceQueryHandler {
 
     const records = await this._state.listAuthorizationRecords(request.userId);
 
+    let executionLog = null;
     if (emergencyCtx) {
-      await this._emergency.recordUse(emergencyCtx.auth, request.userId, 'evidence_query');
+      const usedCount = await this._emergency.recordUse(emergencyCtx.auth, request.userId, 'evidence_query');
+      executionLog = await this._emergency.recordExecution(emergencyCtx, {
+        platformAddress: whitelistResult.address,
+        userId: request.userId,
+        operation: 'evidence_query',
+        executionIndex: usedCount,
+        detail: { list: true },
+        outcome: { recordCount: records.length },
+      });
     }
 
     const mode = emergencyCtx ? 'emergency' : (isUserInitiated ? 'user via platform' : 'platform');
@@ -158,7 +175,7 @@ export class EvidenceQueryHandler {
         authorizationHash: r.authorization_hash,
         createdAt: r.created_at,
       })),
-      ...(emergencyCtx ? { emergencyAuthorizationId: emergencyCtx.auth.authorizationId } : {}),
+      ...(emergencyCtx ? { emergencyAuthorizationId: emergencyCtx.auth.authorizationId, executionLog } : {}),
     };
   }
 

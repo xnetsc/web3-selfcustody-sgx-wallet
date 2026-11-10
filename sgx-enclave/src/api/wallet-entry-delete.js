@@ -86,13 +86,22 @@ export class WalletEntryDeleteHandler {
       console.log(`[WalletEntryDelete] handleDelete: emergency authorization approved, authorizationId=${result.auth.authorizationId}`);
 
       await this._wallet.deleteWalletEntry(request.userId, request.walletId, request.address);
-      await this._emergency.recordUse(emergencyCtx.auth, request.userId, 'wallet_entry_delete');
+      const usedCount = await this._emergency.recordUse(emergencyCtx.auth, request.userId, 'wallet_entry_delete');
+      const executionLog = await this._emergency.recordExecution(emergencyCtx, {
+        platformAddress: whitelistResult.address,
+        userId: request.userId,
+        operation: 'wallet_entry_delete',
+        executionIndex: usedCount,
+        detail: { walletId: request.walletId, address: request.address },
+        outcome: { walletId: request.walletId, address: request.address, deleted: true },
+      });
       console.log(`[WalletEntryDelete] handleDelete: success (emergency), walletId=${request.walletId}, address=${request.address}`);
       return {
         success: true,
         walletId: request.walletId,
         address: request.address,
         emergencyAuthorizationId: emergencyCtx.auth.authorizationId,
+        executionLog,
       };
     }
 

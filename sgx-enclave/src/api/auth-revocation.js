@@ -266,7 +266,15 @@ export class AuthRevocationHandler {
       ? (conn) => this._state._saveAuthorizationRecordInTransaction(conn, userId, authorizationId, toSave.grantee, toSave.authorizationJson, authorizationRecord.authorizationHash)
       : null);
 
-    await this._emergency.recordUse(emgResult.auth, userId, 'auth_revoke');
+    const usedCount = await this._emergency.recordUse(emgResult.auth, userId, 'auth_revoke');
+    const executionLog = await this._emergency.recordExecution(emgResult, {
+      platformAddress,
+      userId,
+      operation: 'auth_revoke',
+      executionIndex: usedCount,
+      detail: { revokedAuthorizationId: authorizationId, revokedGrantee: grantee },
+      outcome: { revoked: true },
+    });
 
     console.log(`[AuthRevocation] handleRevoke (emergency): recorded emergency revocation for userId=${userId}, authorizationId=${authorizationId}, emergencyAuthorizationId=${emgResult.auth.authorizationId}`);
 
@@ -277,6 +285,7 @@ export class AuthRevocationHandler {
       grantee,
       source: 'emergency',
       emergencyAuthorizationId: emgResult.auth.authorizationId,
+      executionLog,
       revocationRecord: stored,
       authorizationRecord: {
         userId,

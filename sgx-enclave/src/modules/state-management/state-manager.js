@@ -8,6 +8,7 @@
 
 import { createConnProxy, shouldExecuteInternalWrite, withLocalFallback } from '../../sync/sync-adapter.js';
 import { getMonotonicDate, getMonotonicSqliteNow } from '../../utils/monotonic-clock.js';
+import { GENESIS_PREV_HASH, computeExecutionLogHash } from '../emergency-auth/execution-log.js';
 
 /**
  * 将时间值规范化为 ISO 字符串（便于统一比较与存储），无法解析时返回 null
@@ -25,6 +26,36 @@ function _normalizeIsoTime(value) {
  * @param {Object} row
  * @returns {Object|null}
  */
+/**
+ * 将 emergency_execution_logs 表行转换为对外对象
+ * （detail/outcome 还原为对象；entryHash/prevHash 供读者重算校验哈希链）
+ * @param {Object} row
+ * @returns {Object|null}
+ */
+function _executionLogFromRow(row) {
+  if (!row) return null;
+  const parseJson = (s) => {
+    try { return JSON.parse(s); } catch { return {}; }
+  };
+  return {
+    logId: row.log_id,
+    createdAt: row.created_at,
+    authorizationId: row.authorization_id,
+    authHash: row.auth_hash,
+    operatorUserId: row.operator_user_id,
+    operatorPubKeyHash: row.operator_pub_key_hash,
+    platformAddress: row.platform_address,
+    targetUserId: row.target_user_id,
+    operation: row.operation,
+    executionIndex: row.execution_index,
+    detail: parseJson(row.detail),
+    result: row.result,
+    outcome: parseJson(row.outcome),
+    prevHash: row.prev_hash,
+    entryHash: row.entry_hash,
+  };
+}
+
 function _revocationFromRow(row) {
   if (!row) return null;
   return {
@@ -881,6 +912,146 @@ export class StateManager {
     const count = await this.getEmergencyUseCount(authorizationId, userId, operation);
     console.log(`[EmergencyAuth] use recorded: authorizationId=${authorizationId}, userId=${userId}, operation=${operation}, usedCount=${count}`);
     return count;
+  }
+
+  // ========== 应急授权执行日志（本地审计表：自增 id + 哈希链，不参与同步） ==========
+
+  /**
+   * 事务内追加一条应急执行日志，并返回完整条目（含 logId 与 entryHash）
+   * 哈希在同一事务内两步完成：先 INSERT 拿到 AUTOINCREMENT 的 logId，
+   * 再按规范序列化算 entry_hash 回填——logId 本身参与哈希，改 id 也会断链。
+   * @param {Object} conn - createConnProxy 代理
+   * @param {Object} entry - { authorizationId, authHash, operatorUserId, operatorPubKeyHash,
+   *   platformAddress, targetUserId, operation, executionIndex, detail?, result?, outcome? }
+   *   detail/outcome 只允许非敏感摘要，严禁私钥/助记词/加密载荷/签名原文
+   * @returns {Object} 完整日志条目（detail/outcome 为对象形态）
+   */
+  _appendExecutionLogInTransaction(conn, entry) {
+    const createdAt = getMonotonicDate().toISOString();
+    const detailJson = JSON.stringify(entry.detail || {});
+    const outcomeJson = JSON.stringify(entry.outcome || {});
+    const result = entry.result || 'success';
+
+    const prevRows = conn.query(
+      'SELECT entry_hash FROM emergency_execution_logs ORDER BY log_id DESC LIMIT 1'
+    );
+    const prevHash = prevRows.length > 0 ? prevRows[0].entry_hash : GENESIS_PREV_HASH;
+
+    const insertResult = conn.query(
+      `INSERT INTO emergency_execution_logs
+       (created_at, authorization_id, auth_hash, operator_user_id, operator_pub_key_hash,
+        platform_address, target_user_id, operation, execution_index, detail, result, outcome,
+        prev_hash, entry_hash)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '')`,
+      [createdAt, entry.authorizationId, entry.authHash, entry.operatorUserId, entry.operatorPubKeyHash,
+       entry.platformAddress, entry.targetUserId, entry.operation, entry.executionIndex,
+       detailJson, result, outcomeJson, prevHash]
+    );
+    const logId = Number(insertResult.lastInsertRowid);
+
+    const full = {
+      logId,
+      createdAt,
+      authorizationId: entry.authorizationId,
+      authHash: entry.authHash,
+      operatorUserId: entry.operatorUserId,
+      operatorPubKeyHash: entry.operatorPubKeyHash,
+      platformAddress: entry.platformAddress,
+      targetUserId: entry.targetUserId,
+      operation: entry.operation,
+      executionIndex: entry.executionIndex,
+      detail: detailJson,
+      result,
+      outcome: outcomeJson,
+      prevHash,
+    };
+    const entryHash = computeExecutionLogHash(full);
+    conn.query('UPDATE emergency_execution_logs SET entry_hash = ? WHERE log_id = ?', [entryHash, logId]);
+
+    console.log(`[EmergencyExecutionLog] appended: logId=${logId}, authorizationId=${entry.authorizationId}, operation=${entry.operation}, targetUserId=${entry.targetUserId}, executionIndex=${entry.executionIndex}, entryHash=${entryHash}`);
+    return { ...full, detail: entry.detail || {}, outcome: entry.outcome || {}, entryHash };
+  }
+
+  /**
+   * 追加一条应急执行日志（独立事务，按目标用户分片键写入）
+   * @param {Object} entry - 同 _appendExecutionLogInTransaction
+   * @returns {Promise<Object>} 完整日志条目
+   */
+  async appendExecutionLog(entry) {
+    let stored = null;
+    await this._engine.write(async (db) => {
+      const conn = createConnProxy(db);
+      stored = this._appendExecutionLogInTransaction(conn, entry);
+    }, entry.targetUserId);
+    return stored;
+  }
+
+  /**
+   * 查询应急执行日志（公开审计读路径）
+   * 过滤条件全部走固定列名片段 + 参数绑定，排序方向只取代码内白名单字面量，
+   * 任何过滤值都不会拼进 SQL 文本。
+   * @param {Object} [filter]
+   * @param {string} [filter.authorizationId]
+   * @param {string} [filter.targetUserId]
+   * @param {string} [filter.operatorUserId]
+   * @param {string} [filter.operation]
+   * @param {string} [filter.platformAddress]
+   * @param {string} [filter.result]
+   * @param {number} [filter.logId] - 精确查一条
+   * @param {string} [filter.fromCreatedAt] - created_at >= 该 ISO 时间
+   * @param {string} [filter.toCreatedAt] - created_at <= 该 ISO 时间
+   * @param {number} [page=1]
+   * @param {number} [pageSize=10]
+   * @param {string} [order='asc'] - 'asc' | 'desc'（按 logId）
+   * @returns {Promise<{ logs: Object[], count: number, totalPages: number, page: number, pageSize: number }>}
+   */
+  async listExecutionLogs(filter = {}, page = 1, pageSize = 10, order = 'asc') {
+    const clauses = [];
+    const params = [];
+    const addEq = (column, value) => {
+      if (value !== undefined && value !== null && value !== '') {
+        clauses.push(`${column} = ?`);
+        params.push(value);
+      }
+    };
+    addEq('authorization_id', filter.authorizationId);
+    addEq('target_user_id', filter.targetUserId);
+    addEq('operator_user_id', filter.operatorUserId);
+    addEq('operation', filter.operation);
+    addEq('platform_address', filter.platformAddress);
+    addEq('result', filter.result);
+    if (filter.logId !== undefined && filter.logId !== null) {
+      clauses.push('log_id = ?');
+      params.push(filter.logId);
+    }
+    if (filter.fromCreatedAt) {
+      clauses.push('created_at >= ?');
+      params.push(filter.fromCreatedAt);
+    }
+    if (filter.toCreatedAt) {
+      clauses.push('created_at <= ?');
+      params.push(filter.toCreatedAt);
+    }
+    const where = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
+    const direction = order === 'desc' ? 'DESC' : 'ASC';
+
+    const countRows = await this._db.readQuery(
+      `SELECT COUNT(*) AS cnt FROM emergency_execution_logs ${where}`,
+      params
+    );
+    const count = countRows[0]?.cnt || 0;
+    const offset = (page - 1) * pageSize;
+    const rows = await this._db.readQuery(
+      `SELECT * FROM emergency_execution_logs ${where} ORDER BY log_id ${direction} LIMIT ? OFFSET ?`,
+      [...params, pageSize, offset]
+    );
+    return {
+      logs: rows.map(_executionLogFromRow),
+      count,
+      totalPages: Math.max(1, Math.ceil(count / pageSize)),
+      page,
+      pageSize,
+    };
   }
 
   /**

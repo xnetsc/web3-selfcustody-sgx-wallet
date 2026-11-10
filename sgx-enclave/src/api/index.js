@@ -8,6 +8,7 @@ export { PasskeyListHandler } from './passkey-list.js';
 export { ChallengeHandler } from './challenge.js';
 export { AuthStatusHandler } from './auth-status.js';
 export { AuthRevocationHandler } from './auth-revocation.js';
+export { EmergencyLogQueryHandler } from './emergency-log-query.js';
 export { TxSigningHandler } from './tx-signing.js';
 export { KeyImportHandler } from './key-import.js';
 export { WalletCrudHandler } from './wallet-crud.js';

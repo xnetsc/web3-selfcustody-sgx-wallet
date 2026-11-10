@@ -168,6 +168,7 @@ export class KeyImportHandler {
     let emergencyCtx = null;
     let emergencyAllowedUserIds = null;
     let emergencyTargetUserId = null;
+    let emergencyImportType = null;
     if (request.emergencyAuthorizationJson) {
       // 目标用户以导入会话为准（会话在 init 时按应急授权校验后创建）
       const session = await this._keyImporter._sessionManager.findSession(request.sessionId);
@@ -175,6 +176,7 @@ export class KeyImportHandler {
         throw new Error('Session not found or expired');
       }
       emergencyTargetUserId = session.userId;
+      emergencyImportType = session.importType;
       const actualChains = (request.chains || []).map((c) => (c && typeof c === 'object' ? c.chainId : c));
       emergencyCtx = await this._verifyEmergency(request, whitelistResult.address, 'handleComplete', {
         importType: session.importType,
@@ -207,13 +209,24 @@ export class KeyImportHandler {
       emergencyAllowedUserIds
     );
 
-    // 应急路径：为实际导入到的每个用户各记一次使用
+    // 应急路径：为实际导入到的每个用户各记一次使用并各写一条执行日志
+    // （日志 detail 只记 importType 与 walletId，绝不含任何密钥材料）
+    let emergencyExecutionLogs = [];
     if (emergencyCtx) {
       const importedUserIds = result.sharedWalletIds
         ? Object.keys(result.sharedWalletIds)
         : [emergencyTargetUserId];
       for (const uid of importedUserIds) {
-        await this._emergency.recordUse(emergencyCtx.auth, uid, 'key_import');
+        const usedCount = await this._emergency.recordUse(emergencyCtx.auth, uid, 'key_import');
+        const uidWalletId = result.sharedWalletIds ? result.sharedWalletIds[uid] : result.walletId;
+        emergencyExecutionLogs.push(await this._emergency.recordExecution(emergencyCtx, {
+          platformAddress: whitelistResult.address,
+          userId: uid,
+          operation: 'key_import',
+          executionIndex: usedCount,
+          detail: { importType: emergencyImportType, walletId: uidWalletId || null },
+          outcome: { walletId: uidWalletId || null },
+        }));
       }
     }
 
@@ -225,7 +238,11 @@ export class KeyImportHandler {
         success: true,
         results: result.results,
         sharedWalletIds: result.sharedWalletIds,
-        ...(emergencyCtx ? { emergencyAuthorizationId: emergencyCtx.auth.authorizationId } : {}),
+        ...(emergencyCtx ? {
+          emergencyAuthorizationId: emergencyCtx.auth.authorizationId,
+          executionLog: emergencyExecutionLogs[0] || null,
+          ...(emergencyExecutionLogs.length > 1 ? { executionLogs: emergencyExecutionLogs } : {}),
+        } : {}),
       };
     } else {
       // 单个导入
@@ -234,7 +251,11 @@ export class KeyImportHandler {
         success: true,
         walletId: result.walletId,
         addresses: result.addresses || [],
-        ...(emergencyCtx ? { emergencyAuthorizationId: emergencyCtx.auth.authorizationId } : {}),
+        ...(emergencyCtx ? {
+          emergencyAuthorizationId: emergencyCtx.auth.authorizationId,
+          executionLog: emergencyExecutionLogs[0] || null,
+          ...(emergencyExecutionLogs.length > 1 ? { executionLogs: emergencyExecutionLogs } : {}),
+        } : {}),
       };
     }
   }

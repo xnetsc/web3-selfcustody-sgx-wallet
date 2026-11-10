@@ -31,6 +31,8 @@ import { parseEmergencyAuthorization } from '../sgx-enclave/src/modules/emergenc
 import { computeAuthorizationHash } from '../sgx-enclave/src/modules/auth-engine/authorization-parser.js';
 import { WalletCrudHandler } from '../sgx-enclave/src/api/wallet-crud.js';
 import { AuthRevocationHandler } from '../sgx-enclave/src/api/auth-revocation.js';
+import { EmergencyLogQueryHandler } from '../sgx-enclave/src/api/emergency-log-query.js';
+import { verifyExecutionLogChain, computeExecutionLogHash, GENESIS_PREV_HASH } from '../sgx-enclave/src/modules/emergency-auth/execution-log.js';
 import { createConnProxy } from '../sgx-enclave/src/sync/sync-adapter.js';
 
 // ============ 常量 ============
@@ -590,4 +592,166 @@ test('handler: AuthRevocation 应急撤销落库 source=emergency', async () => 
   assert.equal(records.length, 1);
   assert.equal(records[0].authorizationId, targetAuthId);
   assert.equal(await w.stateManager.getEmergencyUseCount(emgAuth.authorizationId, ALICE, 'auth_revoke'), 1);
+});
+
+// ============ 应急执行日志 ============
+
+async function createViaEmergency(w) {
+  const auth = buildAuth();
+  const json = JSON.stringify(auth);
+  registerOnContract(w.mockContract, auth, json);
+  const walletManager = new WalletManager(w.connMgr, w.engine);
+  const crud = new WalletCrudHandler({
+    whitelistVerifier: makeWhitelistStub(),
+    passkeyManager: w.passkeyManager,
+    challengeManager: {},
+    walletManager,
+    emergencyAuthorizer: w.authorizer,
+  });
+  const res = await crud.handleCreate(envelope({
+    userId: ALICE,
+    chains: [{ chainId: 1, coinType: 60 }],
+    emergencyAuthorizationJson: json,
+    emergencySignature: GOOD_SIG,
+  }));
+  return { auth, json, res, crud, walletManager };
+}
+
+test('execution-log: 应急操作返回当前日志条目，字段可对着授权 JSON 验证', async () => {
+  const w = await makeWorld();
+  const { auth, json, res } = await createViaEmergency(w);
+
+  const log = res.executionLog;
+  assert.ok(log, 'response must carry executionLog');
+  assert.equal(log.logId, 1);
+  assert.equal(log.authorizationId, auth.authorizationId);
+  // authHash 必须等于对授权 JSON 原文重算的哈希——用户拿着授权 JSON 即可验证
+  assert.equal(log.authHash, computeAuthorizationHash(json));
+  assert.equal(log.operatorUserId, OPERATOR);
+  assert.equal(log.operatorPubKeyHash, OPERATOR_PUBKEY_HASH);
+  assert.equal(log.platformAddress, PLATFORM);
+  assert.equal(log.targetUserId, ALICE);
+  assert.equal(log.operation, 'wallet_create');
+  assert.equal(log.executionIndex, 1);
+  assert.equal(log.result, 'success');
+  assert.equal(log.prevHash, GENESIS_PREV_HASH);
+  // createdAt 为 UTC ISO 时间
+  assert.ok(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/.test(log.createdAt) && log.createdAt.endsWith('Z'));
+  // entryHash 可由任何人按公开规则重算
+  assert.equal(computeExecutionLogHash(log), log.entryHash);
+  // 日志不得泄漏敏感信息：钱包创建 detail/outcome 只有链与公开地址
+  const serialized = JSON.stringify([log.detail, log.outcome]);
+  for (const banned of ['privateKey', 'mnemonic', 'seed', 'encrypted', 'signature']) {
+    assert.ok(!serialized.includes(banned), `log must not contain ${banned}`);
+  }
+});
+
+test('execution-log: 哈希链递增衔接，篡改与删行可检出', async () => {
+  const w = await makeWorld();
+  const { auth, json, crud, walletManager } = await createViaEmergency(w);
+
+  // 第二个操作（删除另一个预置钱包）产生第二条日志
+  await walletManager.createNativeWallet(ALICE, 'wallet-fixed-1', [{ chainId: 1, coinType: 60 }]);
+  const delRes = await crud.handleDelete(envelope({
+    userId: ALICE,
+    walletId: 'wallet-fixed-1',
+    emergencyAuthorizationJson: json,
+    emergencySignature: GOOD_SIG,
+  }));
+  assert.equal(delRes.executionLog.logId, 2);
+  assert.equal(delRes.executionLog.operation, 'wallet_delete');
+
+  const page = await w.stateManager.listExecutionLogs({}, 1, 10, 'asc');
+  assert.equal(page.count, 2);
+  assert.deepEqual(verifyExecutionLogChain(page.logs), { valid: true });
+  assert.equal(page.logs[1].prevHash, page.logs[0].entryHash);
+  assert.ok(page.logs[1].logId > page.logs[0].logId);
+
+  // 篡改第二条的 detail：重算哈希不符，链校验失败
+  w.db.prepare("UPDATE emergency_execution_logs SET detail = ? WHERE log_id = 2").run('{"walletId":"forged"}');
+  const tampered = await w.stateManager.listExecutionLogs({}, 1, 10, 'asc');
+  const check = verifyExecutionLogChain(tampered.logs);
+  assert.equal(check.valid, false);
+  assert.equal(check.brokenAtLogId, 2);
+});
+
+test('execution-log: 公开查询接口分页、过滤、顺序与链头', async () => {
+  const w = await makeWorld();
+  const { auth, res } = await createViaEmergency(w);
+  const handler = new EmergencyLogQueryHandler({ stateManager: w.stateManager });
+
+  // 无鉴权直查（不带任何签名）
+  const all = await handler.handleQuery({});
+  assert.equal(all.count, 1);
+  assert.equal(all.logs[0].logId, res.executionLog.logId);
+  assert.equal(all.latestEntryHash, res.executionLog.entryHash);
+  assert.equal(all.latestLogId, 1);
+
+  // 过滤命中与未命中
+  const byOp = await handler.handleQuery({ operation: 'wallet_create' });
+  assert.equal(byOp.count, 1);
+  const byAuth = await handler.handleQuery({ authorizationId: auth.authorizationId });
+  assert.equal(byAuth.count, 1);
+  const byUser = await handler.handleQuery({ userId: ALICE });
+  assert.equal(byUser.count, 1);
+  const byLogId = await handler.handleQuery({ logId: 1 });
+  assert.equal(byLogId.count, 1);
+  const miss = await handler.handleQuery({ operation: 'wallet_delete' });
+  assert.equal(miss.count, 0);
+
+  // 分页参数校验：越界直接报错
+  await assert.rejects(() => handler.handleQuery({ pageSize: 0 }), /pageSize/);
+  await assert.rejects(() => handler.handleQuery({ pageSize: 101 }), /pageSize/);
+  await assert.rejects(() => handler.handleQuery({ page: 0 }), /page/);
+  await assert.rejects(() => handler.handleQuery({ order: 'sideways' }), /order/);
+  await assert.rejects(() => handler.handleQuery({ operation: 'nonsense' }), /unknown operation/);
+  await assert.rejects(() => handler.handleQuery({ logId: 1.5 }), /logId/);
+});
+
+test('execution-log: SQL 注入字符串只当普通过滤值，查不到也不影响表', async () => {
+  const w = await makeWorld();
+  await createViaEmergency(w);
+  const handler = new EmergencyLogQueryHandler({ stateManager: w.stateManager });
+
+  const r1 = await handler.handleQuery({ authorizationId: "' OR '1'='1" });
+  assert.equal(r1.count, 0);
+  const r2 = await handler.handleQuery({ userId: "x'; DROP TABLE emergency_execution_logs; --" });
+  assert.equal(r2.count, 0);
+  const r3 = await handler.handleQuery({ platformAddress: "0x' UNION SELECT * FROM passkeys --" });
+  assert.equal(r3.count, 0);
+
+  // 表完好，原有日志仍可查
+  const all = await handler.handleQuery({});
+  assert.equal(all.count, 1);
+  assert.deepEqual(verifyExecutionLogChain(all.logs), { valid: true });
+});
+
+test('execution-log: executionIndex 随同授权同操作递增，跨操作独立', async () => {
+  const w = await makeWorld();
+  const auth = buildAuth();
+  auth.wallets[0].policy.operations.wallet_create = { maxUses: 3 };
+  const json = JSON.stringify(auth);
+  registerOnContract(w.mockContract, auth, json);
+  const walletManager = new WalletManager(w.connMgr, w.engine);
+  const crud = new WalletCrudHandler({
+    whitelistVerifier: makeWhitelistStub(),
+    passkeyManager: w.passkeyManager,
+    challengeManager: {},
+    walletManager,
+    emergencyAuthorizer: w.authorizer,
+  });
+  for (let i = 1; i <= 3; i++) {
+    const res = await crud.handleCreate(envelope({
+      userId: ALICE,
+      chains: [{ chainId: 1, coinType: 60 }],
+      emergencyAuthorizationJson: json,
+      emergencySignature: GOOD_SIG,
+    }));
+    assert.equal(res.executionLog.executionIndex, i);
+    assert.equal(res.executionLog.logId, i);
+  }
+  const page = await w.stateManager.listExecutionLogs({ authorizationId: auth.authorizationId }, 1, 2, 'desc');
+  assert.equal(page.count, 3);
+  assert.equal(page.totalPages, 2);
+  assert.equal(page.logs[0].logId, 3);
 });

@@ -53,6 +53,7 @@ import {
   ChallengeHandler,
   AuthStatusHandler,
   AuthRevocationHandler,
+  EmergencyLogQueryHandler,
   TxSigningHandler,
   KeyImportHandler,
   WalletCrudHandler,
@@ -415,6 +416,9 @@ async function main() {
       passkeyManager,
       stateManager,
       emergencyAuthorizer,
+    }),
+    emergencyLogQueryHandler: new EmergencyLogQueryHandler({
+      stateManager,
     }),
     enclaveInfoHandler: new EnclaveInfoHandler({
       contractClient,

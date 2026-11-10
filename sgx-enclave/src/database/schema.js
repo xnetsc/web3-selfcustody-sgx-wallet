@@ -3,7 +3,8 @@
  * 只定义业务表：accounts, passkeys, wallets, authorization_states,
  * authorization_token_states, authorization_records, authorization_revocations,
  * import_sessions, export_sessions, tx_sign_nonces, webauthn_challenges,
- * account_freezes, emergency_authorization_uses, pinned_contract。
+ * account_freezes, emergency_authorization_uses, emergency_execution_logs,
+ * pinned_contract。
  * 同步基础设施表（_sync_log、_sync_peers、_tombstones、_full_sync_*）
  * 由 SyncEngine 在启动时统一创建，app 侧不预建，避免预建形状与引擎
  * 现行 DDL 不一致时被 IF NOT EXISTS 抢先占位。
@@ -254,6 +255,43 @@ export const CREATE_EMERGENCY_AUTHORIZATION_USES_INDEXES_SQL = [
     `CREATE INDEX IF NOT EXISTS idx_emg_uses_user_id ON emergency_authorization_uses (user_id)`,
 ];
 
+// ========== 应急授权执行日志表（本地审计，不参与同步） ==========
+
+// 每一次经应急授权（合约治理）成功执行的操作在此留痕：
+//  - log_id 为 SQLite AUTOINCREMENT 主键，本库内严格递增、永不复用；
+//  - 每条带 prev_hash / entry_hash 哈希链，改、删、插任何一条都会断链可检；
+//  - entry 随操作响应返回，响应整体被 wrap 以 SHA256 注入 attestation quote
+//    的 user_report_data——即日志哈希是生成度量值的材料，日志真实性由
+//    度量值背书；公开查询接口同样经 wrap 返回，读者可核 quote + 哈希链 +
+//    auth_hash（对授权 JSON 原文算 SHA256 即得，可与链上记录互证）。
+// 本表不注册到同步业务表：自增 id 与哈希链是单个 enclave 数据库内的审计
+// 结构，跨节点合并会破坏递增与链序；日志记录的是“本 enclave 执行了什么”。
+export const CREATE_EMERGENCY_EXECUTION_LOGS_SQL = `
+CREATE TABLE IF NOT EXISTS emergency_execution_logs (
+    log_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT NOT NULL,
+    authorization_id TEXT NOT NULL,
+    auth_hash TEXT NOT NULL,
+    operator_user_id TEXT NOT NULL,
+    operator_pub_key_hash TEXT NOT NULL,
+    platform_address TEXT NOT NULL,
+    target_user_id TEXT NOT NULL,
+    operation TEXT NOT NULL,
+    execution_index INTEGER NOT NULL,
+    detail TEXT NOT NULL DEFAULT '{}',
+    result TEXT NOT NULL DEFAULT 'success',
+    outcome TEXT NOT NULL DEFAULT '{}',
+    prev_hash TEXT NOT NULL,
+    entry_hash TEXT NOT NULL
+)`;
+
+export const CREATE_EMERGENCY_EXECUTION_LOGS_INDEXES_SQL = [
+    `CREATE INDEX IF NOT EXISTS idx_emg_logs_auth_id ON emergency_execution_logs (authorization_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_emg_logs_target_user ON emergency_execution_logs (target_user_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_emg_logs_operation ON emergency_execution_logs (operation)`,
+    `CREATE INDEX IF NOT EXISTS idx_emg_logs_created_at ON emergency_execution_logs (created_at)`,
+];
+
 // ========== 合约身份钉住表（安全：防止 env 注入替换合约） ==========
 
 // 单行表（id 恒为 1）。首次成功读到合约数据时写入合约身份 + 最近一次已知的
@@ -292,6 +330,7 @@ export const ALL_TABLE_SQLS = [
     { name: 'webauthn_challenges', sql: CREATE_WEBAUTHN_CHALLENGES_SQL, indexes: CREATE_WEBAUTHN_CHALLENGES_INDEXES_SQL },
     { name: 'account_freezes', sql: CREATE_ACCOUNT_FREEZES_SQL, indexes: CREATE_ACCOUNT_FREEZES_INDEXES_SQL },
     { name: 'emergency_authorization_uses', sql: CREATE_EMERGENCY_AUTHORIZATION_USES_SQL, indexes: CREATE_EMERGENCY_AUTHORIZATION_USES_INDEXES_SQL },
+    { name: 'emergency_execution_logs', sql: CREATE_EMERGENCY_EXECUTION_LOGS_SQL, indexes: CREATE_EMERGENCY_EXECUTION_LOGS_INDEXES_SQL },
     { name: 'pinned_contract', sql: CREATE_PINNED_CONTRACT_SQL, indexes: [] },
 ];
 

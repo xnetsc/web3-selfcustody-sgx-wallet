@@ -17,6 +17,7 @@
  *   POST /api/auth/status                  → AuthStatusHandler.handleGetStatus
  *   POST /api/auth/revoke                  → AuthRevocationHandler.handleRevoke   (平台转发用户撤销，SGX 本地落库)
  *   POST /api/auth/revocation/query        → AuthRevocationHandler.handleQuery    (本地撤销记录查询，无需鉴权)
+ *   POST /api/emergency/execution-log/query → EmergencyLogQueryHandler.handleQuery (应急执行日志查询，无需鉴权)
  *   POST /api/tx/sign                      → TxSigningHandler.handleSigningRequest    (支持txParams和rawTxHex两种模式)
  *   POST /api/key/import/init              → KeyImportHandler.handleInit              (密钥导入：私钥/助记词)
  *   POST /api/key/import/complete          → KeyImportHandler.handleComplete          (密钥导入确认)
@@ -211,6 +212,9 @@ export function createApp(handlers, accountFreezeManager, syncManager = null) {
 
   // 本地撤销记录查询（公开接口：无需平台签名或 Passkey，不受账户冻结影响，只读本地表）
   app.post('/api/auth/revocation/query', wrap(req => handlers.authRevocationHandler.handleQuery(req.body), null, null, null, req => req.path));
+
+  // 应急授权执行日志查询（公开接口：无需鉴权，只读本地审计表，支持分页与过滤）
+  app.post('/api/emergency/execution-log/query', wrap(req => handlers.emergencyLogQueryHandler.handleQuery(req.body), null, null, null, req => req.path));
 
   // 交易签名
   app.post('/api/tx/sign', wrap(req => handlers.txSigningHandler.handleSigningRequest(req.body), accountFreezeManager, syncManager, req => req.path));

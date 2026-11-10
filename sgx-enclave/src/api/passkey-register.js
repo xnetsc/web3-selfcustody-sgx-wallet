@@ -487,9 +487,18 @@ export class PasskeyRegisterHandler {
       }
     }
 
-    // 场景D：绑定成功后记录一次应急授权使用
+    // 场景D：绑定成功后记录一次应急授权使用并写执行日志
+    let emergencyExecutionLog = null;
     if (emergencyCtx) {
-      await this._emergency.recordUse(emergencyCtx.auth, finalUserId, 'passkey_bind');
+      const usedCount = await this._emergency.recordUse(emergencyCtx.auth, finalUserId, 'passkey_bind');
+      emergencyExecutionLog = await this._emergency.recordExecution(emergencyCtx, {
+        platformAddress: whitelistResult.address,
+        userId: finalUserId,
+        operation: 'passkey_bind',
+        executionIndex: usedCount,
+        detail: { credentialId, newPubKeyHash: PasskeyManager.computePubKeyHash(publicKeyCose) },
+        outcome: { credentialId, bound: true },
+      });
     }
 
     console.log(`[PasskeyRegister] handleComplete: success, userId=${result.userId}, isFirstPasskey=${hasNoPasskeys}, frozen=${!!freezeResult}, frozenReplacement=${isFrozenReplacement}, recovery=${isRecovery}`);
@@ -509,6 +518,7 @@ export class PasskeyRegisterHandler {
     if (emergencyCtx) {
       response.emergency = true;
       response.emergencyAuthorizationId = emergencyCtx.auth.authorizationId;
+      response.executionLog = emergencyExecutionLog;
     }
 
     if (stateNormalized) {
