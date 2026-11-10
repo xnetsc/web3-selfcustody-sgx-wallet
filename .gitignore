@@ -24,3 +24,5 @@ contracts/.env.*
 docs/**
 !docs/sgx-enclave-api.md
 !docs/sgx-enclave-api.zh.md
+test-integration/.env.contract
+test-integration/.hardhat.pid
