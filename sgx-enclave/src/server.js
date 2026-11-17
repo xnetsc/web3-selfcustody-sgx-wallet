@@ -71,6 +71,19 @@ const WRITE_PATHS = new Set([
   '/api/key/import/complete',
   '/api/key/export/init',
   '/api/key/export/complete',
+  // 平台账本写路径：信封 userId = 账本所有权人（账本记账写域），由写代理送所有权人分片 leader
+  '/api/ledger/create',
+  '/api/ledger/deposit-address/get-or-create',
+  '/api/ledger/deposit/observe',
+  '/api/ledger/deposit/claim',
+  '/api/ledger/transfer',
+  '/api/ledger/freeze',
+  '/api/ledger/unfreeze',
+  '/api/ledger/withdraw/request',
+  '/api/ledger/withdraw/payout',
+  '/api/ledger/withdraw/refresh',
+  '/api/ledger/withdraw/cancel',
+  '/api/ledger/convert/to-chain',
 ]);
 
 // 取证本身是读路径（本地执行），但应急取证会写状态（应急使用计数 + 执行
@@ -279,6 +292,30 @@ export function createApp(handlers, accountFreezeManager, syncManager = null) {
 
   // 管理员用户ID列表查询（平台签名，不受冻结影响）
   app.post('/api/admin/userId/list', wrap(req => handlers.walletListForPlatformHandler.handleListAll(req.body), null, null, null, req => req.path));
+
+  // 平台账本（站内资产）：账本授权与冻结自成体系，包装层不做 C 端账户冻结检查（accountFreezeManager 传 null）
+  app.post('/api/ledger/create', wrap(req => handlers.ledgerHandler.handleCreate(req.body), null, syncManager, req => req.path));
+  app.post('/api/ledger/deposit-address/get-or-create', wrap(req => handlers.ledgerHandler.handleGetOrCreateDepositAddress(req.body), null, syncManager, req => req.path));
+  app.post('/api/ledger/deposit/observe', wrap(req => handlers.ledgerHandler.handleObserveDeposit(req.body), null, syncManager, req => req.path));
+  app.post('/api/ledger/deposit/claim', wrap(req => handlers.ledgerHandler.handleClaimDeposit(req.body), null, syncManager, req => req.path));
+  app.post('/api/ledger/transfer', wrap(req => handlers.ledgerHandler.handleTransfer(req.body), null, syncManager, req => req.path));
+  app.post('/api/ledger/freeze', wrap(req => handlers.ledgerHandler.handleFreeze(req.body), null, syncManager, req => req.path));
+  app.post('/api/ledger/unfreeze', wrap(req => handlers.ledgerHandler.handleUnfreeze(req.body), null, syncManager, req => req.path));
+  app.post('/api/ledger/withdraw/request', wrap(req => handlers.ledgerHandler.handleWithdrawRequest(req.body), null, syncManager, req => req.path));
+  app.post('/api/ledger/withdraw/payout', wrap(req => handlers.ledgerHandler.handleWithdrawPayout(req.body), null, syncManager, req => req.path));
+  app.post('/api/ledger/withdraw/refresh', wrap(req => handlers.ledgerHandler.handleWithdrawRefresh(req.body), null, syncManager, req => req.path));
+  app.post('/api/ledger/withdraw/cancel', wrap(req => handlers.ledgerHandler.handleWithdrawCancel(req.body), null, syncManager, req => req.path));
+  app.post('/api/ledger/convert/to-chain', wrap(req => handlers.ledgerHandler.handleConvertToChain(req.body), null, syncManager, req => req.path));
+  app.post('/api/ledger/get', wrap(req => handlers.ledgerHandler.handleGet(req.body), null, null, null, req => req.path));
+  app.post('/api/ledger/list', wrap(req => handlers.ledgerHandler.handleList(req.body), null, null, null, req => req.path));
+  app.post('/api/ledger/balance', wrap(req => handlers.ledgerHandler.handleBalance(req.body), null, null, null, req => req.path));
+  app.post('/api/ledger/balances', wrap(req => handlers.ledgerHandler.handleBalances(req.body), null, null, null, req => req.path));
+  app.post('/api/ledger/entries', wrap(req => handlers.ledgerHandler.handleEntries(req.body), null, null, null, req => req.path));
+  app.post('/api/ledger/liabilities', wrap(req => handlers.ledgerHandler.handleLiabilities(req.body), null, null, null, req => req.path));
+  app.post('/api/ledger/deposits', wrap(req => handlers.ledgerHandler.handleDeposits(req.body), null, null, null, req => req.path));
+  app.post('/api/ledger/deposit-addresses', wrap(req => handlers.ledgerHandler.handleDepositAddresses(req.body), null, null, null, req => req.path));
+  app.post('/api/ledger/withdrawals', wrap(req => handlers.ledgerHandler.handleWithdrawals(req.body), null, null, null, req => req.path));
+  app.post('/api/ledger/freezes', wrap(req => handlers.ledgerHandler.handleFreezes(req.body), null, null, null, req => req.path));
 
   return app;
 }

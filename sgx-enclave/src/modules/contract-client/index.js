@@ -783,6 +783,87 @@ export class ContractClient {
   }
 
   /**
+   * 按 ledgerId 实时查询账本指定（所有权人 + 归集地址集 + 启用状态）
+   * @param {string} ledgerId
+   * @returns {Promise<Object|null>} 指定记录；链上未登记时返回 null
+   * @throws 合约不可用时抛错
+   */
+  async getLedger(ledgerId) {
+    this._ensureInitialized();
+    if (!this._contractAvailable || !this._contract) {
+      throw new Error('Contract unavailable: cannot read ledger designation');
+    }
+    const r = await this._contract.getLedger(ledgerId);
+    if (!r.exists) return null;
+    return {
+      ownerUserId: r.ownerUserId,
+      ownerPubKeyHash: r.ownerPubKeyHash,
+      poolAddresses: [...r.poolAddresses],
+      enabled: r.enabled,
+      exists: true,
+    };
+  }
+
+  /**
+   * 实时查询某账本某归集地址可出金到的目标地址集（未配置返回空数组）
+   * @param {string} ledgerId
+   * @param {string} sourceAddress
+   * @returns {Promise<string[]>}
+   * @throws 合约不可用时抛错
+   */
+  async getCollectionPayoutTargets(ledgerId, sourceAddress) {
+    this._ensureInitialized();
+    if (!this._contractAvailable || !this._contract) {
+      throw new Error('Contract unavailable: cannot read collection payout targets');
+    }
+    const r = await this._contract.getCollectionPayoutTargets(ledgerId, sourceAddress);
+    return [...r];
+  }
+
+  /**
+   * 实时查询某账本某资产的提现风控规则（单笔/日累计限额，0 表示不限）
+   * @param {string} ledgerId
+   * @param {string} assetAddress - 资产合约地址，原生币为零地址
+   * @returns {Promise<Object|null>} 未设置时返回 null
+   * @throws 合约不可用时抛错
+   */
+  async getLedgerWithdrawalPolicy(ledgerId, assetAddress) {
+    this._ensureInitialized();
+    if (!this._contractAvailable || !this._contract) {
+      throw new Error('Contract unavailable: cannot read ledger withdrawal policy');
+    }
+    const r = await this._contract.getLedgerWithdrawalPolicy(ledgerId, assetAddress);
+    if (!r.exists) return null;
+    return {
+      maxSingleAmount: r.maxSingleAmount.toString(),
+      maxDailyAmount: r.maxDailyAmount.toString(),
+      exists: true,
+    };
+  }
+
+  /**
+   * 按 chainId 实时查询链读链配置（资产读链专用，SGX 入账核验前实时读、不用缓存）
+   * @param {number} chainId
+   * @returns {Promise<Object|null>} 配置对象；链上未配置时返回 null
+   * @throws 合约不可用时抛错
+   */
+  async getChainRpcConfig(chainId) {
+    this._ensureInitialized();
+    if (!this._contractAvailable || !this._contract) {
+      throw new Error('Contract unavailable: cannot read chain RPC config');
+    }
+    const r = await this._contract.getChainRpcConfig(chainId);
+    if (!r.exists) return null;
+    return {
+      chainName: r.chainName,
+      rpcUrls: [...r.rpcUrls],
+      caCerts: [...r.caCerts],
+      confirmations: Number(r.confirmations),
+      exists: true,
+    };
+  }
+
+  /**
    * 获取缓存最后刷新时间戳
    * @returns {number}
    */

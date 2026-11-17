@@ -32,6 +32,12 @@ export const CONTRACT_ABI = [
   'function emergencyAuthorizationExists(string) view returns (bool)',
   'function getEmergencyAuthorization(string) view returns (bytes32 authHash, string operatorUserId, bytes32 operatorPubKeyHash, address grantee, uint256 createdAt, uint256 expiresAt, bool revoked, bool exists)',
 
+  // ===== 账本指定 + 出金目标配置 + 链读链配置（SGX 实时查询，不走缓存） =====
+  'function getLedger(string) view returns (string ownerUserId, bytes32 ownerPubKeyHash, address[] poolAddresses, bool enabled, bool exists)',
+  'function getCollectionPayoutTargets(string, address) view returns (address[])',
+  'function getLedgerWithdrawalPolicy(string, address) view returns (uint256 maxSingleAmount, uint256 maxDailyAmount, bool exists)',
+  'function getChainRpcConfig(uint256) view returns (string chainName, string[] rpcUrls, string[] caCerts, uint256 confirmations, bool exists)',
+
   // ===== 合约迁移目标（无需鉴权，所有人可读） =====
   'function getMigrationTarget() view returns (string rpcUrl, string contractAddress, uint256 chainId, string rpcTlsCaCert)',
 ];

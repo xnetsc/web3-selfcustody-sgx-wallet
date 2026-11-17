@@ -18,3 +18,4 @@ export { ExportFlowHandler } from './export-flow.js';
 export { EvidenceQueryHandler } from './evidence-query.js';
 export { EnclaveInfoHandler } from './enclave-info.js';
 export { WalletListForPlatformHandler } from './wallet-list-for-platform.js';
+export { LedgerHandler } from './ledger.js';

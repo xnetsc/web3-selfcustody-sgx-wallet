@@ -46,6 +46,12 @@ import { AuthEngine } from './src/modules/auth-engine/auth-engine.js';
 import { EmergencyAuthorizer } from './src/modules/emergency-auth/index.js';
 import { StateManager } from './src/modules/state-management/state-manager.js';
 import { TransactionSigner } from './src/modules/signing/transaction-signer.js';
+import { LedgerAuthorizer } from './src/modules/ledger/ledger-auth.js';
+import { LedgerService } from './src/modules/ledger/ledger-service.js';
+import { LedgerDepositService } from './src/modules/ledger/ledger-deposits.js';
+import { LedgerWithdrawalService } from './src/modules/ledger/ledger-withdrawals.js';
+import { LedgerGuard } from './src/modules/ledger/ledger-guard.js';
+import { ChainReader } from './src/modules/ledger/chain-reader.js';
 
 import {
   PasskeyRegisterHandler,
@@ -63,6 +69,7 @@ import {
   EvidenceQueryHandler,
   EnclaveInfoHandler,
   WalletListForPlatformHandler,
+  LedgerHandler,
 } from './src/api/index.js';
 
 import { createApp, startServer } from './src/server.js';
@@ -318,9 +325,21 @@ async function main() {
   const initialDuration = getFreezeDurationSeconds();
   console.log(`[SGX Enclave] Account freeze duration: ${initialDuration}s (dynamic, source: contract > env > default)`);
   const walletManager = new WalletManager(connectionManager, engine);
+
+  // 平台账本（站内资产）：授权校验器、记账服务、充值/提现服务、资金护栏、读链通道
+  const ledgerAuthorizer = new LedgerAuthorizer({ passkeyManager, contractClient });
+  const ledgerService = new LedgerService({ connectionManager, engine, authorizer: ledgerAuthorizer });
+  const chainReader = new ChainReader({ contractClient, connectionManager });
+  const ledgerDepositService = new LedgerDepositService({
+    connectionManager, engine, ledgerService, authorizer: ledgerAuthorizer, contractClient, chainReader,
+  });
+  const ledgerWithdrawalService = new LedgerWithdrawalService({
+    connectionManager, engine, ledgerService, authorizer: ledgerAuthorizer, contractClient, chainReader,
+  });
+  const ledgerGuard = new LedgerGuard({ connectionManager, contractClient });
   const sessionManager = new SessionManager(connectionManager, engine);
   const keyImporter = new KeyImporter(sessionManager, walletManager, { importTtlSeconds, engine });
-  const keyExporter = new KeyExporter(walletManager, connectionManager, { exportTtlSeconds, engine });
+  const keyExporter = new KeyExporter(walletManager, connectionManager, { exportTtlSeconds, engine, ledgerExportGuard: ledgerGuard });
   const stateManager = new StateManager(connectionManager, engine);
   const transactionSigner = new TransactionSigner(stateManager, walletManager);
   const authEngine = new AuthEngine({
@@ -369,6 +388,7 @@ async function main() {
       walletManager,
       engine,
       emergencyAuthorizer,
+      ledgerGuard,
     }),
     keyImportHandler: new KeyImportHandler({
       whitelistVerifier,
@@ -426,6 +446,13 @@ async function main() {
     walletListForPlatformHandler: new WalletListForPlatformHandler({
       authEngine,
       walletManager,
+    }),
+    ledgerHandler: new LedgerHandler({
+      whitelistVerifier,
+      ledgerService,
+      ledgerDepositService,
+      ledgerWithdrawalService,
+      contractClient,
     }),
   };
 

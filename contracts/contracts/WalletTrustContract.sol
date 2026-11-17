@@ -586,4 +586,250 @@ contract WalletTrustContract is Ownable {
             true
         );
     }
+
+    // ============ 账本指定（多账本：所有权人与归集地址集由合约指定） ============
+
+    /// @dev 账本指定信息：所有权人（普通钱包账户）与归集地址集（所有权人账户名下钱包地址）
+    struct LedgerDesignation {
+        string ownerUserId;         // 所有权人 userId
+        bytes32 ownerPubKeyHash;    // 所有权人 Passkey 公钥哈希
+        address[] poolAddresses;    // 归集地址集（合约公布）
+        bool enabled;               // 是否启用
+        bool exists;                // 是否已登记
+    }
+
+    /// @dev ledgerId => 账本指定
+    mapping(string => LedgerDesignation) internal _ledgers;
+
+    event LedgerRegistered(string ledgerId, string ownerUserId, bytes32 ownerPubKeyHash);
+    event LedgerOwnerChanged(string ledgerId, string ownerUserId, bytes32 ownerPubKeyHash);
+    event LedgerPoolAddressesUpdated(string ledgerId);
+    event LedgerEnabledChanged(string ledgerId, bool enabled);
+
+    /**
+     * @dev 登记一个账本（Owner 权限）。登记只是指定：账本还须由所有权人持指定
+     *      Passkey 在 SGX 内创建才存在（SGX 侧逻辑，合约只保存指定事实）。
+     */
+    function registerLedger(
+        string calldata _ledgerId,
+        string calldata _ownerUserId,
+        bytes32 _ownerPubKeyHash,
+        address[] calldata _poolAddresses
+    ) external onlyOwner {
+        require(bytes(_ledgerId).length > 0, "Empty ledgerId");
+        require(!_ledgers[_ledgerId].exists, "Ledger already registered");
+        require(bytes(_ownerUserId).length > 0, "Empty ownerUserId");
+        require(_ownerPubKeyHash != bytes32(0), "Empty ownerPubKeyHash");
+
+        LedgerDesignation storage ledger = _ledgers[_ledgerId];
+        ledger.ownerUserId = _ownerUserId;
+        ledger.ownerPubKeyHash = _ownerPubKeyHash;
+        ledger.enabled = true;
+        ledger.exists = true;
+        for (uint256 i = 0; i < _poolAddresses.length; i++) {
+            require(_poolAddresses[i] != address(0), "Invalid pool address");
+            ledger.poolAddresses.push(_poolAddresses[i]);
+        }
+
+        emit LedgerRegistered(_ledgerId, _ownerUserId, _ownerPubKeyHash);
+    }
+
+    /// @dev 变更账本所有权人（Owner 权限）；SGX 每次敏感操作实时查本记录，变更即时生效
+    function setLedgerOwner(
+        string calldata _ledgerId,
+        string calldata _ownerUserId,
+        bytes32 _ownerPubKeyHash
+    ) external onlyOwner {
+        require(_ledgers[_ledgerId].exists, "Ledger not found");
+        require(bytes(_ownerUserId).length > 0, "Empty ownerUserId");
+        require(_ownerPubKeyHash != bytes32(0), "Empty ownerPubKeyHash");
+
+        _ledgers[_ledgerId].ownerUserId = _ownerUserId;
+        _ledgers[_ledgerId].ownerPubKeyHash = _ownerPubKeyHash;
+
+        emit LedgerOwnerChanged(_ledgerId, _ownerUserId, _ownerPubKeyHash);
+    }
+
+    /// @dev 整体替换账本的归集地址集（Owner 权限）
+    function setLedgerPoolAddresses(
+        string calldata _ledgerId,
+        address[] calldata _poolAddresses
+    ) external onlyOwner {
+        require(_ledgers[_ledgerId].exists, "Ledger not found");
+
+        delete _ledgers[_ledgerId].poolAddresses;
+        for (uint256 i = 0; i < _poolAddresses.length; i++) {
+            require(_poolAddresses[i] != address(0), "Invalid pool address");
+            _ledgers[_ledgerId].poolAddresses.push(_poolAddresses[i]);
+        }
+
+        emit LedgerPoolAddressesUpdated(_ledgerId);
+    }
+
+    /// @dev 启用/停用账本（Owner 权限）；停用后 SGX 拒绝该账本的一切敏感操作与入账
+    function setLedgerEnabled(string calldata _ledgerId, bool _enabled) external onlyOwner {
+        require(_ledgers[_ledgerId].exists, "Ledger not found");
+        _ledgers[_ledgerId].enabled = _enabled;
+        emit LedgerEnabledChanged(_ledgerId, _enabled);
+    }
+
+    /// @dev 查询账本指定（任何人可调用；SGX 实时调用核对所有权与归集地址集）
+    function getLedger(
+        string calldata _ledgerId
+    ) external view returns (
+        string memory ownerUserId,
+        bytes32 ownerPubKeyHash,
+        address[] memory poolAddresses,
+        bool enabled,
+        bool exists
+    ) {
+        LedgerDesignation storage ledger = _ledgers[_ledgerId];
+        if (!ledger.exists) {
+            return ("", bytes32(0), new address[](0), false, false);
+        }
+        return (ledger.ownerUserId, ledger.ownerPubKeyHash, ledger.poolAddresses, ledger.enabled, true);
+    }
+
+    // ============ 账本提现风控规则（单笔/日累计限额，SGX 强制执行） ============
+
+    /// @dev (ledgerId, 资产地址) => 提现限额；资产地址 address(0) 表示原生币，0 表示该项不限
+    struct WithdrawalPolicy {
+        uint256 maxSingleAmount;
+        uint256 maxDailyAmount;
+        bool exists;
+    }
+
+    mapping(string => mapping(address => WithdrawalPolicy)) internal _withdrawalPolicies;
+
+    event LedgerWithdrawalPolicyUpdated(string ledgerId, address asset);
+
+    /// @dev 设置某账本某资产的提现风控规则（Owner 权限，整体替换）
+    function setLedgerWithdrawalPolicy(
+        string calldata _ledgerId,
+        address _asset,
+        uint256 _maxSingleAmount,
+        uint256 _maxDailyAmount
+    ) external onlyOwner {
+        require(_ledgers[_ledgerId].exists, "Ledger not found");
+        WithdrawalPolicy storage policy = _withdrawalPolicies[_ledgerId][_asset];
+        policy.maxSingleAmount = _maxSingleAmount;
+        policy.maxDailyAmount = _maxDailyAmount;
+        policy.exists = true;
+        emit LedgerWithdrawalPolicyUpdated(_ledgerId, _asset);
+    }
+
+    /// @dev 查询某账本某资产的提现风控规则（任何人可调用；SGX 提现申请时实时调用）
+    function getLedgerWithdrawalPolicy(
+        string calldata _ledgerId,
+        address _asset
+    ) external view returns (uint256 maxSingleAmount, uint256 maxDailyAmount, bool exists) {
+        WithdrawalPolicy storage policy = _withdrawalPolicies[_ledgerId][_asset];
+        if (!policy.exists) return (0, 0, false);
+        return (policy.maxSingleAmount, policy.maxDailyAmount, true);
+    }
+
+    // ============ 归集地址出金目标配置（每个归集地址各自可出金到哪里） ============
+
+    /// @dev (ledgerId, 归集地址) => 允许出金到的目标地址集；未配置即不许出金（默认拒绝）
+    mapping(string => mapping(address => address[])) internal _collectionPayoutTargets;
+
+    event CollectionPayoutTargetsUpdated(string ledgerId, address source);
+
+    /**
+     * @dev 设置某账本某个归集地址可出金到的目标地址集（Owner 权限，整体替换）。
+     *      源地址必须是该账本已登记的归集地址。账本所有权人从归集地址出金时，
+     *      SGX 实时读本配置检查目标地址，不在集内即拒绝签名。
+     */
+    function setCollectionPayoutTargets(
+        string calldata _ledgerId,
+        address _source,
+        address[] calldata _targets
+    ) external onlyOwner {
+        require(_ledgers[_ledgerId].exists, "Ledger not found");
+        bool isPool = false;
+        address[] storage pool = _ledgers[_ledgerId].poolAddresses;
+        for (uint256 i = 0; i < pool.length; i++) {
+            if (pool[i] == _source) { isPool = true; break; }
+        }
+        require(isPool, "Source is not a collection address of this ledger");
+
+        delete _collectionPayoutTargets[_ledgerId][_source];
+        for (uint256 i = 0; i < _targets.length; i++) {
+            require(_targets[i] != address(0), "Invalid target address");
+            _collectionPayoutTargets[_ledgerId][_source].push(_targets[i]);
+        }
+
+        emit CollectionPayoutTargetsUpdated(_ledgerId, _source);
+    }
+
+    /// @dev 查询某账本某归集地址可出金到的目标地址集（任何人可调用；SGX 出金时实时调用）
+    function getCollectionPayoutTargets(
+        string calldata _ledgerId,
+        address _source
+    ) external view returns (address[] memory) {
+        return _collectionPayoutTargets[_ledgerId][_source];
+    }
+
+    // ============ 链读链配置（资产读链专用，与操作合约的 RPC 分开） ============
+
+    /// @dev 单条链的读链配置：以 (chainName, chainId) 标识，RPC 地址集 + 对应 TLS CA + 入账确认数
+    struct ChainRpcConfig {
+        string chainName;
+        string[] rpcUrls;       // RPC 地址集（必须全部为 https，SGX 侧强制校验）
+        string[] caCerts;       // 与 rpcUrls 一一对应的 TLS CA 证书（PEM 文本，无则空字符串）
+        uint256 confirmations;  // 入账所需确认数
+        bool exists;
+    }
+
+    /// @dev chainId => 链读链配置
+    mapping(uint256 => ChainRpcConfig) internal _chainRpcConfigs;
+
+    event ChainRpcConfigUpdated(uint256 chainId, string chainName);
+
+    /**
+     * @dev 设置一条链的读链配置（Owner 权限，整体替换）。
+     *      SGX 每次入账核验前实时读本配置，不用缓存；端点须为 https（SGX 侧拒绝 http）。
+     */
+    function setChainRpcConfig(
+        string calldata _chainName,
+        uint256 _chainId,
+        string[] calldata _rpcUrls,
+        string[] calldata _caCerts,
+        uint256 _confirmations
+    ) external onlyOwner {
+        require(bytes(_chainName).length > 0, "Empty chainName");
+        require(_chainId > 0, "Invalid chainId");
+        require(_rpcUrls.length > 0, "Empty rpcUrls");
+        require(_rpcUrls.length == _caCerts.length, "rpcUrls/caCerts length mismatch");
+
+        ChainRpcConfig storage config = _chainRpcConfigs[_chainId];
+        config.chainName = _chainName;
+        delete config.rpcUrls;
+        delete config.caCerts;
+        for (uint256 i = 0; i < _rpcUrls.length; i++) {
+            config.rpcUrls.push(_rpcUrls[i]);
+            config.caCerts.push(_caCerts[i]);
+        }
+        config.confirmations = _confirmations;
+        config.exists = true;
+
+        emit ChainRpcConfigUpdated(_chainId, _chainName);
+    }
+
+    /// @dev 查询链读链配置（任何人可调用；SGX 入账核验前实时调用）
+    function getChainRpcConfig(
+        uint256 _chainId
+    ) external view returns (
+        string memory chainName,
+        string[] memory rpcUrls,
+        string[] memory caCerts,
+        uint256 confirmations,
+        bool exists
+    ) {
+        ChainRpcConfig storage config = _chainRpcConfigs[_chainId];
+        if (!config.exists) {
+            return ("", new string[](0), new string[](0), 0, false);
+        }
+        return (config.chainName, config.rpcUrls, config.caCerts, config.confirmations, true);
+    }
 }

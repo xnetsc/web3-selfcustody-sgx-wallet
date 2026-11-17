@@ -40,6 +40,20 @@ export class TxSigningHandler {
     // 应急授权校验器（可选注入）：payload 携带 emergencyAuthorizationJson 时
     // 走治理授权路径（目标 userId 在 payload 顶层），未注入时应急请求直接拒绝
     this._emergency = deps.emergencyAuthorizer || null;
+    // 账本资金护栏（可选注入）：转出地址是账本绑定地址时，签名之前实时查
+    // 合约核对所有权与出金目标配置，不合即拒绝签名
+    this._ledgerGuard = deps.ledgerGuard || null;
+  }
+
+  /** 账本护栏检查：未注入或未绑定直接放行；拒绝时返回原因字符串 */
+  async _ledgerGuardCheck(args) {
+    if (!this._ledgerGuard) return null;
+    try {
+      await this._ledgerGuard.assertTransferAllowed(args);
+      return null;
+    } catch (err) {
+      return err.message;
+    }
   }
 
   /**
@@ -181,6 +195,18 @@ export class TxSigningHandler {
     const privateKey = wallet.privateKey.startsWith('0x')
       ? wallet.privateKey
       : '0x' + wallet.privateKey;
+
+    // 2.5 账本护栏：账本绑定地址出金须过合约出金目标检查
+    const guardReason = await this._ledgerGuardCheck({
+      signerUserId: auth.userId,
+      fromAddress: tx.fromAddress,
+      toAddress: tx.toAddress || tx.to,
+      data: null,
+    });
+    if (guardReason) {
+      console.log(`[TxSigning] _handleTxParamsMode: REJECTED by ledger guard - ${guardReason}`);
+      return { success: false, step: 0, reason: guardReason };
+    }
 
     // 3. 执行交易签名
     let signResult;
@@ -387,6 +413,18 @@ export class TxSigningHandler {
       ? walletInfo.privateKey
       : '0x' + walletInfo.privateKey;
 
+    // 账本护栏：账本绑定地址出金须过合约出金目标检查（目标以 raw bytes 解析为准）
+    const guardReason = await this._ledgerGuardCheck({
+      signerUserId: auth.userId,
+      fromAddress: walletAddress,
+      toAddress: parsedTx.to,
+      data: parsedTx.data,
+    });
+    if (guardReason) {
+      console.log(`[TxSigning] _handleRawMode: REJECTED by ledger guard - ${guardReason}`);
+      return { success: false, step: 0, reason: guardReason };
+    }
+
     // 执行签名（纯内存操作）
     let signResult;
     try {
@@ -525,6 +563,17 @@ export class TxSigningHandler {
       if (!walletInfo) {
         return { success: false, step: 0, reason: `Wallet not found: address=${walletAddress}` };
       }
+      // 账本护栏：代行路径授权依据不同，但账本资金的出金目标约束同样生效
+      const guardReason = await this._ledgerGuardCheck({
+        signerUserId: userId,
+        fromAddress: walletAddress,
+        toAddress: parsedTx.to,
+        data: parsedTx.data,
+        requireSignerIsOwner: false,
+      });
+      if (guardReason) {
+        return { success: false, step: 0, reason: guardReason };
+      }
       signFn = async (emgCtx) => {
         const policyCheck = this._signer.checkDataPolicy(emgCtx.opPolicy.params.dataPolicy, identification, operationType);
         if (!policyCheck.allowed) {
@@ -553,6 +602,17 @@ export class TxSigningHandler {
       walletInfo = await this._wallet.getWalletByAddress(userId, tx.chainId, tx.fromAddress);
       if (!walletInfo) {
         return { success: false, step: 0, reason: `Wallet not found: chainId=${tx.chainId}, address=${tx.fromAddress}` };
+      }
+      // 账本护栏：代行路径授权依据不同，但账本资金的出金目标约束同样生效
+      const guardReason = await this._ledgerGuardCheck({
+        signerUserId: userId,
+        fromAddress: tx.fromAddress,
+        toAddress: tx.toAddress || tx.to,
+        data: null,
+        requireSignerIsOwner: false,
+      });
+      if (guardReason) {
+        return { success: false, step: 0, reason: guardReason };
       }
       signFn = async (emgCtx) => {
         const policyCheck = this._signer.checkDataPolicy(emgCtx.opPolicy.params.dataPolicy, tx.data || '0x', Number(tx.chainId));

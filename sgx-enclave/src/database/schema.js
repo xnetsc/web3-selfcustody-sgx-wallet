@@ -52,6 +52,7 @@ CREATE TABLE IF NOT EXISTS wallets (
     address TEXT NOT NULL,
     private_key TEXT NOT NULL,
     derivation_path TEXT,
+    export_locked INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     _hlc TEXT NOT NULL DEFAULT '0',
     UNIQUE (user_id, chain_id, address)
@@ -300,6 +301,141 @@ export const CREATE_EMERGENCY_EXECUTION_LOGS_INDEXES_SQL = [
 // 一旦钉住，enclave 永久使用该合约身份，忽略环境变量里的合约连接参数；
 // 钉住的合约不可达时使用该快照作为最后已知配置，绝不回退到环境变量。
 // 参与跨节点同步（HLC LWW），确保所有节点用同一份钉住数据。
+export const CREATE_LEDGERS_SQL = `
+CREATE TABLE IF NOT EXISTS ledgers (
+    ledger_id TEXT PRIMARY KEY,
+    owner_user_id TEXT NOT NULL,
+    owner_pub_key_hash TEXT NOT NULL,
+    created_by_credential_id TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    _hlc TEXT NOT NULL
+)`;
+
+export const CREATE_LEDGER_BALANCES_SQL = `
+CREATE TABLE IF NOT EXISTS ledger_balances (
+    ledger_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    chain_id INTEGER NOT NULL,
+    asset_id TEXT NOT NULL,
+    available TEXT NOT NULL DEFAULT '0',
+    frozen TEXT NOT NULL DEFAULT '0',
+    withheld TEXT NOT NULL DEFAULT '0',
+    updated_at TEXT NOT NULL,
+    _hlc TEXT NOT NULL,
+    PRIMARY KEY (ledger_id, user_id, chain_id, asset_id)
+)`;
+
+export const CREATE_LEDGER_ENTRIES_SQL = `
+CREATE TABLE IF NOT EXISTS ledger_entries (
+    entry_id TEXT PRIMARY KEY,
+    ledger_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    chain_id INTEGER NOT NULL,
+    asset_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    amount TEXT NOT NULL,
+    available_delta TEXT NOT NULL,
+    frozen_delta TEXT NOT NULL,
+    withheld_delta TEXT NOT NULL DEFAULT '0',
+    balance_after_available TEXT NOT NULL,
+    balance_after_frozen TEXT NOT NULL,
+    balance_after_withheld TEXT NOT NULL DEFAULT '0',
+    ref_type TEXT,
+    ref_id TEXT,
+    counterparty_user_id TEXT,
+    idempotency_key TEXT,
+    created_at TEXT NOT NULL,
+    _hlc TEXT NOT NULL
+)`;
+
+export const CREATE_LEDGER_ENTRIES_INDEXES_SQL = [
+    `CREATE INDEX IF NOT EXISTS idx_ledger_entries_ledger_user ON ledger_entries (ledger_id, user_id, created_at)`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS idx_ledger_entries_idem ON ledger_entries (ledger_id, idempotency_key) WHERE idempotency_key IS NOT NULL`,
+];
+
+export const CREATE_LEDGER_DEPOSITS_SQL = `
+CREATE TABLE IF NOT EXISTS ledger_deposits (
+    deposit_id TEXT PRIMARY KEY,
+    ledger_id TEXT NOT NULL,
+    user_id TEXT,
+    chain_id INTEGER NOT NULL,
+    asset_id TEXT NOT NULL,
+    tx_hash TEXT NOT NULL,
+    log_index INTEGER,
+    from_address TEXT,
+    to_address TEXT NOT NULL,
+    amount TEXT NOT NULL,
+    status TEXT NOT NULL,
+    confirmations_seen INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    _hlc TEXT NOT NULL,
+    UNIQUE (chain_id, tx_hash, log_index)
+)`;
+
+export const CREATE_LEDGER_DEPOSITS_INDEXES_SQL = [
+    `CREATE INDEX IF NOT EXISTS idx_ledger_deposits_ledger_status ON ledger_deposits (ledger_id, status)`,
+    `CREATE INDEX IF NOT EXISTS idx_ledger_deposits_user ON ledger_deposits (ledger_id, user_id)`,
+];
+
+export const CREATE_LEDGER_WITHDRAWALS_SQL = `
+CREATE TABLE IF NOT EXISTS ledger_withdrawals (
+    withdrawal_id TEXT PRIMARY KEY,
+    ledger_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    chain_id INTEGER NOT NULL,
+    asset_id TEXT NOT NULL,
+    amount TEXT NOT NULL,
+    to_address TEXT NOT NULL,
+    source_address TEXT,
+    status TEXT NOT NULL,
+    tx_hash TEXT,
+    raw_tx TEXT,
+    idempotency_key TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    _hlc TEXT NOT NULL
+)`;
+
+export const CREATE_LEDGER_WITHDRAWALS_INDEXES_SQL = [
+    `CREATE INDEX IF NOT EXISTS idx_ledger_withdrawals_ledger_status ON ledger_withdrawals (ledger_id, status)`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS idx_ledger_withdrawals_idem ON ledger_withdrawals (ledger_id, idempotency_key) WHERE idempotency_key IS NOT NULL`,
+];
+
+export const CREATE_LEDGER_FREEZES_SQL = `
+CREATE TABLE IF NOT EXISTS ledger_freezes (
+    freeze_id TEXT PRIMARY KEY,
+    ledger_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    chain_id INTEGER,
+    asset_id TEXT,
+    target_amount TEXT,
+    held_amount TEXT NOT NULL DEFAULT '0',
+    status TEXT NOT NULL,
+    reason TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    _hlc TEXT NOT NULL
+)`;
+
+export const CREATE_LEDGER_FREEZES_INDEXES_SQL = [
+    `CREATE INDEX IF NOT EXISTS idx_ledger_freezes_lookup ON ledger_freezes (ledger_id, user_id, status)`,
+];
+
+export const CREATE_LEDGER_DEPOSIT_ADDRESSES_SQL = `
+CREATE TABLE IF NOT EXISTS ledger_deposit_addresses (
+    ledger_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    chain_id INTEGER NOT NULL,
+    address TEXT NOT NULL,
+    owner_user_id TEXT NOT NULL,
+    wallet_id TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    _hlc TEXT NOT NULL,
+    PRIMARY KEY (ledger_id, user_id, chain_id),
+    UNIQUE (ledger_id, chain_id, address)
+)`;
+
 export const CREATE_PINNED_CONTRACT_SQL = `
 CREATE TABLE IF NOT EXISTS pinned_contract (
     id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -333,6 +469,13 @@ export const ALL_TABLE_SQLS = [
     { name: 'emergency_authorization_uses', sql: CREATE_EMERGENCY_AUTHORIZATION_USES_SQL, indexes: CREATE_EMERGENCY_AUTHORIZATION_USES_INDEXES_SQL },
     { name: 'emergency_execution_logs', sql: CREATE_EMERGENCY_EXECUTION_LOGS_SQL, indexes: CREATE_EMERGENCY_EXECUTION_LOGS_INDEXES_SQL },
     { name: 'pinned_contract', sql: CREATE_PINNED_CONTRACT_SQL, indexes: [] },
+    { name: 'ledgers', sql: CREATE_LEDGERS_SQL, indexes: [] },
+    { name: 'ledger_balances', sql: CREATE_LEDGER_BALANCES_SQL, indexes: [] },
+    { name: 'ledger_entries', sql: CREATE_LEDGER_ENTRIES_SQL, indexes: CREATE_LEDGER_ENTRIES_INDEXES_SQL },
+    { name: 'ledger_deposits', sql: CREATE_LEDGER_DEPOSITS_SQL, indexes: CREATE_LEDGER_DEPOSITS_INDEXES_SQL },
+    { name: 'ledger_withdrawals', sql: CREATE_LEDGER_WITHDRAWALS_SQL, indexes: CREATE_LEDGER_WITHDRAWALS_INDEXES_SQL },
+    { name: 'ledger_freezes', sql: CREATE_LEDGER_FREEZES_SQL, indexes: CREATE_LEDGER_FREEZES_INDEXES_SQL },
+    { name: 'ledger_deposit_addresses', sql: CREATE_LEDGER_DEPOSIT_ADDRESSES_SQL, indexes: [] },
 ];
 
 /**
@@ -344,6 +487,12 @@ export function initializeSchema(db) {
     // 启用 WAL 模式（性能更好，允许并发读）
     db.pragma('journal_mode = WAL');
     db.pragma('foreign_keys = ON');
+
+    // 存量库补列：wallets.export_locked（专属充值地址永久禁止导出标记）
+    const walletCols = db.pragma('table_info(wallets)').map((c) => c.name);
+    if (walletCols.length > 0 && !walletCols.includes('export_locked')) {
+        db.exec('ALTER TABLE wallets ADD COLUMN export_locked INTEGER NOT NULL DEFAULT 0');
+    }
 
     for (const { name, sql, indexes } of ALL_TABLE_SQLS) {
         db.exec(sql);

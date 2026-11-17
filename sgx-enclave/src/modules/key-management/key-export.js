@@ -72,6 +72,37 @@ export class KeyExporter {
     this._db = connectionManager;
     this._engine = options.engine;
     this._exportTtlSeconds = options.exportTtlSeconds || DEFAULT_EXPORT_TTL_SECONDS;
+    // 账本导出护栏（可选注入）：专属充值地址永久禁导出，公布集内地址动态锁定
+    this._ledgerExportGuard = options.ledgerExportGuard || null;
+  }
+
+  /** 按 exportInfo 解析待导出钱包行（与导出过滤逻辑同口径），供护栏检查 */
+  _resolveExportRows(userId, exportInfo) {
+    const rows = [];
+    for (const item of exportInfo) {
+      const all = this._db.readQuery(
+        'SELECT address, export_locked FROM wallets WHERE user_id = ? AND wallet_id = ?',
+        [userId, item.walletId]
+      );
+      if (!item.addresses || item.addresses.length === 0) {
+        rows.push(...all);
+        continue;
+      }
+      for (const row of all) {
+        // 护栏按地址粒度判定（同一地址跨链共用同一密钥），不区分链
+        const hit = item.addresses.some((addr) => (
+          typeof addr === 'string' ? row.address === addr : row.address === addr.address
+        ));
+        if (hit) rows.push(row);
+      }
+    }
+    return rows;
+  }
+
+  async _assertLedgerExportAllowed(userId, exportInfo) {
+    if (!this._ledgerExportGuard) return;
+    const rows = this._resolveExportRows(userId, exportInfo);
+    await this._ledgerExportGuard.assertExportAllowed(rows);
   }
 
   /**
@@ -142,6 +173,9 @@ export class KeyExporter {
     } else {
       keyType = 'ecdh';
     }
+
+    // 账本导出护栏：密钥释放之前实时核对（公布集成员/专属充值地址拒绝导出）
+    await this._assertLedgerExportAllowed(userId, exportInfo);
 
     const sessionId = crypto.randomUUID();
     const ttl = this._exportTtlSeconds;
@@ -283,6 +317,9 @@ export class KeyExporter {
     }
 
     console.log(`[KeyExporter] confirmExport: session found, userId=${session.user_id}, exportInfo=${session.export_info}`);
+
+    // 账本导出护栏复核：会话创建后地址可能新进入公布集，删除前再查一次
+    await this._assertLedgerExportAllowed(session.user_id, exportInfo);
 
     // 2. 事务内：批量删除钱包 + 删除会话
     return this._engine.write(async (db) => {

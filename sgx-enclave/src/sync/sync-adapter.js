@@ -319,7 +319,7 @@ export const BUSINESS_TABLES = {
     },
     wallets: {
         keyColumns: ['user_id', 'chain_id', 'address'],
-        dataColumns: ['user_id', 'wallet_id', 'wallet_type', 'mnemonic', 'chain_id', 'coin_type', 'address', 'private_key', 'derivation_path', 'created_at', '_hlc'],
+        dataColumns: ['user_id', 'wallet_id', 'wallet_type', 'mnemonic', 'chain_id', 'coin_type', 'address', 'private_key', 'derivation_path', 'export_locked', 'created_at', '_hlc'],
         validator: TABLE_VALIDATORS.wallets,
     },
     authorization_states: {
@@ -369,6 +369,34 @@ export const BUSINESS_TABLES = {
         // 表内不设自增 id（节点本地自增号在同步表里没有意义）
         keyColumns: ['entry_hash'],
         dataColumns: ['entry_hash', 'created_at', 'authorization_id', 'auth_hash', 'operator_user_id', 'operator_pub_key_hash', 'platform_address', 'target_user_id', 'operation', 'execution_index', 'detail', 'result', 'outcome', 'prev_hash', '_hlc'],
+    },
+    ledgers: {
+        keyColumns: ['ledger_id'],
+        dataColumns: ['ledger_id', 'owner_user_id', 'owner_pub_key_hash', 'created_by_credential_id', 'created_at', '_hlc'],
+    },
+    ledger_balances: {
+        keyColumns: ['ledger_id', 'user_id', 'chain_id', 'asset_id'],
+        dataColumns: ['ledger_id', 'user_id', 'chain_id', 'asset_id', 'available', 'frozen', 'withheld', 'updated_at', '_hlc'],
+    },
+    ledger_entries: {
+        keyColumns: ['entry_id'],
+        dataColumns: ['entry_id', 'ledger_id', 'user_id', 'chain_id', 'asset_id', 'kind', 'amount', 'available_delta', 'frozen_delta', 'withheld_delta', 'balance_after_available', 'balance_after_frozen', 'balance_after_withheld', 'ref_type', 'ref_id', 'counterparty_user_id', 'idempotency_key', 'created_at', '_hlc'],
+    },
+    ledger_deposits: {
+        keyColumns: ['deposit_id'],
+        dataColumns: ['deposit_id', 'ledger_id', 'user_id', 'chain_id', 'asset_id', 'tx_hash', 'log_index', 'from_address', 'to_address', 'amount', 'status', 'confirmations_seen', 'created_at', 'updated_at', '_hlc'],
+    },
+    ledger_withdrawals: {
+        keyColumns: ['withdrawal_id'],
+        dataColumns: ['withdrawal_id', 'ledger_id', 'user_id', 'chain_id', 'asset_id', 'amount', 'to_address', 'source_address', 'status', 'tx_hash', 'raw_tx', 'idempotency_key', 'created_at', 'updated_at', '_hlc'],
+    },
+    ledger_freezes: {
+        keyColumns: ['freeze_id'],
+        dataColumns: ['freeze_id', 'ledger_id', 'user_id', 'chain_id', 'asset_id', 'target_amount', 'held_amount', 'status', 'reason', 'created_at', 'updated_at', '_hlc'],
+    },
+    ledger_deposit_addresses: {
+        keyColumns: ['ledger_id', 'user_id', 'chain_id'],
+        dataColumns: ['ledger_id', 'user_id', 'chain_id', 'address', 'owner_user_id', 'wallet_id', 'created_at', '_hlc'],
     },
     webauthn_challenges: {
         // id 是节点本地自增主键，不参与同步；以全局唯一的 challenge 字符串为同步键
