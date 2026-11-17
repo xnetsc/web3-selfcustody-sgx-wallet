@@ -274,7 +274,7 @@ export function parseAuthorization(auth) {
  * @param {number} chainId - 链 ID
  * @returns {boolean} 是否有效
  */
-function isValidTokenAddress(tokenAddress, chainId) {
+export function isValidTokenAddress(tokenAddress, chainId) {
   // 通配符 "*"：匹配任意 token
   if (tokenAddress === '*') {
     return true;

@@ -13,6 +13,8 @@
  *  - 每项可带 maxUses（正整数），缺省 1。
  */
 
+import { isValidTokenAddress } from '../auth-engine/authorization-parser.js';
+
 export const EMERGENCY_OPERATIONS = [
   'tx_sign',           // 交易签名（转账/合约调用/部署/7702 等，范围由 scope 字段约束）
   'wallet_create',     // 创建钱包
@@ -132,6 +134,10 @@ export function parseEmergencyAuthorization(auth) {
           for (const item of params.tokenRestrictions) {
             if (!item || item.chainId === undefined || typeof item.tokenAddress !== 'string' || item.tokenAddress === '') {
               return { valid: false, reason: 'tx_sign policy tokenRestrictions items require chainId and tokenAddress' };
+            }
+            // 与普通授权同一口径：只认合约地址、通配符或带本项 chainId 前缀的原生币标识，币名不是合法标识
+            if (!isValidTokenAddress(item.tokenAddress, item.chainId)) {
+              return { valid: false, reason: `Invalid tokenAddress in tx_sign policy tokenRestrictions: ${item.tokenAddress}. Must be a valid Ethereum address, "*" wildcard, or special identifier "${item.chainId}_native" / "${item.chainId}_unknown"` };
             }
           }
         }

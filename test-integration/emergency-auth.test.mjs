@@ -213,6 +213,25 @@ function verifyArgs(authJson, overrides = {}) {
 
 test('parser: 合法授权通过', () => {
   assert.equal(parseEmergencyAuthorization(buildAuth()).valid, true);
+
+test('parser: tx_sign tokenRestrictions only accept contract addresses or chain-prefixed native markers, never names', () => {
+  const USDT = '0xdAC17F958D2ee523a2206206994597C13D831ec7';
+  const withRestrictions = (tokenRestrictions) => {
+    const auth = buildAuth();
+    auth.wallets[0].policy.operations.tx_sign.tokenRestrictions = tokenRestrictions;
+    return parseEmergencyAuthorization(auth);
+  };
+  // 币名不是合法标识：直接拒
+  assert.equal(withRestrictions([{ chainId: 1, tokenAddress: 'USDT' }]).valid, false);
+  // 裸 native 无法确定是哪条链：拒
+  assert.equal(withRestrictions([{ chainId: 1, tokenAddress: 'native' }]).valid, false);
+  // 哨兵前缀与本项 chainId 不符：拒
+  assert.equal(withRestrictions([{ chainId: 1, tokenAddress: '56_native' }]).valid, false);
+  // 合约地址、本链原生币哨兵、通配符：合法
+  assert.equal(withRestrictions([{ chainId: 1, tokenAddress: USDT }]).valid, true);
+  assert.equal(withRestrictions([{ chainId: 1, tokenAddress: '1_native' }]).valid, true);
+  assert.equal(withRestrictions([{ chainId: 1, tokenAddress: '*' }]).valid, true);
+});
 });
 
 test('parser: grantee 为通配符或数组时拒绝', () => {
