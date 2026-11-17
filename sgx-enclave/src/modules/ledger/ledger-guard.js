@@ -7,7 +7,8 @@
  * 合约指定的那把所有权人 Passkey（同一账号的其它 Passkey 不能动绑定
  * 地址）、目标地址在合约为（账本、源地址）配置的出金目标集内；目标若是
  * SGX 托管钱包，还须是原生钱包（导入钱包私钥在外部存在过，不合格）。
- * 任一不合，拒绝签名。
+ * 任一不合，拒绝签名。本护栏只挂普通授权路径：应急授权路径不经此
+ * 护栏，应急操作只按应急授权自身的合约校验与 policy 执行。
  *
  * 导出护栏（密钥释放之前）：专属充值地址永久禁止导出；地址在任一账本的
  * 合约公布集内时禁止导出（移出公布集后锁定解除）；本地存在账本而合约
@@ -82,15 +83,14 @@ export class LedgerGuard {
   /**
    * 转账签名前的护栏。未绑定地址直接放行；绑定地址任一检查不合即抛错拒绝。
    * @param {Object} args
-   * @param {string} args.signerUserId - 签名账户（普通路径）或目标账户（应急路径传目标用户并关闭所有权检查）
-   * @param {string} [args.signerCredentialId] - 本次授权实际签名用的 Passkey（普通路径）：绑定地址只认合约指定的那把
+   * @param {string} args.signerUserId - 签名账户
+   * @param {string} [args.signerCredentialId] - 本次授权实际签名用的 Passkey：绑定地址只认合约指定的那把
    * @param {string} args.fromAddress
    * @param {string} args.toAddress
    * @param {string} [args.data] - 交易 data（raw 模式解实际收款方用）
-   * @param {boolean} [args.requireSignerIsOwner=true] - 应急代行路径传 false：授权依据不同，但出金目标约束同样生效
    * @returns {Promise<{bound: boolean, ledgerId?: string}>}
    */
-  async assertTransferAllowed({ signerUserId, signerCredentialId = null, fromAddress, toAddress, data = null, requireSignerIsOwner = true }) {
+  async assertTransferAllowed({ signerUserId, signerCredentialId = null, fromAddress, toAddress, data = null }) {
     const binding = await this.findBinding(fromAddress);
     if (!binding) return { bound: false };
     const { ledgerId } = binding;
@@ -103,7 +103,7 @@ export class LedgerGuard {
     }
     if (!designation) throw new Error(`Ledger guard: ledger ${ledgerId} is not designated on contract`);
     if (!designation.enabled) throw new Error(`Ledger guard: ledger ${ledgerId} is disabled`);
-    if (requireSignerIsOwner) {
+    {
       if (designation.ownerUserId !== signerUserId) {
         throw new Error('Ledger guard: source address is ledger-bound and the signer is not the ledger owner');
       }

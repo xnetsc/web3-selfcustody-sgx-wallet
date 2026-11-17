@@ -565,17 +565,6 @@ export class TxSigningHandler {
       if (!walletInfo) {
         return { success: false, step: 0, reason: `Wallet not found: address=${walletAddress}` };
       }
-      // 账本护栏：代行路径授权依据不同，但账本资金的出金目标约束同样生效
-      const guardReason = await this._ledgerGuardCheck({
-        signerUserId: userId,
-        fromAddress: walletAddress,
-        toAddress: parsedTx.to,
-        data: parsedTx.data,
-        requireSignerIsOwner: false,
-      });
-      if (guardReason) {
-        return { success: false, step: 0, reason: guardReason };
-      }
       signFn = async (emgCtx) => {
         const policyCheck = this._signer.checkDataPolicy(emgCtx.opPolicy.params.dataPolicy, identification, operationType);
         if (!policyCheck.allowed) {
@@ -604,17 +593,6 @@ export class TxSigningHandler {
       walletInfo = await this._wallet.getWalletByAddress(userId, tx.chainId, tx.fromAddress);
       if (!walletInfo) {
         return { success: false, step: 0, reason: `Wallet not found: chainId=${tx.chainId}, address=${tx.fromAddress}` };
-      }
-      // 账本护栏：代行路径授权依据不同，但账本资金的出金目标约束同样生效
-      const guardReason = await this._ledgerGuardCheck({
-        signerUserId: userId,
-        fromAddress: tx.fromAddress,
-        toAddress: tx.toAddress || tx.to,
-        data: null,
-        requireSignerIsOwner: false,
-      });
-      if (guardReason) {
-        return { success: false, step: 0, reason: guardReason };
       }
       signFn = async (emgCtx) => {
         const policyCheck = this._signer.checkDataPolicy(emgCtx.opPolicy.params.dataPolicy, tx.data || '0x', Number(tx.chainId));
