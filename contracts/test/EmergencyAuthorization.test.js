@@ -49,7 +49,6 @@ describe("WalletTrustContract - Emergency Authorization", function () {
     timePolicy: { deadline: "2027-01-01T00:00:00.000Z" },
     createdAt: "2026-11-10T00:00:00.000Z",
   });
-  const SIGNATURE_JSON = JSON.stringify({ response: { authenticatorData: "aa", clientDataJSON: "bb", signature: "cc" } });
 
   async function futureTimestamp(offsetSeconds = 7 * 24 * 3600) {
     const block = await ethers.provider.getBlock("latest");
@@ -68,20 +67,19 @@ describe("WalletTrustContract - Emergency Authorization", function () {
   }
 
   async function setAuth(id = "emg-2026-0001", overrides = {}) {
+    const { authorizationJson = AUTH_JSON, ...rest } = overrides;
     const args = {
       authorizationId: id,
-      authorizationJson: AUTH_JSON,
-      signatureJson: SIGNATURE_JSON,
+      authHash: sha256Hex(authorizationJson),
       operatorUserId: OPERATOR_USER_ID,
       operatorPubKeyHash: PUBKEY_HASH,
       grantee: addr1.address,
       expiresAt: await futureTimestamp(),
-      ...overrides,
+      ...rest,
     };
     return contract.setEmergencyAuthorization(
       args.authorizationId,
-      args.authorizationJson,
-      args.signatureJson,
+      args.authHash,
       args.operatorUserId,
       args.operatorPubKeyHash,
       args.grantee,
@@ -130,15 +128,13 @@ describe("WalletTrustContract - Emergency Authorization", function () {
       await designate();
     });
 
-    it("Stores the full record and computes authHash on-chain", async function () {
+    it("Stores the record with the supplied authHash", async function () {
       const expiresAt = await futureTimestamp();
       await expect(setAuth("emg-2026-0001", { expiresAt }))
         .to.emit(contract, "EmergencyAuthorizationSet")
         .withArgs("emg-2026-0001", sha256Hex(AUTH_JSON), OPERATOR_USER_ID, PUBKEY_HASH, addr1.address, expiresAt);
 
       const rec = await contract.getEmergencyAuthorization("emg-2026-0001");
-      expect(rec.authorizationJson).to.equal(AUTH_JSON);
-      expect(rec.signatureJson).to.equal(SIGNATURE_JSON);
       expect(rec.authHash).to.equal(sha256Hex(AUTH_JSON));
       expect(rec.operatorUserId).to.equal(OPERATOR_USER_ID);
       expect(rec.operatorPubKeyHash).to.equal(PUBKEY_HASH);
@@ -178,7 +174,7 @@ describe("WalletTrustContract - Emergency Authorization", function () {
     it("Non-owner cannot set an authorization", async function () {
       const expiresAt = await futureTimestamp();
       await expect(
-        contract.connect(addr1).setEmergencyAuthorization("emg-x", AUTH_JSON, SIGNATURE_JSON, OPERATOR_USER_ID, PUBKEY_HASH, addr1.address, expiresAt)
+        contract.connect(addr1).setEmergencyAuthorization("emg-x", sha256Hex(AUTH_JSON), OPERATOR_USER_ID, PUBKEY_HASH, addr1.address, expiresAt)
       ).to.be.revertedWithCustomError(contract, "OwnableUnauthorizedAccount");
     });
 
@@ -189,13 +185,13 @@ describe("WalletTrustContract - Emergency Authorization", function () {
 
       const rec1 = await contract.getEmergencyAuthorization("emg-2026-0001");
       const rec2 = await contract.getEmergencyAuthorization("emg-2026-0002");
-      expect(rec1.authorizationJson).to.equal(AUTH_JSON);
-      expect(rec2.authorizationJson).to.equal(json2);
+      expect(rec1.authHash).to.equal(sha256Hex(AUTH_JSON));
+      expect(rec2.authHash).to.equal(sha256Hex(json2));
       expect(rec1.authHash).to.not.equal(rec2.authHash);
 
       const missing = await contract.getEmergencyAuthorization("emg-does-not-exist");
       expect(missing.exists).to.equal(false);
-      expect(missing.authorizationJson).to.equal("");
+      expect(missing.authHash).to.equal(ethers.ZeroHash);
     });
   });
 
@@ -211,8 +207,8 @@ describe("WalletTrustContract - Emergency Authorization", function () {
         .withArgs("emg-2026-0001");
       const rec = await contract.getEmergencyAuthorization("emg-2026-0001");
       expect(rec.revoked).to.equal(true);
-      // 全文仍在，事后可审计当时授权了什么
-      expect(rec.authorizationJson).to.equal(AUTH_JSON);
+      // 记录（含哈希）仍在，事后可核对被撤销的是哪份授权
+      expect(rec.authHash).to.equal(sha256Hex(AUTH_JSON));
     });
 
     it("Revoking twice is rejected", async function () {

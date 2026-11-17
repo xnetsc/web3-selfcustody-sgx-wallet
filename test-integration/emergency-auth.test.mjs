@@ -165,8 +165,6 @@ function buildAuth(overrides = {}) {
 function registerOnContract(mock, auth, authJson, overrides = {}) {
   mock.record = {
     __id: auth.authorizationId,
-    authorizationJson: authJson,
-    signatureJson: JSON.stringify(GOOD_SIG),
     authHash: '0x' + crypto.createHash('sha256').update(authJson, 'utf8').digest('hex'),
     operatorUserId: auth.operatorUserId,
     operatorPubKeyHash: OPERATOR_PUBKEY_HASH,

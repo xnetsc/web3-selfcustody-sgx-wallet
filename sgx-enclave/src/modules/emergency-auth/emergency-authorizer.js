@@ -26,6 +26,7 @@
  * 事务内用 StateManager 的事务内方法递增，保证原子性）。
  */
 
+import { createHash } from 'node:crypto';
 import { parseEmergencyAuthorization, findWalletEntry, getOperationPolicy } from './emergency-authorization-parser.js';
 import { computeAuthorizationHash } from '../auth-engine/authorization-parser.js';
 import { matchCron } from '../auth-engine/cron-matcher.js';
@@ -230,7 +231,7 @@ export class EmergencyAuthorizer {
       return reject('emergency authorization cannot operate on the operator account itself');
     }
 
-    // 4. 合约实时核查（fail-closed：查不到、不可用、已撤销、已过期、文本不一致都拒绝）
+    // 4. 合约实时核查（fail-closed：查不到、不可用、已撤销、已过期、递进文本哈希与记录不一致都拒绝）
     let record;
     try {
       record = await this._contract.getEmergencyAuthorization(auth.authorizationId);
@@ -239,8 +240,9 @@ export class EmergencyAuthorizer {
     }
     if (!record) return reject('no emergency authorization record on contract for this authorizationId');
     if (record.revoked) return reject('emergency authorization has been revoked on contract');
-    if (record.authorizationJson !== authorizationJson) {
-      return reject('authorization text does not match the contract record');
+    const presentedAuthHash = createHash('sha256').update(authorizationJson, 'utf8').digest('hex');
+    if (!record.authHash || record.authHash.replace(/^0x/i, '').toLowerCase() !== presentedAuthHash) {
+      return reject('authorization hash does not match the contract record');
     }
     if (record.operatorUserId !== auth.operatorUserId) {
       return reject('operator in authorization does not match the contract record');

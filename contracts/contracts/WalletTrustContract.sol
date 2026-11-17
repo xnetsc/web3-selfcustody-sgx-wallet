@@ -474,11 +474,10 @@ contract WalletTrustContract is Ownable {
 
     // ============ 应急授权（运营方治理，面向他人钱包的全量操作授权） ============
 
-    /// @dev 应急授权记录：授权全文与签名完整存于合约，任何人可查，SGX 以此为唯一有效版本
+    /// @dev 应急授权记录：合约只存授权 JSON 的哈希与核查元数据，不存全文；
+    ///      授权全文由执行方递进 SGX，SGX 对递进文本算 sha256 与本记录比对
     struct EmergencyAuthorization {
-        string authorizationJson;   // 授权 JSON 全文（SGX 对递进文本逐字比对）
-        string signatureJson;       // 治理 Passkey 对授权原文的 WebAuthn 签名（JSON 字符串）
-        bytes32 authHash;           // sha256(authorizationJson)，写入时由合约自算，不采信外部传入
+        bytes32 authHash;           // sha256(授权 JSON 全文)，写入时由 Owner 随记录提交
         string operatorUserId;      // 治理方（运营方）userId
         bytes32 operatorPubKeyHash; // 治理 Passkey 公钥哈希（写入时必须为已指定治理 Passkey）
         address grantee;            // 唯一允许执行本次授权的服务器平台地址
@@ -505,10 +504,10 @@ contract WalletTrustContract is Ownable {
     /**
      * @dev 写入一份应急授权（Owner 权限）
      *      前置条件：签名钥匙必须已被指定为治理 Passkey；authorizationId 全局唯一且永不复用。
-     *      authHash 由合约对 authorizationJson 自行计算，保证记录内的哈希与全文永远一致。
+     *      合约只存授权 JSON 的哈希：_authHash 须为 sha256(授权 JSON 全文)，由写入方
+     *      在链下对原文计算；SGX 执行时对递进文本重算哈希与记录比对，不一致即拒绝。
      * @param _authorizationId 全局唯一授权 ID（写入授权 JSON 原文内）
-     * @param _authorizationJson 授权 JSON 全文
-     * @param _signatureJson 治理 Passkey 对授权原文的 WebAuthn 签名（JSON 字符串）
+     * @param _authHash 授权 JSON 全文的 sha256 哈希
      * @param _operatorUserId 治理方 userId
      * @param _operatorPubKeyHash 治理 Passkey 公钥哈希
      * @param _grantee 唯一允许执行的平台地址
@@ -516,8 +515,7 @@ contract WalletTrustContract is Ownable {
      */
     function setEmergencyAuthorization(
         string calldata _authorizationId,
-        string calldata _authorizationJson,
-        string calldata _signatureJson,
+        bytes32 _authHash,
         string calldata _operatorUserId,
         bytes32 _operatorPubKeyHash,
         address _grantee,
@@ -525,17 +523,14 @@ contract WalletTrustContract is Ownable {
     ) external onlyOwner {
         require(bytes(_authorizationId).length > 0, "Empty authorizationId");
         require(!emergencyAuthorizationExists[_authorizationId], "Authorization id already used");
-        require(bytes(_authorizationJson).length > 0, "Empty authorizationJson");
-        require(bytes(_signatureJson).length > 0, "Empty signatureJson");
+        require(_authHash != bytes32(0), "Empty authHash");
         require(_governancePasskeys[_operatorUserId][_operatorPubKeyHash], "Passkey not designated as governance");
         require(_grantee != address(0), "Invalid grantee");
         require(_expiresAt > block.timestamp, "Authorization already expired");
 
-        bytes32 authHash = sha256(bytes(_authorizationJson));
+        bytes32 authHash = _authHash;
 
         _emergencyAuthorizations[_authorizationId] = EmergencyAuthorization({
-            authorizationJson: _authorizationJson,
-            signatureJson: _signatureJson,
             authHash: authHash,
             operatorUserId: _operatorUserId,
             operatorPubKeyHash: _operatorPubKeyHash,
@@ -560,14 +555,12 @@ contract WalletTrustContract is Ownable {
     }
 
     /**
-     * @dev 查询应急授权记录全文（任何人可调用；SGX 每次执行应急授权时实时调用，
-     *      以链上记录判定有效性：存在、未撤销、未过期、递进文本与记录全文一致）
+     * @dev 查询应急授权记录（任何人可调用；SGX 每次执行应急授权时实时调用，
+     *      以链上记录判定有效性：存在、未撤销、未过期、递进文本的 sha256 与记录 authHash 一致）
      */
     function getEmergencyAuthorization(
         string calldata _authorizationId
     ) external view returns (
-        string memory authorizationJson,
-        string memory signatureJson,
         bytes32 authHash,
         string memory operatorUserId,
         bytes32 operatorPubKeyHash,
@@ -579,12 +572,10 @@ contract WalletTrustContract is Ownable {
     ) {
         exists = emergencyAuthorizationExists[_authorizationId];
         if (!exists) {
-            return ("", "", bytes32(0), "", bytes32(0), address(0), 0, 0, false, false);
+            return (bytes32(0), "", bytes32(0), address(0), 0, 0, false, false);
         }
         EmergencyAuthorization memory record = _emergencyAuthorizations[_authorizationId];
         return (
-            record.authorizationJson,
-            record.signatureJson,
             record.authHash,
             record.operatorUserId,
             record.operatorPubKeyHash,

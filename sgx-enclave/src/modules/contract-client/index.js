@@ -758,7 +758,7 @@ export class ContractClient {
   }
 
   /**
-   * 按 authorizationId 精确查询应急授权记录全文（实时查询）
+   * 按 authorizationId 精确查询应急授权记录（实时查询；合约只存哈希与元数据）
    * @param {string} authorizationId - 全局唯一授权 ID
    * @returns {Promise<Object|null>} 记录对象；链上不存在该 ID 时返回 null
    * @throws 合约不可用时抛错
@@ -771,8 +771,6 @@ export class ContractClient {
     const r = await this._contract.getEmergencyAuthorization(authorizationId);
     if (!r.exists) return null;
     return {
-      authorizationJson: r.authorizationJson,
-      signatureJson: r.signatureJson,
       authHash: r.authHash,
       operatorUserId: r.operatorUserId,
       operatorPubKeyHash: r.operatorPubKeyHash,

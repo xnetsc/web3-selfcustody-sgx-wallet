@@ -111,9 +111,9 @@ const WALLET_TRUST_CONTRACT_ABI = [
   'function designateGovernancePasskey(string calldata _userId, bytes32 _pubKeyHash) external',
   'function removeGovernancePasskey(string calldata _userId, bytes32 _pubKeyHash) external',
   'function isGovernancePasskey(string calldata _userId, bytes32 _pubKeyHash) external view returns (bool)',
-  'function setEmergencyAuthorization(string calldata _authorizationId, string calldata _authorizationJson, string calldata _signatureJson, string calldata _operatorUserId, bytes32 _operatorPubKeyHash, address _grantee, uint256 _expiresAt) external',
+  'function setEmergencyAuthorization(string calldata _authorizationId, bytes32 _authHash, string calldata _operatorUserId, bytes32 _operatorPubKeyHash, address _grantee, uint256 _expiresAt) external',
   'function revokeEmergencyAuthorization(string calldata _authorizationId) external',
-  'function getEmergencyAuthorization(string calldata _authorizationId) external view returns (string, string, bytes32, string, bytes32, address, uint256, uint256, bool, bool)',
+  'function getEmergencyAuthorization(string calldata _authorizationId) external view returns (bytes32, string, bytes32, address, uint256, uint256, bool, bool)',
   // 事件
   'event CodeRepositoryUpdated(string codeRepository)',
   'event RuntimeParamsUpdated(string runtimeParams)',
@@ -3425,14 +3425,14 @@ async function testEmergencyAuthorization() {
   });
 
   const txSet = await contract.setEmergencyAuthorization(
-    authObj.authorizationId, authText, JSON.stringify(emergencySignature),
+    authObj.authorizationId, '0x' + authHash.toString('hex'),
     opUserId, opPubKeyHash, PLATFORM_ADDRESS, Math.floor(deadlineMs / 1000),
     { nonce: getOwnerNonce() },
   );
   await txSet.wait();
   const record = await contract.getEmergencyAuthorization(authObj.authorizationId);
-  assert(record[9] === true && record[2].toLowerCase() === '0x' + authHash.toString('hex'),
-    'emergency: authorization stored on contract, authHash matches sha256(text)');
+  assert(record[7] === true && record[0].toLowerCase() === '0x' + authHash.toString('hex'),
+    'emergency: authorization stored on contract as hash, authHash matches sha256(text)');
 
   // ---- 负控制：递进文本被改动 → 拒绝 ----
   const badRes = await httpPost('/api/wallet/create', await buildRequest({
