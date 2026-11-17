@@ -783,7 +783,7 @@ export class ContractClient {
   }
 
   /**
-   * 按 ledgerId 实时查询账本指定（所有权人 + 归集地址集 + 启用状态）
+   * 按 ledgerId 实时查询账本指定（所有权人 + 启用状态）
    * @param {string} ledgerId
    * @returns {Promise<Object|null>} 指定记录；链上未登记时返回 null
    * @throws 合约不可用时抛错
@@ -798,25 +798,57 @@ export class ContractClient {
     return {
       ownerUserId: r.ownerUserId,
       ownerPubKeyHash: r.ownerPubKeyHash,
-      poolAddresses: [...r.poolAddresses],
       enabled: r.enabled,
       exists: true,
     };
   }
 
   /**
-   * 实时查询某账本某归集地址可出金到的目标地址集（未配置返回空数组）
+   * 实时查询某账本在某（链，币种）下登记的归集地址集（可归集资产逐项登记）
    * @param {string} ledgerId
+   * @param {number} chainId
+   * @param {string} assetAddress - 资产合约地址，原生币为零地址；资产身份只认（链，合约地址），不认名称
+   * @returns {Promise<string[]>}
+   * @throws 合约不可用时抛错
+   */
+  async getLedgerPoolAddresses(ledgerId, chainId, assetAddress) {
+    this._ensureInitialized();
+    if (!this._contractAvailable || !this._contract) {
+      throw new Error('Contract unavailable: cannot read ledger pool addresses');
+    }
+    const r = await this._contract.getLedgerPoolAddresses(ledgerId, chainId, assetAddress);
+    return [...r];
+  }
+
+  /**
+   * 某地址是否被登记为任一账本任一（链，币种）的归集地址（导出锁判定用）
+   * @param {string} address
+   * @returns {Promise<boolean>}
+   * @throws 合约不可用时抛错
+   */
+  async isCollectionAddress(address) {
+    this._ensureInitialized();
+    if (!this._contractAvailable || !this._contract) {
+      throw new Error('Contract unavailable: cannot check collection address registration');
+    }
+    return !!(await this._contract.isCollectionAddress(address));
+  }
+
+  /**
+   * 实时查询某账本在某（链，币种）下某归集地址可出金到的目标地址集（未配置返回空数组）
+   * @param {string} ledgerId
+   * @param {number} chainId
+   * @param {string} assetAddress - 资产合约地址，原生币为零地址
    * @param {string} sourceAddress
    * @returns {Promise<string[]>}
    * @throws 合约不可用时抛错
    */
-  async getCollectionPayoutTargets(ledgerId, sourceAddress) {
+  async getCollectionPayoutTargets(ledgerId, chainId, assetAddress, sourceAddress) {
     this._ensureInitialized();
     if (!this._contractAvailable || !this._contract) {
       throw new Error('Contract unavailable: cannot read collection payout targets');
     }
-    const r = await this._contract.getCollectionPayoutTargets(ledgerId, sourceAddress);
+    const r = await this._contract.getCollectionPayoutTargets(ledgerId, chainId, assetAddress, sourceAddress);
     return [...r];
   }
 

@@ -88,6 +88,7 @@ export class LedgerHandler {
         ledgerId: this._requireLedgerId(payload),
         userId: payload.targetUserId,
         chainId: payload.chainId,
+        assetId: payload.assetId || null,
       });
       return result;
     });
@@ -280,7 +281,7 @@ export class LedgerHandler {
   async handleDepositAddresses(request) {
     return this._handle(request, async (payload) => {
       const ledgerId = this._requireLedgerId(payload);
-      const addresses = this._deposits.listDepositAddresses(ledgerId);
+      const addresses = await this._deposits.listDepositAddresses(ledgerId, { chainId: payload.chainId ?? null, assetId: payload.assetId || null });
       const creditedTotals = payload.chainId !== undefined
         ? this._deposits.creditedTotalsByAddress(ledgerId, payload.chainId)
         : [];

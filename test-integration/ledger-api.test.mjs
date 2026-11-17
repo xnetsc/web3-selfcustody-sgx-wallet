@@ -86,9 +86,19 @@ function setup() {
   const contract = {
     designation: {
       ownerUserId: OWNER, ownerPubKeyHash: OWNER_HASH,
-      poolAddresses: [COLLECTION], enabled: true, exists: true,
+      enabled: true, exists: true,
     },
+    poolMap: new Map([[`${LEDGER}|${CHAIN}|${USDT}`, [COLLECTION]]]),
     async getLedger() { return this.designation; },
+    async getLedgerPoolAddresses(ledgerId, chainId, asset) {
+      return this.poolMap.get(`${ledgerId}|${chainId}|${String(asset).toLowerCase()}`) || [];
+    },
+    async isCollectionAddress(address) {
+      for (const addrs of this.poolMap.values()) {
+        if (addrs.some((a) => a.toLowerCase() === address.toLowerCase())) return true;
+      }
+      return false;
+    },
     async getCollectionPayoutTargets() { return [EXTERNAL]; },
     async getLedgerWithdrawalPolicy() { return null; },
   };
@@ -177,7 +187,7 @@ test('ledger API end-to-end: create -> deposit address -> observe credit -> tran
   });
   assert.equal(opened.body.success, true);
   const depositAddress = opened.body.address;
-  contract.designation.poolAddresses = [COLLECTION, depositAddress];
+  contract.poolMap.set(`${LEDGER}|${CHAIN}|${USDT}`, [COLLECTION, depositAddress]);
 
   // 充值观察入账
   evidence.transfers = [{ assetId: USDT, from: EXTERNAL, to: depositAddress, amount: '500', logIndex: 0 }];

@@ -80,11 +80,15 @@ function setup() {
   const engine = makeFakeEngine(db);
   const designation = {
     ownerUserId: OWNER, ownerPubKeyHash: OWNER_HASH,
-    poolAddresses: [], enabled: true, exists: true,
+    enabled: true, exists: true,
   };
   const contract = {
     designation,
+    poolMap: new Map(), // `${chainId}|${assetAddress}` -> [addresses]（该账本在该（链，币种）下的归集登记）
     async getLedger() { return this.designation; },
+    async getLedgerPoolAddresses(ledgerId, chainId, asset) {
+      return this.poolMap.get(`${chainId}|${String(asset).toLowerCase()}`) || [];
+    },
   };
   const passkeyManager = new PasskeyManager(connMgr, engine);
   const authorizer = new LedgerAuthorizer({
@@ -119,6 +123,12 @@ async function createLedger(service) {
   });
 }
 
+
+/** 在合约桩上登记某（链，币种）的归集地址集 */
+function setPool(contract, chainId, asset, addrs) {
+  contract.poolMap.set(`${chainId}|${String(asset).toLowerCase()}`, addrs);
+}
+
 function erc20Transfer(to, amount, logIndex = 0, asset = USDT) {
   return { assetId: asset, from: SENDER, to, amount: String(amount), logIndex };
 }
@@ -148,7 +158,7 @@ test('observe: creditable deposit credits the assigned user exactly once', async
   const { contract, ledgerService, deposits, evidence } = setup();
   await createLedger(ledgerService);
   const { address } = await deposits.getOrCreateDepositAddress({ ledgerId: LEDGER, userId: ALICE, chainId: CHAIN });
-  contract.designation.poolAddresses = [address];
+  setPool(contract, CHAIN, USDT, [address]);
   evidence.transfers = [erc20Transfer(address, '500')];
 
   const r1 = await deposits.observeDeposit({ ledgerId: LEDGER, chainId: CHAIN, txHash: TX });
@@ -164,7 +174,7 @@ test('observe: insufficient confirmations stays pending, later observation compl
   const { contract, ledgerService, deposits, evidence } = setup();
   await createLedger(ledgerService);
   const { address } = await deposits.getOrCreateDepositAddress({ ledgerId: LEDGER, userId: ALICE, chainId: CHAIN });
-  contract.designation.poolAddresses = [address];
+  setPool(contract, CHAIN, USDT, [address]);
   evidence.transfers = [erc20Transfer(address, '70')];
   evidence.confirmations = 3;
 
@@ -246,12 +256,39 @@ function chainSetup(providersByUrl, configOverrides = {}) {
   });
 }
 
+test('deposit route info matches collectable registration one-to-one (per chain and asset)', async () => {
+  const { contract, ledgerService, deposits } = setup();
+  await createLedger(ledgerService);
+  const USDC = '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48';
+
+  // 未登记任何（链，币种）：开通返回的地址对 USDT 不可直接入账
+  const opened = await deposits.getOrCreateDepositAddress({ ledgerId: LEDGER, userId: ALICE, chainId: CHAIN, assetId: USDT });
+  assert.equal(opened.collectable, false);
+
+  // 登记该地址为（本链，USDT）的可归集资产后：USDT 路径成立，其它币不成立
+  setPool(contract, CHAIN, USDT, [opened.address]);
+  const again = await deposits.getOrCreateDepositAddress({ ledgerId: LEDGER, userId: ALICE, chainId: CHAIN, assetId: USDT });
+  assert.equal(again.collectable, true);
+  const otherAsset = await deposits.getOrCreateDepositAddress({ ledgerId: LEDGER, userId: ALICE, chainId: CHAIN, assetId: USDC });
+  assert.equal(otherAsset.collectable, false);
+  // 换一条链：同一地址同一币也未登记
+  const listedOtherChain = await deposits.listDepositAddresses(LEDGER, { chainId: 137, assetId: USDT });
+  assert.equal(listedOtherChain.length, 0);
+
+  // 清单按（链，币种）标注，与登记逐项对应
+  const listed = await deposits.listDepositAddresses(LEDGER, { chainId: CHAIN, assetId: USDT });
+  assert.equal(listed.length, 1);
+  assert.equal(listed[0].collectable, true);
+  const listedUsdc = await deposits.listDepositAddresses(LEDGER, { chainId: CHAIN, assetId: USDC });
+  assert.equal(listedUsdc[0].collectable, false);
+});
+
 test('observe: same-ledger internal movements are not deposits (collection cannot double-count)', async () => {
   const { db, contract, ledgerService, deposits, evidence } = setup();
   await createLedger(ledgerService);
   const POOL = '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
   const { address } = await deposits.getOrCreateDepositAddress({ ledgerId: LEDGER, userId: ALICE, chainId: CHAIN });
-  contract.designation.poolAddresses = [address, POOL];
+  setPool(contract, CHAIN, USDT, [address, POOL]);
 
   // 归集：充值地址 -> 归集地址。资金在充值地址入账时已记过，这笔只是池内移动
   evidence.transfers = [{ assetId: USDT, from: address, to: POOL, amount: '500', logIndex: 0 }];
@@ -272,7 +309,7 @@ test('observe: sender bound to ANOTHER ledger is a real deposit here (cross-ledg
   const { db, contract, ledgerService, deposits, evidence } = setup();
   await createLedger(ledgerService);
   const { address } = await deposits.getOrCreateDepositAddress({ ledgerId: LEDGER, userId: ALICE, chainId: CHAIN });
-  contract.designation.poolAddresses = [address];
+  setPool(contract, CHAIN, USDT, [address]);
 
   // 另一个账本的充值地址（对本账本而言是外部地址）：跨账本提现打进来即本账本的真充值
   const OTHER_LEDGER_ADDR = '0x7777777777777777777777777777777777777777';

@@ -589,11 +589,10 @@ contract WalletTrustContract is Ownable {
 
     // ============ 账本指定（多账本：所有权人与归集地址集由合约指定） ============
 
-    /// @dev 账本指定信息：所有权人（普通钱包账户）与归集地址集（所有权人账户名下钱包地址）
+    /// @dev 账本指定信息：所有权人（普通钱包账户）
     struct LedgerDesignation {
         string ownerUserId;         // 所有权人 userId
         bytes32 ownerPubKeyHash;    // 所有权人 Passkey 公钥哈希
-        address[] poolAddresses;    // 归集地址集（合约公布）
         bool enabled;               // 是否启用
         bool exists;                // 是否已登记
     }
@@ -601,9 +600,19 @@ contract WalletTrustContract is Ownable {
     /// @dev ledgerId => 账本指定
     mapping(string => LedgerDesignation) internal _ledgers;
 
+    /// @dev 可归集资产登记：(ledgerId, chainId, 资产地址) => 归集地址集。
+    ///      资产地址 address(0) 表示该链原生币。登记按（链，币种）逐项进行，
+    ///      每一项登记对应账本里同（链，币种）的一份资产：账本资产与可归集
+    ///      资产一一对应。同一地址可登记为多个账本、多个（链，币种）的归集地址。
+    mapping(string => mapping(uint256 => mapping(address => address[]))) internal _ledgerPoolSets;
+
+    /// @dev 地址被登记为归集地址的总份数（跨账本、跨链、跨币种累计）。
+    ///      大于 0 即该地址托管着某个账本的可归集资产（SGX 导出锁判定用）。
+    mapping(address => uint256) internal _collectionRefCount;
+
     event LedgerRegistered(string ledgerId, string ownerUserId, bytes32 ownerPubKeyHash);
     event LedgerOwnerChanged(string ledgerId, string ownerUserId, bytes32 ownerPubKeyHash);
-    event LedgerPoolAddressesUpdated(string ledgerId);
+    event LedgerPoolAddressesUpdated(string ledgerId, uint256 chainId, address asset);
     event LedgerEnabledChanged(string ledgerId, bool enabled);
 
     /**
@@ -613,8 +622,7 @@ contract WalletTrustContract is Ownable {
     function registerLedger(
         string calldata _ledgerId,
         string calldata _ownerUserId,
-        bytes32 _ownerPubKeyHash,
-        address[] calldata _poolAddresses
+        bytes32 _ownerPubKeyHash
     ) external onlyOwner {
         require(bytes(_ledgerId).length > 0, "Empty ledgerId");
         require(!_ledgers[_ledgerId].exists, "Ledger already registered");
@@ -626,10 +634,6 @@ contract WalletTrustContract is Ownable {
         ledger.ownerPubKeyHash = _ownerPubKeyHash;
         ledger.enabled = true;
         ledger.exists = true;
-        for (uint256 i = 0; i < _poolAddresses.length; i++) {
-            require(_poolAddresses[i] != address(0), "Invalid pool address");
-            ledger.poolAddresses.push(_poolAddresses[i]);
-        }
 
         emit LedgerRegistered(_ledgerId, _ownerUserId, _ownerPubKeyHash);
     }
@@ -650,20 +654,48 @@ contract WalletTrustContract is Ownable {
         emit LedgerOwnerChanged(_ledgerId, _ownerUserId, _ownerPubKeyHash);
     }
 
-    /// @dev 整体替换账本的归集地址集（Owner 权限）
+    /**
+     * @dev 整体替换某账本在某（链，币种）下的归集地址集（Owner 权限）。
+     *      同步维护每个地址的登记计数：离开集合减一、进入集合加一（同一地址
+     *      在新旧集合中同时出现时增减相抵）。
+     */
     function setLedgerPoolAddresses(
         string calldata _ledgerId,
+        uint256 _chainId,
+        address _asset,
         address[] calldata _poolAddresses
     ) external onlyOwner {
         require(_ledgers[_ledgerId].exists, "Ledger not found");
 
-        delete _ledgers[_ledgerId].poolAddresses;
+        address[] storage current = _ledgerPoolSets[_ledgerId][_chainId][_asset];
+        for (uint256 i = 0; i < current.length; i++) {
+            _collectionRefCount[current[i]] -= 1;
+        }
+        delete _ledgerPoolSets[_ledgerId][_chainId][_asset];
         for (uint256 i = 0; i < _poolAddresses.length; i++) {
             require(_poolAddresses[i] != address(0), "Invalid pool address");
-            _ledgers[_ledgerId].poolAddresses.push(_poolAddresses[i]);
+            for (uint256 j = 0; j < i; j++) {
+                require(_poolAddresses[j] != _poolAddresses[i], "Duplicate pool address");
+            }
+            _ledgerPoolSets[_ledgerId][_chainId][_asset].push(_poolAddresses[i]);
+            _collectionRefCount[_poolAddresses[i]] += 1;
         }
 
-        emit LedgerPoolAddressesUpdated(_ledgerId);
+        emit LedgerPoolAddressesUpdated(_ledgerId, _chainId, _asset);
+    }
+
+    /// @dev 查询某账本在某（链，币种）下的归集地址集（任何人可调用；SGX 实时调用）
+    function getLedgerPoolAddresses(
+        string calldata _ledgerId,
+        uint256 _chainId,
+        address _asset
+    ) external view returns (address[] memory) {
+        return _ledgerPoolSets[_ledgerId][_chainId][_asset];
+    }
+
+    /// @dev 某地址是否被登记为任一账本任一（链，币种）的归集地址（SGX 导出锁判定用）
+    function isCollectionAddress(address _addr) external view returns (bool) {
+        return _collectionRefCount[_addr] > 0;
     }
 
     /// @dev 启用/停用账本（Owner 权限）；停用后 SGX 拒绝该账本的一切敏感操作与入账
@@ -673,21 +705,20 @@ contract WalletTrustContract is Ownable {
         emit LedgerEnabledChanged(_ledgerId, _enabled);
     }
 
-    /// @dev 查询账本指定（任何人可调用；SGX 实时调用核对所有权与归集地址集）
+    /// @dev 查询账本指定（任何人可调用；SGX 实时调用核对所有权）
     function getLedger(
         string calldata _ledgerId
     ) external view returns (
         string memory ownerUserId,
         bytes32 ownerPubKeyHash,
-        address[] memory poolAddresses,
         bool enabled,
         bool exists
     ) {
         LedgerDesignation storage ledger = _ledgers[_ledgerId];
         if (!ledger.exists) {
-            return ("", bytes32(0), new address[](0), false, false);
+            return ("", bytes32(0), false, false);
         }
-        return (ledger.ownerUserId, ledger.ownerPubKeyHash, ledger.poolAddresses, ledger.enabled, true);
+        return (ledger.ownerUserId, ledger.ownerPubKeyHash, ledger.enabled, true);
     }
 
     // ============ 账本提现风控规则（单笔/日累计限额，SGX 强制执行） ============
@@ -730,44 +761,48 @@ contract WalletTrustContract is Ownable {
 
     // ============ 归集地址出金目标配置（每个归集地址各自可出金到哪里） ============
 
-    /// @dev (ledgerId, 归集地址) => 允许出金到的目标地址集；未配置即不许出金（默认拒绝）
-    mapping(string => mapping(address => address[])) internal _collectionPayoutTargets;
+    /// @dev (ledgerId, chainId, 资产地址, 归集地址) => 允许出金到的目标地址集；未配置即不许出金（默认拒绝）
+    mapping(string => mapping(uint256 => mapping(address => mapping(address => address[])))) internal _collectionPayoutTargets;
 
-    event CollectionPayoutTargetsUpdated(string ledgerId, address source);
+    event CollectionPayoutTargetsUpdated(string ledgerId, uint256 chainId, address asset, address source);
 
     /**
-     * @dev 设置某账本某个归集地址可出金到的目标地址集（Owner 权限，整体替换）。
-     *      源地址必须是该账本已登记的归集地址。账本所有权人从归集地址出金时，
-     *      SGX 实时读本配置检查目标地址，不在集内即拒绝签名。
+     * @dev 设置某账本在某（链，币种）下某个归集地址可出金到的目标地址集（Owner 权限，整体替换）。
+     *      源地址必须是该账本在该（链，币种）下已登记的归集地址。账本所有权人从
+     *      归集地址出金时，SGX 实时读本配置检查目标地址，不在集内即拒绝签名。
      */
     function setCollectionPayoutTargets(
         string calldata _ledgerId,
+        uint256 _chainId,
+        address _asset,
         address _source,
         address[] calldata _targets
     ) external onlyOwner {
         require(_ledgers[_ledgerId].exists, "Ledger not found");
         bool isPool = false;
-        address[] storage pool = _ledgers[_ledgerId].poolAddresses;
+        address[] storage pool = _ledgerPoolSets[_ledgerId][_chainId][_asset];
         for (uint256 i = 0; i < pool.length; i++) {
             if (pool[i] == _source) { isPool = true; break; }
         }
-        require(isPool, "Source is not a collection address of this ledger");
+        require(isPool, "Source is not a collection address of this ledger for this chain and asset");
 
-        delete _collectionPayoutTargets[_ledgerId][_source];
+        delete _collectionPayoutTargets[_ledgerId][_chainId][_asset][_source];
         for (uint256 i = 0; i < _targets.length; i++) {
             require(_targets[i] != address(0), "Invalid target address");
-            _collectionPayoutTargets[_ledgerId][_source].push(_targets[i]);
+            _collectionPayoutTargets[_ledgerId][_chainId][_asset][_source].push(_targets[i]);
         }
 
-        emit CollectionPayoutTargetsUpdated(_ledgerId, _source);
+        emit CollectionPayoutTargetsUpdated(_ledgerId, _chainId, _asset, _source);
     }
 
-    /// @dev 查询某账本某归集地址可出金到的目标地址集（任何人可调用；SGX 出金时实时调用）
+    /// @dev 查询某账本在某（链，币种）下某归集地址可出金到的目标地址集（任何人可调用；SGX 出金时实时调用）
     function getCollectionPayoutTargets(
         string calldata _ledgerId,
+        uint256 _chainId,
+        address _asset,
         address _source
     ) external view returns (address[] memory) {
-        return _collectionPayoutTargets[_ledgerId][_source];
+        return _collectionPayoutTargets[_ledgerId][_chainId][_asset][_source];
     }
 
     // ============ 链读链配置（资产读链专用，与操作合约的 RPC 分开） ============

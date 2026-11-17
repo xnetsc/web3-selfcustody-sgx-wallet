@@ -71,8 +71,8 @@ export class LedgerWithdrawalService {
     return this._db.readQuery(sql, params);
   }
 
-  /** 出款地址资格：合约公布集内 ∧ 所有权人账户的原生钱包 */
-  async _assertQualifiedSource(ledgerId, ownerUserId, sourceAddress) {
+  /** 出款地址资格：登记为该（链，币种）的归集地址 ∧ 所有权人账户的原生钱包 */
+  async _assertQualifiedSource(ledgerId, ownerUserId, chainId, assetId, sourceAddress) {
     const source = String(sourceAddress).toLowerCase();
     let designation;
     try {
@@ -83,8 +83,14 @@ export class LedgerWithdrawalService {
     if (!designation) throw new Error(`ledger ${ledgerId} is not designated on contract`);
     if (!designation.enabled) throw new Error(`ledger ${ledgerId} is disabled`);
     if (designation.ownerUserId !== ownerUserId) throw new Error('ledger owner mismatch with contract designation');
-    if (!designation.poolAddresses.some((a) => a.toLowerCase() === source)) {
-      throw new Error('source address is not in the ledger collection set published on contract');
+    let pool;
+    try {
+      pool = await this._contract.getLedgerPoolAddresses(ledgerId, Number(chainId), assetId === 'native' ? ZERO_ADDRESS : assetId);
+    } catch (err) {
+      throw new Error(`Contract unavailable: cannot verify collection address registration (${err.message})`);
+    }
+    if (!pool.some((a) => a.toLowerCase() === source)) {
+      throw new Error('source address is not registered as a collection address of this ledger for this chain and asset');
     }
     const rows = this._db.readQuery(
       'SELECT wallet_type FROM wallets WHERE user_id = ? AND LOWER(address) = ?',
@@ -142,7 +148,7 @@ export class LedgerWithdrawalService {
       }
     }
 
-    await this._assertQualifiedSource(ledgerId, ledgerRow.owner_user_id, sourceAddress);
+    await this._assertQualifiedSource(ledgerId, ledgerRow.owner_user_id, chainId, asset, sourceAddress);
 
     return this._ledger.withLedgerWrite(ledgerId, (conn) => {
       const dup = conn.query(
@@ -177,7 +183,7 @@ export class LedgerWithdrawalService {
       throw new Error(`withdrawal is not payable (status=${row.status})`);
     }
     const ledgerRow = this._ledger.getLedgerRow(ledgerId);
-    await this._assertQualifiedSource(ledgerId, ledgerRow.owner_user_id, row.source_address);
+    await this._assertQualifiedSource(ledgerId, ledgerRow.owner_user_id, row.chain_id, row.asset_id, row.source_address);
 
     // 合规冻结闸门：冻结生效期间不出款，提现单保持冻结占用
     const freezeRows = this._db.readQuery(

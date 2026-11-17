@@ -7,16 +7,27 @@
  *
  * 入账走观察提交式：外部报 txHash，SGX 经资产读链通道自读收据并交叉核对，
  * 按收款地址反查归属映射定归属；金额、方向只认链上证据，外部只能影响时效。
- * 到账地址不在该账本合约公布集内、或账本被停用、或地址无归属映射的，
- * 一律记待认领，不自动入账。
+ * 到账地址未被登记为该（链，币种）的可归集资产、或账本被停用、或地址
+ * 无归属映射的，一律记待认领，不自动入账。
+ *
+ * 充值信息与可归集配置一一对应：SGX 对外给出充值路径（某地址收某链某币）
+ * 时，逐项以合约登记为准核对并标注，未登记的不作为可直接入账的充值路径
+ * 给出；入账侧同一口径（未登记即待认领）。
  */
 
 import { v4 as uuidv4 } from 'uuid';
 import { createConnProxy } from '../../sync/sync-adapter.js';
 import { getMonotonicSqliteNow } from '../../utils/monotonic-clock.js';
 import { generateMnemonic, deriveWallet } from '../wallet-management/hd-wallet.js';
+import { normalizeAssetId } from './ledger-core.js';
 
 const EVM_COIN_TYPE = 60;
+const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000';
+
+/** 账本资产标识译为合约资产参数：原生币为零地址，ERC20 为其合约地址 */
+function toContractAsset(assetId) {
+  return assetId === 'native' ? ZERO_ADDRESS : assetId;
+}
 
 export class LedgerDepositService {
   /**
@@ -45,16 +56,34 @@ export class LedgerDepositService {
     return rows[0] || null;
   }
 
-  /** 开通专属充值地址（幂等：已有则返回原址） */
-  async getOrCreateDepositAddress({ ledgerId, userId, chainId }) {
+  /** 某（链，币种，地址）是否已在合约登记为该账本的可归集资产（实时查合约；查不到按未登记） */
+  async _isCollectable(ledgerId, chainId, assetId, address) {
+    try {
+      const pool = await this._contract.getLedgerPoolAddresses(ledgerId, Number(chainId), toContractAsset(assetId));
+      return pool.some((a) => a.toLowerCase() === String(address).toLowerCase());
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * 开通专属充值地址（幂等：已有则返回原址）。传入 assetId 时附带返回
+   * collectable：该地址是否已被登记为该（链，币种）的可归集资产——充值
+   * 路径信息以合约登记为准，未登记的（链，币种）到账只记待认领。
+   */
+  async getOrCreateDepositAddress({ ledgerId, userId, chainId, assetId = null }) {
     const existing = this.getAssignment(ledgerId, userId, chainId);
-    if (existing) return { address: existing.address, created: false };
+    if (existing) {
+      const result = { address: existing.address, created: false };
+      if (assetId) result.collectable = await this._isCollectable(ledgerId, chainId, normalizeAssetId(assetId), result.address);
+      return result;
+    }
 
     const ledgerRow = this._ledger.getLedgerRow(ledgerId);
     if (!ledgerRow) throw new Error(`ledger ${ledgerId} does not exist (not created in SGX)`);
     const ownerUserId = ledgerRow.owner_user_id;
 
-    return this._engine.write(async (db) => {
+    const result = await this._engine.write(async (db) => {
       const conn = createConnProxy(db);
       const inside = conn.query(
         'SELECT address FROM ledger_deposit_addresses WHERE ledger_id = ? AND user_id = ? AND chain_id = ?',
@@ -80,6 +109,8 @@ export class LedgerDepositService {
       );
       return { address: derived.address, created: true };
     }, ownerUserId);
+    if (assetId) result.collectable = await this._isCollectable(ledgerId, chainId, normalizeAssetId(assetId), result.address);
+    return result;
   }
 
   /**
@@ -97,7 +128,20 @@ export class LedgerDepositService {
     } catch {
       designation = null;
     }
-    const poolSet = new Set((designation?.poolAddresses || []).map((a) => a.toLowerCase()));
+    // 可归集登记按（链，币种）逐项查合约（同一交易内按资产缓存）；合约不可用按未登记处理
+    const poolSets = new Map();
+    const poolSetFor = async (assetId) => {
+      if (!poolSets.has(assetId)) {
+        let addrs = [];
+        if (designation) {
+          try {
+            addrs = await this._contract.getLedgerPoolAddresses(ledgerId, Number(chainId), toContractAsset(assetId));
+          } catch { addrs = []; }
+        }
+        poolSets.set(assetId, new Set(addrs.map((a) => a.toLowerCase())));
+      }
+      return poolSets.get(assetId);
+    };
     const ledgerEnabled = !!(designation && designation.enabled);
 
     const evidence = await this._chainReader.fetchTransferEvidence(Number(chainId), txHash);
@@ -106,6 +150,7 @@ export class LedgerDepositService {
     for (const transfer of evidence.transfers) {
       const to = String(transfer.to).toLowerCase();
       const from = String(transfer.from).toLowerCase();
+      const poolSet = await poolSetFor(transfer.assetId);
 
       // 内部移动不入充值账：转出方是本账本自己的绑定地址（专属充值地址或
       // 公布集内地址）时，这是资金池内部的位置移动（如归集），不是一笔
@@ -230,11 +275,24 @@ export class LedgerDepositService {
     );
   }
 
-  listDepositAddresses(ledgerId) {
-    return this._db.readQuery(
+  /**
+   * 充值地址清单。传入（chainId, assetId）时只列该链地址，并逐址标注
+   * collectable（是否已登记为该（链，币种）的可归集资产）：对外给出的
+   * 充值路径以合约登记为准，未登记者不作为可直接入账的路径。
+   */
+  async listDepositAddresses(ledgerId, { chainId = null, assetId = null } = {}) {
+    let rows = this._db.readQuery(
       'SELECT ledger_id, user_id, chain_id, address, created_at FROM ledger_deposit_addresses WHERE ledger_id = ? ORDER BY user_id, chain_id',
       [ledgerId]
     );
+    if (chainId !== null && assetId) {
+      const asset = normalizeAssetId(assetId);
+      rows = rows.filter((r) => Number(r.chain_id) === Number(chainId));
+      for (const row of rows) {
+        row.collectable = await this._isCollectable(ledgerId, chainId, asset, row.address);
+      }
+    }
+    return rows;
   }
 
   /** 逐地址累计入账额（归集决策数据之一；链上余额由外部自查） */

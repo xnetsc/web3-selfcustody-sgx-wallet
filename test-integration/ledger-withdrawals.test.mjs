@@ -84,15 +84,27 @@ function setup() {
   const contract = {
     designation: {
       ownerUserId: OWNER, ownerPubKeyHash: OWNER_HASH,
-      poolAddresses: [COLLECTION], enabled: true, exists: true,
+      enabled: true, exists: true,
     },
-    payoutTargets: new Map(), // `${ledger}|${source}` -> [targets]
+    poolMap: new Map([[`${LEDGER}|${CHAIN}|${USDT}`, [COLLECTION]]]), // `${ledger}|${chain}|${asset}` -> [addresses]
+    payoutTargets: new Map(), // `${ledger}|${chain}|${asset}|${source}` -> [targets]
     policy: null,
     unavailable: false,
     async getLedger() { if (this.unavailable) throw new Error('RPC unreachable'); return this.designation; },
-    async getCollectionPayoutTargets(ledgerId, source) {
+    async getLedgerPoolAddresses(ledgerId, chainId, asset) {
       if (this.unavailable) throw new Error('RPC unreachable');
-      return this.payoutTargets.get(`${ledgerId}|${source.toLowerCase()}`) || [];
+      return this.poolMap.get(`${ledgerId}|${chainId}|${String(asset).toLowerCase()}`) || [];
+    },
+    async isCollectionAddress(address) {
+      if (this.unavailable) throw new Error('RPC unreachable');
+      for (const addrs of this.poolMap.values()) {
+        if (addrs.some((a) => a.toLowerCase() === address.toLowerCase())) return true;
+      }
+      return false;
+    },
+    async getCollectionPayoutTargets(ledgerId, chainId, asset, source) {
+      if (this.unavailable) throw new Error('RPC unreachable');
+      return this.payoutTargets.get(`${ledgerId}|${chainId}|${String(asset).toLowerCase()}|${source.toLowerCase()}`) || [];
     },
     async getLedgerWithdrawalPolicy() { if (this.unavailable) throw new Error('RPC unreachable'); return this.policy; },
   };
@@ -169,22 +181,22 @@ test('guard: unbound source passes freely; bound source enforces owner + configu
   await createLedger(ledgerService);
 
   // 普通地址：不受护栏约束
-  const free = await guard.assertTransferAllowed({ signerUserId: ALICE, fromAddress: EXTERNAL, toAddress: COLLECTION });
+  const free = await guard.assertTransferAllowed({ chainId: CHAIN, assetId: USDT, signerUserId: ALICE, fromAddress: EXTERNAL, toAddress: COLLECTION  });
   assert.equal(free.bound, false);
 
   // 归集地址出金，签名者不是所有权人 → 拒
   await assert.rejects(
-    guard.assertTransferAllowed({ signerUserId: ALICE, fromAddress: COLLECTION, toAddress: EXTERNAL }),
+    guard.assertTransferAllowed({ chainId: CHAIN, assetId: USDT, signerUserId: ALICE, fromAddress: COLLECTION, toAddress: EXTERNAL  }),
     /not the ledger owner/
   );
   // 所有权人出金但目标未配置 → 拒
   await assert.rejects(
-    guard.assertTransferAllowed({ signerUserId: OWNER, signerCredentialId: OWNER_CRED, fromAddress: COLLECTION, toAddress: EXTERNAL }),
+    guard.assertTransferAllowed({ chainId: CHAIN, assetId: USDT, signerUserId: OWNER, signerCredentialId: OWNER_CRED, fromAddress: COLLECTION, toAddress: EXTERNAL  }),
     /not a configured payout target/
   );
   // 配置目标后放行
-  contract.payoutTargets.set(`${LEDGER}|${COLLECTION}`, [EXTERNAL]);
-  const ok = await guard.assertTransferAllowed({ signerUserId: OWNER, signerCredentialId: OWNER_CRED, fromAddress: COLLECTION, toAddress: EXTERNAL });
+  contract.payoutTargets.set(`${LEDGER}|${CHAIN}|${USDT}|${COLLECTION}`, [EXTERNAL]);
+  const ok = await guard.assertTransferAllowed({ chainId: CHAIN, assetId: USDT, signerUserId: OWNER, signerCredentialId: OWNER_CRED, fromAddress: COLLECTION, toAddress: EXTERNAL  });
   assert.equal(ok.bound, true);
   assert.equal(ok.ledgerId, LEDGER);
 });
@@ -192,21 +204,21 @@ test('guard: unbound source passes freely; bound source enforces owner + configu
 test('guard: only the contract-designated passkey can move bound addresses', async () => {
   const { ledgerService, guard, contract, seedPasskey } = setup();
   await createLedger(ledgerService);
-  contract.payoutTargets.set(`${LEDGER}|${COLLECTION}`, [EXTERNAL]);
+  contract.payoutTargets.set(`${LEDGER}|${CHAIN}|${USDT}|${COLLECTION}`, [EXTERNAL]);
 
   // 所有权人账号的第二把 Passkey（未被合约指定）→ 拒
   seedPasskey(OWNER, 'owner-cred-2', Buffer.from('owner-second-passkey-cose'));
   await assert.rejects(
-    guard.assertTransferAllowed({ signerUserId: OWNER, signerCredentialId: 'owner-cred-2', fromAddress: COLLECTION, toAddress: EXTERNAL }),
+    guard.assertTransferAllowed({ chainId: CHAIN, assetId: USDT, signerUserId: OWNER, signerCredentialId: 'owner-cred-2', fromAddress: COLLECTION, toAddress: EXTERNAL  }),
     /contract-designated owner passkey/
   );
   // 授权里没有 credentialId → 无法证明是指定 Passkey，拒
   await assert.rejects(
-    guard.assertTransferAllowed({ signerUserId: OWNER, fromAddress: COLLECTION, toAddress: EXTERNAL }),
+    guard.assertTransferAllowed({ chainId: CHAIN, assetId: USDT, signerUserId: OWNER, fromAddress: COLLECTION, toAddress: EXTERNAL  }),
     /contract-designated owner passkey/
   );
   // 指定 Passkey → 放行（对照）
-  const ok = await guard.assertTransferAllowed({ signerUserId: OWNER, signerCredentialId: OWNER_CRED, fromAddress: COLLECTION, toAddress: EXTERNAL });
+  const ok = await guard.assertTransferAllowed({ chainId: CHAIN, assetId: USDT, signerUserId: OWNER, signerCredentialId: OWNER_CRED, fromAddress: COLLECTION, toAddress: EXTERNAL  });
   assert.equal(ok.bound, true);
 });
 
@@ -218,19 +230,84 @@ test('guard: ERC20 calldata recipient is the effective target; imported target w
   assert.equal(decoded.target, EXTERNAL);
   assert.equal(decoded.isPlainTransfer, true);
 
-  contract.payoutTargets.set(`${LEDGER}|${COLLECTION}`, [EXTERNAL]);
-  const ok = await guard.assertTransferAllowed({
-    signerUserId: OWNER, signerCredentialId: OWNER_CRED, fromAddress: COLLECTION, toAddress: USDT, data,
-  });
+  contract.payoutTargets.set(`${LEDGER}|${CHAIN}|${USDT}|${COLLECTION}`, [EXTERNAL]);
+  const ok = await guard.assertTransferAllowed({ chainId: CHAIN, assetId: USDT, signerUserId: OWNER, signerCredentialId: OWNER_CRED, chainId: CHAIN, assetId: USDT, fromAddress: COLLECTION, toAddress: USDT, data,
+   });
   assert.equal(ok.bound, true);
 
   // 目标是 SGX 内的导入钱包：即使配进目标集也不合格
   const imported = '0xcccccccccccccccccccccccccccccccccccccccc';
-  contract.payoutTargets.set(`${LEDGER}|${COLLECTION}`, [imported]);
+  contract.payoutTargets.set(`${LEDGER}|${CHAIN}|${USDT}|${COLLECTION}`, [imported]);
   const data2 = '0xa9059cbb' + '0'.repeat(24) + imported.slice(2) + '0'.repeat(64);
   await assert.rejects(
-    guard.assertTransferAllowed({ signerUserId: OWNER, signerCredentialId: OWNER_CRED, fromAddress: COLLECTION, toAddress: USDT, data: data2 }),
+    guard.assertTransferAllowed({ chainId: CHAIN, assetId: USDT, signerUserId: OWNER, signerCredentialId: OWNER_CRED, fromAddress: COLLECTION, toAddress: USDT, data: data2  }),
     /not key-qualified/
+  );
+});
+
+test('guard: binding is scoped per (chain, asset) — other chains and other assets of the same address are free', async () => {
+  const { ledgerService, guard, contract } = setup();
+  await createLedger(ledgerService);
+  contract.payoutTargets.set(`${LEDGER}|${CHAIN}|${USDT}|${COLLECTION}`, [EXTERNAL]);
+  const USDC = '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48';
+
+  // COLLECTION 只登记为（链1，USDT）的归集地址：同地址的其它币、其它链、原生币都不受护栏约束
+  const otherAsset = await guard.assertTransferAllowed({ signerUserId: ALICE, chainId: CHAIN, assetId: USDC, fromAddress: COLLECTION, toAddress: EXTERNAL });
+  assert.equal(otherAsset.bound, false);
+  const otherChain = await guard.assertTransferAllowed({ signerUserId: ALICE, chainId: 137, assetId: USDT, fromAddress: COLLECTION, toAddress: EXTERNAL });
+  assert.equal(otherChain.bound, false);
+  const nativeAsset = await guard.assertTransferAllowed({ signerUserId: ALICE, chainId: CHAIN, assetId: 'native', fromAddress: COLLECTION, toAddress: EXTERNAL });
+  assert.equal(nativeAsset.bound, false);
+  // 登记维度内仍是绑定（对照）
+  const bound = await guard.assertTransferAllowed({ signerUserId: OWNER, signerCredentialId: OWNER_CRED, chainId: CHAIN, assetId: USDT, fromAddress: COLLECTION, toAddress: EXTERNAL });
+  assert.equal(bound.bound, true);
+});
+
+test('guard: an address registered by multiple ledgers is authorized by any one ledger in full', async () => {
+  const db = makeDb();
+  const connMgr = makeConnMgr(db);
+  const engine = makeFakeEngine(db);
+  const passkeyManager = new PasskeyManager(connMgr, engine);
+  const COSE_A = Buffer.from('owner-passkey-for-ledger-a');
+  const COSE_B = Buffer.from('owner-passkey-for-ledger-b');
+  const T1 = '0xdddddddddddddddddddddddddddddddddddddddd';
+  const T2 = '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee';
+  const designations = {
+    'ledger-a': { ownerUserId: OWNER, ownerPubKeyHash: PasskeyManager.computePubKeyHash(COSE_A), enabled: true, exists: true },
+    'ledger-b': { ownerUserId: OWNER, ownerPubKeyHash: PasskeyManager.computePubKeyHash(COSE_B), enabled: true, exists: true },
+  };
+  const contract = {
+    async getLedger(id) { return designations[id] || null; },
+    async getLedgerPoolAddresses(id, chainId, asset) {
+      return (id === 'ledger-a' || id === 'ledger-b') && chainId === CHAIN && asset.toLowerCase() === USDT ? [COLLECTION] : [];
+    },
+    async getCollectionPayoutTargets(id, chainId, asset, source) {
+      if (source.toLowerCase() !== COLLECTION) return [];
+      return id === 'ledger-a' ? [T1] : [T2];
+    },
+    async isCollectionAddress() { return true; },
+  };
+  const guard = new LedgerGuard({ connectionManager: connMgr, contractClient: contract, passkeyManager });
+  for (const id of ['ledger-a', 'ledger-b']) {
+    db.prepare('INSERT INTO ledgers (ledger_id, owner_user_id, owner_pub_key_hash, created_by_credential_id, created_at, _hlc) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(id, OWNER, 'hash', OWNER_CRED, '2026-01-01T00:00:00.000Z', '1');
+  }
+  const seed = (cred, cose) => db.prepare('INSERT INTO passkeys (user_id, credential_id, public_key_cose, sign_count, created_at, _hlc) VALUES (?, ?, ?, 0, ?, ?)')
+    .run(OWNER, cred, cose, '2026-01-01T00:00:00.000Z', '1');
+  seed('cred-a', COSE_A);
+  seed('cred-b', COSE_B);
+
+  // 同一个归集地址服务两个账本：任一账本的完整授权（其指定 Passkey + 其目标配置）成立即放行
+  const viaA = await guard.assertTransferAllowed({ signerUserId: OWNER, signerCredentialId: 'cred-a', chainId: CHAIN, assetId: USDT, fromAddress: COLLECTION, toAddress: T1 });
+  assert.equal(viaA.ledgerId, 'ledger-a');
+  const viaB = await guard.assertTransferAllowed({ signerUserId: OWNER, signerCredentialId: 'cred-b', chainId: CHAIN, assetId: USDT, fromAddress: COLLECTION, toAddress: T2 });
+  assert.equal(viaB.ledgerId, 'ledger-b');
+  // 混搭不成立：A 的 Passkey 配 B 的目标、B 的 Passkey 配 A 的目标，都没有任何一个账本完整授权
+  await assert.rejects(
+    guard.assertTransferAllowed({ signerUserId: OWNER, signerCredentialId: 'cred-a', chainId: CHAIN, assetId: USDT, fromAddress: COLLECTION, toAddress: T2 })
+  );
+  await assert.rejects(
+    guard.assertTransferAllowed({ signerUserId: OWNER, signerCredentialId: 'cred-b', chainId: CHAIN, assetId: USDT, fromAddress: COLLECTION, toAddress: T1 })
   );
 });
 
@@ -239,7 +316,7 @@ test('guard: deposit addresses are bound even before pool publication; export gu
   await createLedger(ledgerService);
   const { address } = await deposits.getOrCreateDepositAddress({ ledgerId: LEDGER, userId: ALICE, chainId: CHAIN });
 
-  const binding = await guard.findBinding(address);
+  const binding = await guard.findBinding(CHAIN, USDT, address);
   assert.equal(binding.kind, 'deposit_address');
 
   // 导出护栏：专属充值地址（export_locked=1）直接拒绝
@@ -250,7 +327,7 @@ test('guard: deposit addresses are bound even before pool publication; export gu
   // 导出护栏：公布集内的归集地址动态锁定
   await assert.rejects(
     guard.assertExportAllowed([{ address: COLLECTION, export_locked: 0 }]),
-    /published as a collection address/
+    /registered as a collection address/
   );
   // 普通地址放行
   await guard.assertExportAllowed([{ address: EXTERNAL, export_locked: 0 }]);
@@ -321,7 +398,7 @@ test('withdrawal: unqualified source rejected; active freeze blocks payout until
       amount: '10', toAddress: EXTERNAL, sourceAddress: EXTERNAL,
       payloadJson: withdrawPayload(10, EXTERNAL, EXTERNAL),
     }),
-    /not in the ledger collection set/
+    /not registered as a collection address of this ledger for this chain and asset/
   );
 
   const row = await withdrawals.requestWithdrawal({

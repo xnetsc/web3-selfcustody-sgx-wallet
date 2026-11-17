@@ -131,7 +131,7 @@ function setup() {
 
   contract.designations.set(LEDGER, {
     ownerUserId: OWNER, ownerPubKeyHash: OWNER_HASH,
-    poolAddresses: [], enabled: true, exists: true,
+    enabled: true, exists: true,
   });
 
   return { db, engine, contract, service };

@@ -16,6 +16,14 @@
  */
 
 import { createConnProxy } from '../sync/sync-adapter.js';
+import { deriveAssetId } from '../modules/ledger/ledger-guard.js';
+
+/** 请求里的 tokenAddress 字段译为账本资产标识：合约地址直用，"<chainId>_native" 为原生币，其余返回 null 由交易形态推导 */
+function assetIdFromTokenField(tokenAddress, chainId) {
+  if (typeof tokenAddress === 'string' && /^0x[0-9a-fA-F]{40}$/.test(tokenAddress)) return tokenAddress.toLowerCase();
+  if (tokenAddress === `${chainId}_native`) return 'native';
+  return null;
+}
 
 export class TxSigningHandler {
   /**
@@ -200,9 +208,11 @@ export class TxSigningHandler {
     const guardReason = await this._ledgerGuardCheck({
       signerUserId: auth.userId,
       signerCredentialId: auth.credentialId,
+      chainId: Number(tx.chainId),
+      assetId: assetIdFromTokenField(tx.tokenAddress, tx.chainId) ?? deriveAssetId(tx.toAddress || tx.to, tx.data || null),
       fromAddress: tx.fromAddress,
       toAddress: tx.toAddress || tx.to,
-      data: null,
+      data: tx.data || null,
     });
     if (guardReason) {
       console.log(`[TxSigning] _handleTxParamsMode: REJECTED by ledger guard - ${guardReason}`);
@@ -415,9 +425,15 @@ export class TxSigningHandler {
       : '0x' + walletInfo.privateKey;
 
     // 账本护栏：账本绑定地址出金须过合约出金目标检查（目标以 raw bytes 解析为准）
+    const rawToken = tokenInfo.tokens[0];
+    const rawAssetId = rawToken?.isNative
+      ? 'native'
+      : (/^0x[0-9a-fA-F]{40}$/.test(rawToken?.tokenAddress || '') ? rawToken.tokenAddress.toLowerCase() : deriveAssetId(parsedTx.to, parsedTx.data));
     const guardReason = await this._ledgerGuardCheck({
       signerUserId: auth.userId,
       signerCredentialId: auth.credentialId,
+      chainId: Number(parsedTx.chainId),
+      assetId: rawAssetId,
       fromAddress: walletAddress,
       toAddress: parsedTx.to,
       data: parsedTx.data,
