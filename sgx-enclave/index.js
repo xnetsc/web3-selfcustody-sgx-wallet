@@ -336,7 +336,7 @@ async function main() {
   const ledgerWithdrawalService = new LedgerWithdrawalService({
     connectionManager, engine, ledgerService, authorizer: ledgerAuthorizer, contractClient, chainReader,
   });
-  const ledgerGuard = new LedgerGuard({ connectionManager, contractClient });
+  const ledgerGuard = new LedgerGuard({ connectionManager, contractClient, passkeyManager });
   const sessionManager = new SessionManager(connectionManager, engine);
   const keyImporter = new KeyImporter(sessionManager, walletManager, { importTtlSeconds, engine });
   const keyExporter = new KeyExporter(walletManager, connectionManager, { exportTtlSeconds, engine, ledgerExportGuard: ledgerGuard });

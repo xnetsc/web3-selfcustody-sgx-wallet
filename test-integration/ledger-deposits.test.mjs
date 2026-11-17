@@ -246,6 +246,47 @@ function chainSetup(providersByUrl, configOverrides = {}) {
   });
 }
 
+test('observe: same-ledger internal movements are not deposits (collection cannot double-count)', async () => {
+  const { db, contract, ledgerService, deposits, evidence } = setup();
+  await createLedger(ledgerService);
+  const POOL = '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+  const { address } = await deposits.getOrCreateDepositAddress({ ledgerId: LEDGER, userId: ALICE, chainId: CHAIN });
+  contract.designation.poolAddresses = [address, POOL];
+
+  // 归集：充值地址 -> 归集地址。资金在充值地址入账时已记过，这笔只是池内移动
+  evidence.transfers = [{ assetId: USDT, from: address, to: POOL, amount: '500', logIndex: 0 }];
+  const r1 = await deposits.observeDeposit({ ledgerId: LEDGER, chainId: CHAIN, txHash: TX });
+  assert.equal(r1[0].status, 'internal');
+  assert.equal(db.prepare('SELECT COUNT(*) AS c FROM ledger_deposits').get().c, 0);
+  assert.equal(ledgerService.getBalance(LEDGER, ALICE, CHAIN, USDT).available, '0');
+
+  // 反向内部移动：归集地址 -> 充值地址，同样不记充值
+  evidence.transfers = [{ assetId: USDT, from: POOL, to: address, amount: '500', logIndex: 0 }];
+  const r2 = await deposits.observeDeposit({ ledgerId: LEDGER, chainId: CHAIN, txHash: TX });
+  assert.equal(r2[0].status, 'internal');
+  assert.equal(db.prepare('SELECT COUNT(*) AS c FROM ledger_deposits').get().c, 0);
+  assert.equal(ledgerService.getBalance(LEDGER, ALICE, CHAIN, USDT).available, '0');
+});
+
+test('observe: sender bound to ANOTHER ledger is a real deposit here (cross-ledger via chain)', async () => {
+  const { db, contract, ledgerService, deposits, evidence } = setup();
+  await createLedger(ledgerService);
+  const { address } = await deposits.getOrCreateDepositAddress({ ledgerId: LEDGER, userId: ALICE, chainId: CHAIN });
+  contract.designation.poolAddresses = [address];
+
+  // 另一个账本的充值地址（对本账本而言是外部地址）：跨账本提现打进来即本账本的真充值
+  const OTHER_LEDGER_ADDR = '0x7777777777777777777777777777777777777777';
+  db.prepare('INSERT INTO ledgers (ledger_id, owner_user_id, owner_pub_key_hash, created_by_credential_id, created_at, _hlc) VALUES (?, ?, ?, ?, ?, ?)')
+    .run('ledger-other', OWNER, OWNER_HASH, OWNER_CRED, '2026-01-01T00:00:00.000Z', '1');
+  db.prepare('INSERT INTO ledger_deposit_addresses (ledger_id, user_id, chain_id, address, owner_user_id, wallet_id, created_at, _hlc) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+    .run('ledger-other', ALICE, CHAIN, OTHER_LEDGER_ADDR, OWNER, 'w-other', '2026-01-01T00:00:00.000Z', '1');
+
+  evidence.transfers = [{ assetId: USDT, from: OTHER_LEDGER_ADDR, to: address, amount: '300', logIndex: 0 }];
+  const r = await deposits.observeDeposit({ ledgerId: LEDGER, chainId: CHAIN, txHash: TX });
+  assert.equal(r[0].status, 'credited');
+  assert.equal(ledgerService.getBalance(LEDGER, ALICE, CHAIN, USDT).available, '300');
+});
+
 test('chain reader: two agreeing endpoints produce parsed transfers and confirmations', async () => {
   const to = '0x7777777777777777777777777777777777777777';
   const receipt = erc20Receipt(to, '123');

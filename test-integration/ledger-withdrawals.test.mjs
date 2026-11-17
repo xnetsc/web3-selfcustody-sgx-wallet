@@ -104,7 +104,7 @@ function setup() {
     }),
   });
   const ledgerService = new LedgerService({ connectionManager: connMgr, engine, authorizer });
-  const guard = new LedgerGuard({ connectionManager: connMgr, contractClient: contract });
+  const guard = new LedgerGuard({ connectionManager: connMgr, contractClient: contract, passkeyManager });
 
   const seedPasskey = (userId, credentialId, cose) => {
     db.prepare('INSERT INTO passkeys (user_id, credential_id, public_key_cose, sign_count, created_at, _hlc) VALUES (?, ?, ?, 0, ?, ?)')
@@ -138,7 +138,7 @@ function setup() {
     contractClient: contract, chainReader,
   });
 
-  return { db, contract, ledgerService, guard, withdrawals, deposits, evidence, broadcasts };
+  return { db, contract, ledgerService, guard, withdrawals, deposits, evidence, broadcasts, seedPasskey };
 }
 
 async function createLedger(service) {
@@ -179,14 +179,35 @@ test('guard: unbound source passes freely; bound source enforces owner + configu
   );
   // 所有权人出金但目标未配置 → 拒
   await assert.rejects(
-    guard.assertTransferAllowed({ signerUserId: OWNER, fromAddress: COLLECTION, toAddress: EXTERNAL }),
+    guard.assertTransferAllowed({ signerUserId: OWNER, signerCredentialId: OWNER_CRED, fromAddress: COLLECTION, toAddress: EXTERNAL }),
     /not a configured payout target/
   );
   // 配置目标后放行
   contract.payoutTargets.set(`${LEDGER}|${COLLECTION}`, [EXTERNAL]);
-  const ok = await guard.assertTransferAllowed({ signerUserId: OWNER, fromAddress: COLLECTION, toAddress: EXTERNAL });
+  const ok = await guard.assertTransferAllowed({ signerUserId: OWNER, signerCredentialId: OWNER_CRED, fromAddress: COLLECTION, toAddress: EXTERNAL });
   assert.equal(ok.bound, true);
   assert.equal(ok.ledgerId, LEDGER);
+});
+
+test('guard: only the contract-designated passkey can move bound addresses', async () => {
+  const { ledgerService, guard, contract, seedPasskey } = setup();
+  await createLedger(ledgerService);
+  contract.payoutTargets.set(`${LEDGER}|${COLLECTION}`, [EXTERNAL]);
+
+  // 所有权人账号的第二把 Passkey（未被合约指定）→ 拒
+  seedPasskey(OWNER, 'owner-cred-2', Buffer.from('owner-second-passkey-cose'));
+  await assert.rejects(
+    guard.assertTransferAllowed({ signerUserId: OWNER, signerCredentialId: 'owner-cred-2', fromAddress: COLLECTION, toAddress: EXTERNAL }),
+    /contract-designated owner passkey/
+  );
+  // 授权里没有 credentialId → 无法证明是指定 Passkey，拒
+  await assert.rejects(
+    guard.assertTransferAllowed({ signerUserId: OWNER, fromAddress: COLLECTION, toAddress: EXTERNAL }),
+    /contract-designated owner passkey/
+  );
+  // 指定 Passkey → 放行（对照）
+  const ok = await guard.assertTransferAllowed({ signerUserId: OWNER, signerCredentialId: OWNER_CRED, fromAddress: COLLECTION, toAddress: EXTERNAL });
+  assert.equal(ok.bound, true);
 });
 
 test('guard: ERC20 calldata recipient is the effective target; imported target wallet rejected', async () => {
@@ -199,7 +220,7 @@ test('guard: ERC20 calldata recipient is the effective target; imported target w
 
   contract.payoutTargets.set(`${LEDGER}|${COLLECTION}`, [EXTERNAL]);
   const ok = await guard.assertTransferAllowed({
-    signerUserId: OWNER, fromAddress: COLLECTION, toAddress: USDT, data,
+    signerUserId: OWNER, signerCredentialId: OWNER_CRED, fromAddress: COLLECTION, toAddress: USDT, data,
   });
   assert.equal(ok.bound, true);
 
@@ -208,7 +229,7 @@ test('guard: ERC20 calldata recipient is the effective target; imported target w
   contract.payoutTargets.set(`${LEDGER}|${COLLECTION}`, [imported]);
   const data2 = '0xa9059cbb' + '0'.repeat(24) + imported.slice(2) + '0'.repeat(64);
   await assert.rejects(
-    guard.assertTransferAllowed({ signerUserId: OWNER, fromAddress: COLLECTION, toAddress: USDT, data: data2 }),
+    guard.assertTransferAllowed({ signerUserId: OWNER, signerCredentialId: OWNER_CRED, fromAddress: COLLECTION, toAddress: USDT, data: data2 }),
     /not key-qualified/
   );
 });

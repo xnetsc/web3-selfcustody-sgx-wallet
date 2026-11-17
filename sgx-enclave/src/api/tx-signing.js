@@ -199,6 +199,7 @@ export class TxSigningHandler {
     // 2.5 账本护栏：账本绑定地址出金须过合约出金目标检查
     const guardReason = await this._ledgerGuardCheck({
       signerUserId: auth.userId,
+      signerCredentialId: auth.credentialId,
       fromAddress: tx.fromAddress,
       toAddress: tx.toAddress || tx.to,
       data: null,
@@ -416,6 +417,7 @@ export class TxSigningHandler {
     // 账本护栏：账本绑定地址出金须过合约出金目标检查（目标以 raw bytes 解析为准）
     const guardReason = await this._ledgerGuardCheck({
       signerUserId: auth.userId,
+      signerCredentialId: auth.credentialId,
       fromAddress: walletAddress,
       toAddress: parsedTx.to,
       data: parsedTx.data,

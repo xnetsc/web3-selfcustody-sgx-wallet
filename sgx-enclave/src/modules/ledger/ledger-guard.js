@@ -3,9 +3,11 @@
  *
  * 转账护栏（签名之前）：先判定转出地址是不是账本绑定地址（某账本的专属
  * 充值地址，或在其合约公布集内）。不是，普通转账不受影响；是，则实时查
- * 合约核对：账本启用、（普通路径）签名者是该账本所有权人、目标地址在合约
- * 为（账本、源地址）配置的出金目标集内；目标若是 SGX 托管钱包，还须是
- * 原生钱包（导入钱包私钥在外部存在过，不合格）。任一不合，拒绝签名。
+ * 合约核对：账本启用、（普通路径）签名者是该账本所有权人且签名用的正是
+ * 合约指定的那把所有权人 Passkey（同一账号的其它 Passkey 不能动绑定
+ * 地址）、目标地址在合约为（账本、源地址）配置的出金目标集内；目标若是
+ * SGX 托管钱包，还须是原生钱包（导入钱包私钥在外部存在过，不合格）。
+ * 任一不合，拒绝签名。
  *
  * 导出护栏（密钥释放之前）：专属充值地址永久禁止导出；地址在任一账本的
  * 合约公布集内时禁止导出（移出公布集后锁定解除）；本地存在账本而合约
@@ -34,15 +36,19 @@ export function decodeEffectiveTarget(toAddress, data) {
   return { target: to, isPlainTransfer: false };
 }
 
+import { PasskeyManager } from '../webauthn/passkey-manager.js';
+
 export class LedgerGuard {
   /**
    * @param {Object} deps
    * @param {import('../../database/connection-manager.js').default} deps.connectionManager
    * @param {import('../contract-client/index.js').ContractClient} deps.contractClient
+   * @param {import('../webauthn/passkey-manager.js').PasskeyManager} deps.passkeyManager - 指定 Passkey 校验用（普通路径）
    */
   constructor(deps) {
     this._db = deps.connectionManager;
     this._contract = deps.contractClient;
+    this._passkeys = deps.passkeyManager || null;
   }
 
   _localLedgers() {
@@ -77,13 +83,14 @@ export class LedgerGuard {
    * 转账签名前的护栏。未绑定地址直接放行；绑定地址任一检查不合即抛错拒绝。
    * @param {Object} args
    * @param {string} args.signerUserId - 签名账户（普通路径）或目标账户（应急路径传目标用户并关闭所有权检查）
+   * @param {string} [args.signerCredentialId] - 本次授权实际签名用的 Passkey（普通路径）：绑定地址只认合约指定的那把
    * @param {string} args.fromAddress
    * @param {string} args.toAddress
    * @param {string} [args.data] - 交易 data（raw 模式解实际收款方用）
    * @param {boolean} [args.requireSignerIsOwner=true] - 应急代行路径传 false：授权依据不同，但出金目标约束同样生效
    * @returns {Promise<{bound: boolean, ledgerId?: string}>}
    */
-  async assertTransferAllowed({ signerUserId, fromAddress, toAddress, data = null, requireSignerIsOwner = true }) {
+  async assertTransferAllowed({ signerUserId, signerCredentialId = null, fromAddress, toAddress, data = null, requireSignerIsOwner = true }) {
     const binding = await this.findBinding(fromAddress);
     if (!binding) return { bound: false };
     const { ledgerId } = binding;
@@ -96,8 +103,26 @@ export class LedgerGuard {
     }
     if (!designation) throw new Error(`Ledger guard: ledger ${ledgerId} is not designated on contract`);
     if (!designation.enabled) throw new Error(`Ledger guard: ledger ${ledgerId} is disabled`);
-    if (requireSignerIsOwner && designation.ownerUserId !== signerUserId) {
-      throw new Error('Ledger guard: source address is ledger-bound and the signer is not the ledger owner');
+    if (requireSignerIsOwner) {
+      if (designation.ownerUserId !== signerUserId) {
+        throw new Error('Ledger guard: source address is ledger-bound and the signer is not the ledger owner');
+      }
+      // 指定 Passkey：绑定地址只能由合约指定的那把所有权人 Passkey 签动，
+      // 同一账号下的其它 Passkey 不得操作专属充值地址与归集地址
+      if (!this._passkeys) {
+        throw new Error('Ledger guard: passkey verification unavailable, refusing to sign from a ledger-bound address');
+      }
+      if (!signerCredentialId) {
+        throw new Error('Ledger guard: bound addresses can only be moved by the contract-designated owner passkey (authorization carries no credential)');
+      }
+      const passkey = await this._passkeys.getPasskey(signerUserId, signerCredentialId);
+      if (!passkey) {
+        throw new Error('Ledger guard: signing passkey not found on the signer account');
+      }
+      const signingHash = PasskeyManager.computePubKeyHash(passkey.publicKeyCose);
+      if (signingHash.toLowerCase() !== String(designation.ownerPubKeyHash).toLowerCase()) {
+        throw new Error('Ledger guard: bound addresses can only be moved by the contract-designated owner passkey');
+      }
     }
 
     const { target, isPlainTransfer } = decodeEffectiveTarget(toAddress, data);

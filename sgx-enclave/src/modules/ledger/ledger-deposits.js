@@ -105,6 +105,25 @@ export class LedgerDepositService {
 
     for (const transfer of evidence.transfers) {
       const to = String(transfer.to).toLowerCase();
+      const from = String(transfer.from).toLowerCase();
+
+      // 内部移动不入充值账：转出方是本账本自己的绑定地址（专属充值地址或
+      // 公布集内地址）时，这是资金池内部的位置移动（如归集），不是一笔
+      // 新充值——充值在资金首次到达充值地址时已经记过，再记一次并允许
+      // 认领即凭空多出一份负债。转出方是其它账本的绑定地址则不算内部
+      // 移动：跨账本只能经链上提现+充值，那正是本账本的一笔真充值。
+      const fromAssignments = this._db.readQuery(
+        'SELECT address FROM ledger_deposit_addresses WHERE ledger_id = ? AND chain_id = ? AND LOWER(address) = ?',
+        [ledgerId, Number(chainId), from]
+      );
+      if (poolSet.has(from) || fromAssignments.length > 0) {
+        results.push({
+          logIndex: transfer.logIndex, assetId: transfer.assetId,
+          to, amount: transfer.amount, status: 'internal',
+        });
+        continue;
+      }
+
       const assignmentRows = this._db.readQuery(
         'SELECT * FROM ledger_deposit_addresses WHERE ledger_id = ? AND chain_id = ? AND LOWER(address) = ?',
         [ledgerId, Number(chainId), to]
